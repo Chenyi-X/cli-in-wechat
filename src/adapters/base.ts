@@ -107,6 +107,7 @@ export interface IntermediateMessage {
   type: 'thinking' | 'text' | 'tool_use' | 'tool_result';
   content: string;
   toolName?: string;
+  toolInput?: Record<string, unknown>;
 }
 
 export interface AdapterCapabilities {

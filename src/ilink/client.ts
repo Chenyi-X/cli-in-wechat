@@ -205,33 +205,37 @@ export class ILinkClient {
     contextToken: string,
     itemList: MessageItem[],
   ): Promise<void> {
+    const body = JSON.stringify({
+      msg: {
+        from_user_id: '',
+        to_user_id: userId,
+        client_id: randomUUID(),
+        message_type: 2,
+        message_state: 2,
+        context_token: contextToken,
+        item_list: itemList,
+      },
+      base_info: this.baseInfo(),
+    });
+
     const res = await fetch(
       `${this.credentials.baseUrl}/ilink/bot/sendmessage`,
       {
         method: 'POST',
         headers: this.headers(),
-        body: JSON.stringify({
-          msg: {
-            from_user_id: '',
-            to_user_id: userId,
-            client_id: randomUUID(),
-            message_type: 2,
-            message_state: 2,
-            context_token: contextToken,
-            item_list: itemList,
-          },
-          base_info: this.baseInfo(),
-        }),
+        body,
       },
     );
 
     if (!res.ok) {
-      const body = await res.text().catch(() => '');
-      throw new Error(`发送消息失败: HTTP ${res.status} ${body}`);
+      const respBody = await res.text().catch(() => '');
+      throw new Error(`发送消息失败: HTTP ${res.status} ${respBody}`);
     }
 
     const data = (await res.json()) as { ret?: number; errmsg?: string };
     if (data.ret !== undefined && data.ret !== 0) {
+      // Log the failed message content for debugging
+      log.error(`[sendRawMessage] ret=${data.ret} 内容长度=${body.length} 内容预览=${body.substring(0, 200)}`);
       throw new Error(`发送消息失败: ${data.errmsg || `ret=${data.ret}`}`);
     }
   }

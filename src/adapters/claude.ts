@@ -162,7 +162,7 @@ export class ClaudeAdapter implements CLIAdapter {
             if (block.type === 'tool_use') {
               pendingToolName = block.name;
               if (streamIntermediate) {
-                onIntermediate({ type: 'tool_use', content: '', toolName: block.name });
+                onIntermediate({ type: 'tool_use', content: '', toolName: block.name, toolInput: block.input });
               }
             }
           }
@@ -176,9 +176,13 @@ export class ClaudeAdapter implements CLIAdapter {
         if (content && streamIntermediate) {
           for (const block of content) {
             if (block.type === 'tool_result' && block.content) {
+              // content may be string or array, convert to string
+              const contentStr = typeof block.content === 'string'
+                ? block.content
+                : JSON.stringify(block.content);
               onIntermediate({
                 type: 'tool_result',
-                content: block.content,
+                content: contentStr,
                 toolName: pendingToolName,
               });
               pendingToolName = undefined;
