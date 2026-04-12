@@ -1052,28 +1052,56 @@ export class Router {
     // Track if we've streamed text (to avoid duplicate with final result)
     let hasStreamedText = false;
 
+    // Helper to format tool input for display
+    const formatToolInput = (toolName: string, input?: Record<string, unknown>): string => {
+      if (!input || msgMode !== 'verbose') return `${toolName}...`;
+      const inputStr = JSON.stringify(input);
+      const preview = inputStr.length > 100 ? inputStr.substring(0, 100) + '...' : inputStr;
+      return `${toolName}\n📋 ${preview}`;
+    };
+
+    // Queue to serialize message sending and avoid rate limiting
+    let sendPromise = Promise.resolve();
+    const queueSend = async (text: string, label?: string) => {
+      sendPromise = sendPromise.then(async () => {
+        // Always wait 1 second between messages to avoid rate limiting
+        await new Promise(r => setTimeout(r, 1000));
+        try {
+          await this.ilink.sendText(uid, text);
+        } catch (err) {
+          log.error(`[stream] 发送失败 (${label || 'unknown'}):`, err);
+          // Continue with next message
+        }
+      });
+      return sendPromise;
+    };
+
     // Streaming intermediate messages (for verbose/normal mode)
-    const onIntermediate = msgMode !== 'compact' ? (msg: import('../adapters/base.js').IntermediateMessage) => {
-      // Send each block immediately when received
+    const onIntermediate = msgMode !== 'compact' ? async (msg: import('../adapters/base.js').IntermediateMessage) => {
+      // Send each block via queue (serialized with delay)
       switch (msg.type) {
         case 'tool_use':
-          this.ilink.sendText(uid, `🔧 ${msg.toolName || 'tool'}...`).catch(() => {});
+          await queueSend(`🔧 ${formatToolInput(msg.toolName || 'tool', msg.toolInput)}`, `tool:${msg.toolName}`);
           break;
         case 'thinking':
           // thinking 显示只由 showThoughts 控制，与 msgMode 无关
-          if (settings.showThoughts && msg.content.trim()) {
-            this.ilink.sendText(uid, `💭 ${msg.content}`).catch(() => {});
+          if (settings.showThoughts && typeof msg.content === 'string' && msg.content.trim()) {
+            await queueSend(`💭 ${msg.content}`, 'thinking');
           }
           break;
         case 'text':
-          if (msg.content.trim()) {
+          if (typeof msg.content === 'string' && msg.content.trim()) {
             hasStreamedText = true;
-            this.ilink.sendText(uid, msg.content).catch(() => {});
+            await queueSend(msg.content, 'text');
           }
           break;
         case 'tool_result':
-          if (msgMode === 'verbose' && msg.content.trim()) {
-            this.ilink.sendText(uid, `📤 ${msg.content}`).catch(() => {});
+          if (msgMode === 'verbose') {
+            // content may be string or array, convert safely
+            const contentStr = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
+            if (contentStr.trim()) {
+              await queueSend(`📤 ${contentStr}`, `result:${msg.toolName}`);
+            }
           }
           break;
       }
@@ -1103,6 +1131,12 @@ export class Router {
       const sentNotice = sentFiles.length > 0
         ? `\n[已发送文件: ${sentFiles.join(', ')}]`
         : '';
+
+      // Wait for all queued messages to complete before sending footer
+      await sendPromise;
+
+      // Add delay before footer to avoid rate limiting
+      await new Promise(r => setTimeout(r, 1000));
 
       // If text was already streamed, only send footer (avoid duplicate)
       if (hasStreamedText) {
