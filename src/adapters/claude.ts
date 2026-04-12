@@ -1,33 +1,33 @@
 import { log } from '../utils/logger.js';
-import type { CLIAdapter, ExecOptions, ExecResult, AdapterCapabilities } from './base.js';
+import type { CLIAdapter, ExecOptions, ExecResult, AdapterCapabilities, IntermediateMessage } from './base.js';
 import { commandExists, spawnProc, setupAbort, setupTimeout, isSessionError } from './base.js';
 import type { DownloadedMedia } from '../utils/media.js';
 import { copyMediaToWorkDir } from '../utils/media.js';
 
 function buildMediaPrompt(prompt: string, media?: DownloadedMedia[], workDir?: string): string {
   if (!media || media.length === 0) return prompt;
-  
+
   // 复制文件到工作目录
   const copiedMedia = workDir ? media.map(m => copyMediaToWorkDir(m, workDir)) : media;
-  
+
   const fileList = copiedMedia.map(m => {
-    const relativePath = workDir && m.path.startsWith(workDir) 
+    const relativePath = workDir && m.path.startsWith(workDir)
       ? m.path.slice(workDir.length).replace(/^[\/\\]/, '')
       : m.path;
     const typeNames: Record<string, string> = { image: '图片', file: '文件', video: '视频' };
     const sizeStr = m.size ? `${(m.size / 1024).toFixed(1)}KB` : '未知大小';
     return `- ${m.fileName}\n  类型: ${typeNames[m.type] || '文件'}\n  大小: ${sizeStr}\n  路径: ${relativePath}`;
   }).join('\n\n');
-  
+
   const userPrompt = prompt.trim() && !prompt.startsWith('[文件:') && !prompt.startsWith('[图片:') && !prompt.startsWith('[视频:')
     ? `\n\n用户说：${prompt}`
     : '';
-  
+
   return `已接收到用户通过微信发送的文件：
 
 ${fileList}
 
-文件已保存到工作目录，等待您的指令。${userPrompt}`;
+文件已保存到工作目录。请勿主动读取或处理这些文件，等待用户明确指示需要做什么。${userPrompt}`;
 }
 
 export class ClaudeAdapter implements CLIAdapter {
@@ -45,7 +45,7 @@ export class ClaudeAdapter implements CLIAdapter {
     const { settings } = opts;
     const workDir = settings.workDir || opts.workDir;
     const fullPrompt = buildMediaPrompt(prompt, opts.media, workDir);
-    
+
     log.debug(`[claude] workDir: ${workDir}`);
     if (opts.media && opts.media.length > 0) {
       log.debug(`[claude] media paths: ${opts.media.map(m => m.path).join(', ')}`);
@@ -66,11 +66,14 @@ export class ClaudeAdapter implements CLIAdapter {
     const { query } = await import('@anthropic-ai/claude-agent-sdk');
     const { settings } = opts;
     const start = Date.now();
+    const msgMode = settings.msgMode || 'compact';
 
     // Build options
     const sdkOpts: Record<string, unknown> = {
       maxTurns: settings.maxTurns,
       permissionMode: settings.mode === 'auto' ? 'bypassPermissions' : settings.mode === 'plan' ? 'plan' : 'default',
+      // Load all settings sources to get complete skills/commands list
+      settingSources: ['user', 'project', 'local'] as const,
     };
 
     if (settings.effort) sdkOpts.effort = settings.effort;
@@ -91,7 +94,7 @@ export class ClaudeAdapter implements CLIAdapter {
       const askUser = opts.askUser;
       sdkOpts.canUseTool = async (toolName: string, input: Record<string, unknown>) => {
         if (toolName === 'AskUserQuestion') {
-          log.debug('[claude] AskUserQuestion intercepted, forwarding to WeChat');
+          log.debug('[claude] AskUserQuestion input:', JSON.stringify(input, null, 2));
           try {
             const answers = await askUser({
               questions: (input.questions as Array<{
@@ -100,6 +103,7 @@ export class ClaudeAdapter implements CLIAdapter {
                 multiSelect?: boolean;
               }>) || [],
             });
+            log.debug('[claude] AskUserQuestion answers:', JSON.stringify(answers));
             return {
               behavior: 'allow' as const,
               updatedInput: { ...input, answers },
@@ -113,12 +117,19 @@ export class ClaudeAdapter implements CLIAdapter {
       };
     }
 
-    log.debug(`[claude/sdk] effort=${settings.effort} mode=${settings.mode} resume=${sid || 'none'}`);
+    log.debug(`[claude/sdk] effort=${settings.effort} mode=${settings.mode} msgMode=${msgMode} resume=${sid || 'none'}`);
 
     let resultText = '';
     let thinking = '';
     let sessionId: string | undefined;
     let error = false;
+
+    // Stream intermediate messages via callback
+    const { onIntermediate } = opts;
+    const streamIntermediate = msgMode !== 'compact' && onIntermediate;
+
+    // Track pending tool_use to associate with tool_result
+    let pendingToolName: string | undefined;
 
     for await (const message of query({
       prompt,
@@ -131,14 +142,47 @@ export class ClaudeAdapter implements CLIAdapter {
       const msg = message as Record<string, unknown>;
 
       if (msg.type === 'assistant') {
-        // SDKAssistantMessage wraps the Anthropic message: content lives at msg.message.content,
-        // not directly on msg (see node_modules/@anthropic-ai/claude-agent-sdk/sdk.d.ts).
-        const inner = msg.message as { content?: Array<{ type: string; thinking?: string }> } | undefined;
-        const content = inner?.content;
+        // SDK 用 message.content 存储 content blocks
+        const msgObj = msg as any;
+        const content = msgObj.content || msgObj.message?.content;
         if (content) {
           for (const block of content) {
+            log.debug(`[claude/sdk] block type=${block.type}${block.type === 'text' ? ', text=' + block.text?.substring(0, 50) : ''}`);
             if (block.type === 'thinking' && block.thinking) {
               thinking += block.thinking;
+              if (streamIntermediate) {
+                onIntermediate({ type: 'thinking', content: block.thinking });
+              }
+            }
+            if (block.type === 'text' && block.text) {
+              // Intermediate text output
+              if (streamIntermediate && block.text.trim()) {
+                onIntermediate({ type: 'text', content: block.text });
+              }
+            }
+            if (block.type === 'tool_use') {
+              pendingToolName = block.name;
+              if (streamIntermediate) {
+                onIntermediate({ type: 'tool_use', content: '', toolName: block.name });
+              }
+            }
+          }
+        }
+      }
+
+      if (msg.type === 'user') {
+        // SDK 用 message.content 存储 tool_result
+        const msgObj = msg as any;
+        const content = msgObj.content || msgObj.message?.content;
+        if (content && streamIntermediate) {
+          for (const block of content) {
+            if (block.type === 'tool_result' && block.content) {
+              onIntermediate({
+                type: 'tool_result',
+                content: block.content,
+                toolName: pendingToolName,
+              });
+              pendingToolName = undefined;
             }
           }
         }
@@ -166,10 +210,8 @@ export class ClaudeAdapter implements CLIAdapter {
   private executeWithCLI(prompt: string, opts: ExecOptions): Promise<ExecResult> {
     return new Promise((resolve) => {
       const { settings } = opts;
-      // Prompt is passed via stdin below to avoid Windows cmd.exe issues with
-      // special characters. --verbose is required for stream-json in -p mode.
-      const args = ['-p', '--output-format', 'stream-json', '--verbose'];
-      if (settings.showThoughts) args.push('--thinking', 'enabled');
+      // 使用 stdin 传递提示词，避免 Windows shell 对特殊字符的处理问题
+      const args = ['--output-format', 'stream-json', '--thinking', 'enabled', '--verbose'];
 
       switch (settings.mode) {
         case 'auto': args.push('--dangerously-skip-permissions'); break;
@@ -191,7 +233,7 @@ export class ClaudeAdapter implements CLIAdapter {
 
       log.debug(`[claude] effort=${settings.effort} model=${settings.model || 'default'} mode=${settings.mode}`);
       log.debug(`[claude] stdin prompt length: ${prompt.length}`);
-      
+
       const proc = spawnProc(this.command, args, {
         cwd: settings.workDir || opts.workDir,
         stdio: ['pipe', 'pipe', 'pipe'],
@@ -243,7 +285,14 @@ export class ClaudeAdapter implements CLIAdapter {
         }
 
         if (text) {
-          resolve({ text, thinking: thinking || undefined, sessionId, duration, error: isErr, sessionExpired: isErr && !!sid && isSessionError(text) });
+          resolve({
+            text,
+            thinking: thinking || undefined,
+            sessionId,
+            duration,
+            error: isErr,
+            sessionExpired: isErr && !!sid && isSessionError(text),
+          });
         } else {
           const fallbackText = stdout.trim() || stderr.trim() || `exit ${code}`;
           resolve({ text: fallbackText, error: code !== 0, sessionExpired: code !== 0 && !!sid && isSessionError(fallbackText) });
