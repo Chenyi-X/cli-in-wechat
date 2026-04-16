@@ -4,7 +4,7 @@ import { ClaudeAdapter } from './claude.js';
 import { CodexAdapter } from './codex.js';
 import { GeminiAdapter } from './gemini.js';
 import { KimiAdapter } from './kimi.js';
-import { OpenCodeAdapter } from './opencode.js';
+import { OpenCodeAdapter } from './opencode-sdk.js';
 
 export class AdapterRegistry {
   private adapters = new Map<string, CLIAdapter>();
