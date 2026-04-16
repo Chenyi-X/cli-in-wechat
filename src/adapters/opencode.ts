@@ -1,6 +1,6 @@
 import { log } from '../utils/logger.js';
-import type { CLIAdapter, ExecOptions, ExecResult, AdapterCapabilities } from './base.js';
-import { commandExists, spawnProc, setupAbort, setupTimeout, stripAnsi } from './base.js';
+import type { CLIAdapter, ExecOptions, ExecResult, AdapterCapabilities, IntermediateMessage } from './base.js';
+import { commandExists, spawnProc, setupAbort, setupTimeout, stripAnsi, summarizeToolUse, summarizeToolResult } from './base.js';
 import type { DownloadedMedia } from '../utils/media.js';
 import { copyMediaToWorkDir } from '../utils/media.js';
 import { execSync } from 'node:child_process';
@@ -54,7 +54,7 @@ export class OpenCodeAdapter implements CLIAdapter {
   readonly displayName = 'OpenCode';
   readonly command = 'opencode';
   readonly capabilities: AdapterCapabilities = {
-    streaming: false, jsonOutput: true, sessionResume: true,
+    streaming: true, jsonOutput: true, sessionResume: true,
     modes: ['auto', 'safe', 'plan'], hasEffort: false, hasModel: true, hasSearch: false, hasBudget: false,
   };
 
@@ -152,21 +152,68 @@ private resolveModelArg(model: string, workDir?: string): string {
           let sessionId: string | undefined;
           let hasError = code !== 0;
 
+          // Track pending tool for tool_use → tool_result association
+          let pendingToolName: string | undefined;
+          const { onIntermediate } = opts;
+          const msgMode = settings.msgMode || 'normal';
+          const streamIntermediate = msgMode !== 'compact' && onIntermediate;
+
           const lines = stdout.trim().split('\n');
           for (const line of lines) {
             if (!line.trim()) continue;
             try {
               const obj = JSON.parse(line);
+
               if (obj.type === 'text' && obj.part?.text) {
                 text += obj.part.text;
+                if (streamIntermediate && obj.part.text.trim()) {
+                  onIntermediate({ type: 'text', content: obj.part.text });
+                }
               }
+
               if (obj.type === 'reasoning' && obj.part?.text) {
                 thinking += obj.part.text;
                 log.debug(`[opencode] found reasoning, length: ${obj.part.text.length}`);
+                if (streamIntermediate && obj.part.text.trim()) {
+                  onIntermediate({ type: 'thinking', content: obj.part.text });
+                }
               }
+
+              if (obj.type === 'tool_use' && obj.part) {
+                const part = obj.part as Record<string, unknown>;
+                const toolName = (part.tool as string) || 'Tool';
+                const state = (part.state as Record<string, unknown>) || {};
+                const input = (state.input as Record<string, unknown>) || {};
+                const output = (state.output as string) || '';
+
+                pendingToolName = toolName;
+
+                // Emit tool_use event
+                if (streamIntermediate) {
+                  onIntermediate({
+                    type: 'tool_use',
+                    content: summarizeToolUse(toolName, input),
+                    toolName,
+                  });
+                }
+
+                // Emit tool_result event (opencode bundles both in tool_use)
+                if (streamIntermediate && output) {
+                  const summary = summarizeToolResult(toolName, output);
+                  if (summary) {
+                    onIntermediate({
+                      type: 'tool_result',
+                      content: summary,
+                      toolName,
+                    });
+                  }
+                }
+              }
+
               if (obj.sessionID && !sessionId) {
                 sessionId = obj.sessionID;
               }
+
               if (obj.type === 'step_finish' && obj.part?.reason === 'error') {
                 hasError = true;
               }
