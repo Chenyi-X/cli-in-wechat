@@ -270,6 +270,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
           '',
           '— 设置 —',
           '/status  查看所有配置',
+          '/models  查看可用模型',
           '/model <名>  切模型',
           '/mode <auto|safe|plan>  权限',
           '/effort <low|med|high|max>  深度',
@@ -348,6 +349,26 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
           `可用: ${this.registry.getAvailableNames().join(', ')}`,
         ];
         await reply(lines.join('\n'));
+        return true;
+      }
+
+      case 'models': {
+        try {
+          const { execSync } = await import('node:child_process');
+          const stdout = execSync('opencode models', {
+            encoding: 'utf-8',
+            timeout: 5000,
+            stdio: ['ignore', 'pipe', 'ignore'],
+          });
+          const models = stdout.trim().split(/\r?\n/).filter(Boolean);
+          if (models.length === 0) {
+            await reply('没有可用的模型');
+          } else {
+            await reply(`可用模型 (${models.length}个):\n${models.join('\n')}`);
+          }
+        } catch (err) {
+          await reply(`获取模型列表失败: ${(err as Error).message}`);
+        }
         return true;
       }
 

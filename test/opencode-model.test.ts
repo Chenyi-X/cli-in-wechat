@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { resolveBareModelFromList } from '../src/adapters/opencode.js';
+import { resolveBareModelFromList } from '../dist/adapters/opencode.js';
 
 test('resolveBareModelFromList keeps provider/model as-is', () => {
   const model = resolveBareModelFromList('baiduqianfancodingplan/glm-5', [

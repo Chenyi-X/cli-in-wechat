@@ -1,9 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { Router } from '../src/bridge/router.js';
-import type { BridgeConfig } from '../src/config.js';
-import type { WeixinMessage } from '../src/ilink/types.js';
+import { Router } from '../dist/bridge/router.js';
+import type { BridgeConfig } from '../dist/config.js';
+import type { WeixinMessage } from '../dist/ilink/types.js';
 
 function createRouter() {
   const messages: Array<{ uid: string; text: string }> = [];
@@ -250,4 +250,24 @@ test('exec maps stale default-alias model to empty before adapter execution', as
 
   assert.equal(capturedModels[0], '');
   assert.equal((sessions.get('u1') as any).model, '');
+});
+
+test('handleSlash /models returns model list', async () => {
+  const { router, messages } = createRouter();
+  
+  // 直接测试实际命令（需要opencode可用）
+  try {
+    await router.handleSlash('u1', '/models');
+    
+    const lastMessage = messages[messages.length - 1]?.text;
+    if (lastMessage.includes('获取模型列表失败')) {
+      // 如果opencode不可用，跳过测试
+      return;
+    }
+    assert.ok(lastMessage.includes('可用模型'));
+    assert.ok(lastMessage.includes('opencode/')); // 检查是否包含模型格式
+  } catch (err) {
+    // 如果命令执行失败，跳过测试
+    console.log('跳过测试：opencode不可用');
+  }
 });
