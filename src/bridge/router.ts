@@ -357,8 +357,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
           const { execSync } = await import('node:child_process');
           const stdout = execSync('opencode models', {
             encoding: 'utf-8',
-            timeout: 5000,
-            stdio: ['ignore', 'pipe', 'ignore'],
+            timeout: 10000,
           });
           const models = stdout.trim().split(/\r?\n/).filter(Boolean);
           if (models.length === 0) {
@@ -1010,7 +1009,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
       const stdout = execSync('opencode session list --format json -n 15', {
         cwd: workDir,
         encoding: 'utf-8',
-        timeout: 5000,
+        timeout: 10000,
       });
       const sessions = JSON.parse(stdout);
       return sessions.map((s: { id: string; title: string; updated: number }) => {

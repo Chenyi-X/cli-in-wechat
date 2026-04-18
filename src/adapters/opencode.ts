@@ -72,8 +72,7 @@ private resolveModelArg(model: string, workDir?: string): string {
       const output = execSync('opencode models', {
         cwd: workDir,
         encoding: 'utf8',
-        timeout: 5000,
-        stdio: ['ignore', 'pipe', 'ignore'],
+        timeout: 10000,
       });
       const availableModels = output
         .split(/\r?\n/)
