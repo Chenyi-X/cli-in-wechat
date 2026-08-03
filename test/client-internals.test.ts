@@ -1,7 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { rmSync } from 'node:fs';
 
 import { redactSecrets, ILinkClient } from '../src/ilink/client.js';
+import { accountStatePath } from '../src/config.js';
 import type { Credentials } from '../src/ilink/types.js';
 
 // ─── redactSecrets: never leak decryption keys / signed URLs into logs ───────
@@ -71,4 +73,37 @@ test('isFreshMessage: evicts oldest beyond the 1000-entry cap but keeps recent o
   assert.equal(client.isFreshMessage('u', 0), true, 'evicted key is treated as fresh again');
   // A recently-seen key is still remembered.
   assert.equal(client.isFreshMessage('u', 999), false);
+});
+
+test('getUpdates stages the cursor until the returned messages are processed', async () => {
+  const accountId = `poll-cursor-test-${Date.now()}`;
+  const client = new ILinkClient({ ...DUMMY_CREDS, ilinkBotId: accountId }) as any;
+  const originalFetch = globalThis.fetch;
+  client.pollCursor = 'cursor-before';
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    ret: 0,
+    msgs: [{
+      message_id: 1,
+      from_user_id: 'user-a',
+      to_user_id: 'bot-user',
+      client_id: 'inbound-client-1',
+      create_time_ms: Date.now(),
+      message_type: 1,
+      message_state: 0,
+      context_token: 'context-a',
+      item_list: [{ type: 1, text_item: { text: '0' } }],
+    }],
+    get_updates_buf: 'cursor-after',
+    longpolling_timeout_ms: 30_000,
+  }), { status: 200 });
+  try {
+    const messages = await client.getUpdates();
+
+    assert.equal(messages.length, 1);
+    assert.equal(client.pollCursor, 'cursor-before');
+    assert.equal(client.pendingPollCursor, 'cursor-after');
+  } finally {
+    globalThis.fetch = originalFetch;
+    rmSync(accountStatePath(accountId, 'poll_cursor.txt'), { force: true });
+  }
 });

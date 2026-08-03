@@ -88,6 +88,7 @@ export class ILinkClient {
   private pollCursor: string;
   private running = false;
   private contextTokens: Map<string, string>;
+  private pendingPollCursor?: string;
   private typingTickets = new Map<string, { ticket: string; ts: number }>();
   private handlers: MessageHandler[] = [];
   private sendQueues = new Map<string, Promise<unknown>>();
@@ -237,6 +238,7 @@ export class ILinkClient {
         for (const msg of msgs) {
           await this.processMessage(msg);
         }
+        this.commitPendingPollCursor();
       } catch (err: unknown) {
         if (!this.running) return;
 
@@ -353,14 +355,23 @@ export class ILinkClient {
       }
 
       if (data.get_updates_buf) {
-        this.pollCursor = data.get_updates_buf;
-        savePollCursor(this.pollCursor, this.accountId);
+        // Do not advance the durable cursor until every message in this
+        // response has been processed. Otherwise a crash or handler error can
+        // permanently skip an inbound recovery signal such as "0".
+        this.pendingPollCursor = data.get_updates_buf;
       }
 
       return data.msgs || [];
     } finally {
       clearTimeout(timer);
     }
+  }
+
+  private commitPendingPollCursor(): void {
+    if (!this.pendingPollCursor) return;
+    this.pollCursor = this.pendingPollCursor;
+    this.pendingPollCursor = undefined;
+    savePollCursor(this.pollCursor, this.accountId);
   }
 
   // ─── Message handling ──────────────────────────────────
