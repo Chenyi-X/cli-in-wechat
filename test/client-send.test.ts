@@ -871,6 +871,56 @@ test('a fresh inbound with the same context token gets one recovery attempt', as
   });
 });
 
+test('a new inbound drains a guarded final result when the token string is unchanged', async () => {
+  await withStores(async (outbox, quota) => {
+    const client = new ILinkClient(credentials, { outbox, quota });
+    quota.recordInbound('user-a', 'message-1', 'context-a');
+    (client as any).contextTokens.set('user-a', 'context-a');
+
+    const originalFetch = globalThis.fetch;
+    const payloads: Array<Record<string, any>> = [];
+    globalThis.fetch = async (_input, init) => {
+      payloads.push(JSON.parse(String(init?.body)));
+      return new Response(JSON.stringify({ ret: 0, message_id: payloads.length }), { status: 200 });
+    };
+    try {
+      for (let i = 0; i < 9; i++) {
+        const result = await client.sendText('user-a', `中间块 ${i + 1}`, {
+          streamType: 'intermediate',
+          priority: 'intermediate',
+        });
+        assert.ok(result.every((item) => item.status === 'sent'));
+      }
+
+      const guarded = await client.sendText('user-a', '需要恢复的最终结果', { priority: 'final' });
+      assert.ok(guarded.some((item) => item.status === 'queued'));
+      assert.equal(outbox.listPending('user-a').some((item) => item.text === '需要恢复的最终结果'), true);
+      assert.equal(payloads.length, 10, 'nine intermediate chunks plus one recovery notice');
+
+      await (client as any).processMessage({
+        message_id: 2,
+        from_user_id: 'user-a',
+        to_user_id: 'bot-user',
+        client_id: 'inbound-client-2',
+        create_time_ms: Date.now(),
+        message_type: 1,
+        message_state: 0,
+        context_token: 'context-a',
+        item_list: [],
+      });
+
+      assert.equal(payloads.at(-1)?.msg.item_list[0].text_item.text, '需要恢复的最终结果');
+      assert.deepEqual(outbox.listPending('user-a'), []);
+      const snapshot = quota.snapshot('user-a');
+      assert.equal(snapshot.sentItems, 11, 'recovery keeps cumulative successful-send accounting');
+      assert.equal(snapshot.tokenVersion, 1, 'recovery does not invent a token version');
+      assert.equal(quota.getTokenBudget('user-a').sentItems, 1, 'only the resumed window counts locally');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
 test('ret=-2 keeps intermediate backlog and the final result durable', async () => {
   await withStores(async (outbox, quota) => {
     const client = new ILinkClient(credentials, { outbox, quota });

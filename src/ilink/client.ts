@@ -434,6 +434,11 @@ export class ILinkClient {
       this.accountId,
     ).filter((item) => !this.isRecoveryNotice(item)).length;
 
+    if (pendingTextCountBeforeDrain > 0
+      && this.quota.openInboundRecoveryWindow(msg.from_user_id)) {
+      log.info(`[msg] 新入站已打开恢复发送窗口: ${msg.from_user_id.substring(0, 12)}...`);
+    }
+
     // A new, deduplicated inbound message is the safe trigger for draining text
     // that was waiting for a usable context token or an ambiguous ret=-2 response.
     await this.drainOutbox(msg.from_user_id);

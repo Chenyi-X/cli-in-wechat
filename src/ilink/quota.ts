@@ -219,6 +219,31 @@ export class QuotaManager {
     this.persist();
   }
 
+  /**
+   * Open one local delivery window for a real inbound recovery signal.
+   *
+   * The server may return the same context token for a new inbound message.
+   * In that case the token-version counters cannot tell us that the user has
+   * explicitly asked to resume. Keep cumulative accounting and token identity
+   * intact, but allow the durable backlog one fresh guarded send window.
+   */
+  openInboundRecoveryWindow(userId: string): boolean {
+    const state = this.getState(userId);
+    const hadConsumedBudget = state.tokenSentItems > 0
+      || state.tokenSentBytes > 0
+      || state.tokenBudgetNoticeVersion !== undefined;
+    if (!hadConsumedBudget) return false;
+
+    state.tokenSentItems = 0;
+    state.tokenSentBytes = 0;
+    state.tokenBudgetNoticeVersion = undefined;
+    state.rateBackoffUntil = 0;
+    state.rateBackoffGeneration = state.inboundGeneration;
+    state.rateBackoffTokenVersion = undefined;
+    this.persist();
+    return true;
+  }
+
   getRateBackoff(userId: string): { until: number; generation: number; tokenVersion?: number } {
     const state = this.getState(userId);
     return {
