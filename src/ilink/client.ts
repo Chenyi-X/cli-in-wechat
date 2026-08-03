@@ -181,6 +181,13 @@ export class ILinkClient {
     return true;
   }
 
+  private forgetSeenMessage(userId: string, id: number): void {
+    const key = `${userId}:${id}`;
+    if (!this.seenMsgIds.delete(key)) return;
+    const index = this.seenMsgOrder.indexOf(key);
+    if (index >= 0) this.seenMsgOrder.splice(index, 1);
+  }
+
   private headers(): Record<string, string> {
     return {
       'Content-Type': 'application/json',
@@ -236,7 +243,16 @@ export class ILinkClient {
         this.consecutiveFailures = 0;
 
         for (const msg of msgs) {
-          await this.processMessage(msg);
+          try {
+            await this.processMessage(msg);
+          } catch (err) {
+            // The cursor is intentionally still uncommitted here. Allow this
+            // message to be replayed in the same process as well as after a
+            // restart; its quota receipt remains pending until success.
+            this.forgetSeenMessage(msg.from_user_id, msg.message_id);
+            this.quota.abandonInbound(msg.from_user_id, String(msg.message_id));
+            throw err;
+          }
         }
         this.commitPendingPollCursor();
       } catch (err: unknown) {
@@ -509,7 +525,10 @@ export class ILinkClient {
       pendingTextCountAfterDrain,
     );
 
-    if (!text && !refText && mediaItems.length === 0) return;
+    if (!text && !refText && mediaItems.length === 0) {
+      this.quota.completeInbound(msg.from_user_id, String(msg.message_id));
+      return;
+    }
 
     log.debug(`收到 [${msg.from_user_id.substring(0, 12)}...]: ${text.substring(0, 60)}${mediaItems.length > 0 ? ` (+${mediaItems.length} media)` : ''}`);
 
@@ -526,6 +545,7 @@ export class ILinkClient {
         log.error('消息处理器异常:', err);
       }
     }
+    this.quota.completeInbound(msg.from_user_id, String(msg.message_id));
   }
 
   getContextToken(userId: string): string | undefined {

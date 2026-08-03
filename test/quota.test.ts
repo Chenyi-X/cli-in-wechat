@@ -49,6 +49,18 @@ test('QuotaManager increments inbound generation once and versions only changed 
   });
 });
 
+test('QuotaManager retries an inbound left in progress after restart', () => {
+  withQuota((filePath) => {
+    const first = new QuotaManager(filePath, 'account-a', limits);
+    const initial = first.recordInbound('user-a', 'message-in-progress', 'token-a');
+
+    const restarted = new QuotaManager(filePath, 'account-a', limits);
+    assert.deepEqual(restarted.recordInbound('user-a', 'message-in-progress', 'token-a'), initial);
+    assert.equal(restarted.completeInbound('user-a', 'message-in-progress'), true);
+    assert.equal(restarted.recordInbound('user-a', 'message-in-progress', 'token-a').duplicate, true);
+  });
+});
+
 test('QuotaManager persists generations and counts only successful reservations', () => {
   withQuota((filePath) => {
     const quota = new QuotaManager(filePath, 'account-a', limits);

@@ -43,6 +43,7 @@ interface UserQuotaState {
   tokenVersion: number;
   tokenFingerprint?: string;
   seenInboundIds: string[];
+  pendingInboundIds: string[];
   sentItems: number;
   sentBytes: number;
   reservedItems: number;
@@ -115,6 +116,7 @@ function emptyState(accountId: string, userId: string): UserQuotaState {
     inboundGeneration: 0,
     tokenVersion: 0,
     seenInboundIds: [],
+    pendingInboundIds: [],
     sentItems: 0,
     sentBytes: 0,
     reservedItems: 0,
@@ -129,6 +131,7 @@ function emptyState(accountId: string, userId: string): UserQuotaState {
 
 export class QuotaManager {
   private readonly users = new Map<string, UserQuotaState>();
+  private readonly activeInboundIds = new Set<string>();
   private readonly limits: QuotaLimits;
 
   constructor(
@@ -143,8 +146,9 @@ export class QuotaManager {
 
   recordInbound(userId: string, messageId: string, contextToken: string): InboundResult {
     const state = this.getState(userId);
+    const inboundKey = this.inboundKey(userId, messageId);
     const previousTokenVersion = state.tokenVersion;
-    if (state.seenInboundIds.includes(messageId)) {
+    if (state.seenInboundIds.includes(messageId) || this.activeInboundIds.has(inboundKey)) {
       return {
         duplicate: true,
         inboundGeneration: state.inboundGeneration,
@@ -152,9 +156,20 @@ export class QuotaManager {
       };
     }
 
-    state.seenInboundIds.push(messageId);
-    if (state.seenInboundIds.length > 1_000) state.seenInboundIds.shift();
-    state.inboundGeneration += 1;
+    const isRetry = state.pendingInboundIds.includes(messageId);
+    if (!isRetry) {
+      state.pendingInboundIds.push(messageId);
+      state.inboundGeneration += 1;
+    }
+    this.activeInboundIds.add(inboundKey);
+    if (isRetry) {
+      return {
+        duplicate: false,
+        inboundGeneration: state.inboundGeneration,
+        tokenVersion: state.tokenVersion,
+      };
+    }
+
     if (state.rateBackoffUntil === 0) {
       state.rateBackoffGeneration = state.inboundGeneration;
     }
@@ -186,6 +201,26 @@ export class QuotaManager {
       inboundGeneration: state.inboundGeneration,
       tokenVersion: state.tokenVersion,
     };
+  }
+
+  completeInbound(userId: string, messageId: string): boolean {
+    const state = this.getState(userId);
+    const inboundKey = this.inboundKey(userId, messageId);
+    const pendingIndex = state.pendingInboundIds.indexOf(messageId);
+    if (pendingIndex < 0 && !this.activeInboundIds.has(inboundKey)) return false;
+
+    this.activeInboundIds.delete(inboundKey);
+    if (pendingIndex >= 0) state.pendingInboundIds.splice(pendingIndex, 1);
+    if (!state.seenInboundIds.includes(messageId)) {
+      state.seenInboundIds.push(messageId);
+      if (state.seenInboundIds.length > 1_000) state.seenInboundIds.shift();
+    }
+    this.persist();
+    return true;
+  }
+
+  abandonInbound(userId: string, messageId: string): boolean {
+    return this.activeInboundIds.delete(this.inboundKey(userId, messageId));
   }
 
   snapshot(userId: string): QuotaSnapshot {
@@ -397,6 +432,10 @@ export class QuotaManager {
     return `${this.accountId}\u0000${userId}`;
   }
 
+  private inboundKey(userId: string, messageId: string): string {
+    return `${this.key(userId)}\u0000${messageId}`;
+  }
+
   private getState(userId: string): UserQuotaState {
     const key = this.key(userId);
     let state = this.users.get(key);
@@ -428,6 +467,8 @@ export class QuotaManager {
         state.reservations = {};
         state.reservedItems = 0;
         state.reservedBytes = 0;
+        state.seenInboundIds = Array.isArray(state.seenInboundIds) ? state.seenInboundIds : [];
+        state.pendingInboundIds = Array.isArray(state.pendingInboundIds) ? state.pendingInboundIds : [];
         // Older quota snapshots did not persist per-token counters. Treat the
         // current token as exhausted rather than resetting its budget after a
         // restart; a genuinely new context token resets these counters below.
