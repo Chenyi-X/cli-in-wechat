@@ -1690,6 +1690,101 @@ test('any inbound with queued text carries a recovery snapshot before normal rou
   });
 });
 
+test('an inbound sees text materialized while its serialized drain is waiting', async () => {
+  await withStores(async (outbox, quota) => {
+    const client = new ILinkClient(credentials, { outbox, quota });
+    quota.recordInbound('user-a', 'message-1', 'context-a');
+    (client as any).contextTokens.set('user-a', 'context-a');
+
+    let recovery: unknown;
+    client.onMessage((_msg, _text, _refText, _media, inboundRecovery) => {
+      recovery = inboundRecovery;
+    });
+
+    const originalDrain = (client as any).drainOutbox;
+    (client as any).drainOutbox = async () => {
+      await Promise.resolve();
+      outbox.enqueueText({
+        accountId: 'account-a',
+        userId: 'user-a',
+        generation: 1,
+        tokenVersion: 1,
+        priority: 'final',
+        text: '并发 drain 期间落盘的最终结果',
+      });
+      return [];
+    };
+
+    try {
+      await (client as any).processMessage({
+        message_id: 2,
+        from_user_id: 'user-a',
+        to_user_id: 'bot-user',
+        client_id: 'inbound-client-2',
+        create_time_ms: Date.now(),
+        message_type: 1,
+        message_state: 0,
+        context_token: 'context-b',
+        item_list: [{ type: 1, text_item: { text: '0' } }],
+      });
+
+      assert.deepEqual(recovery, { pendingTextCount: 1 });
+    } finally {
+      (client as any).drainOutbox = originalDrain;
+    }
+  });
+});
+
+test('an inbound does not reopen its recovery window after that drain already sent text', async () => {
+  await withStores(async (outbox, quota) => {
+    const client = new ILinkClient(credentials, { outbox, quota });
+    quota.recordInbound('user-a', 'message-1', 'context-a');
+    (client as any).contextTokens.set('user-a', 'context-a');
+
+    const consumed = quota.reserve('user-a', 1, 'control');
+    assert.equal(consumed.allowed, true);
+    if (consumed.allowed) quota.commit(consumed.reservation.reservationId);
+
+    let drainCalls = 0;
+    const originalDrain = (client as any).drainOutbox;
+    (client as any).drainOutbox = async () => {
+      drainCalls += 1;
+      outbox.enqueueText({
+        accountId: 'account-a',
+        userId: 'user-a',
+        generation: 1,
+        tokenVersion: 1,
+        priority: 'final',
+        text: `drain ${drainCalls}`,
+      });
+      const sent = quota.reserve('user-a', 1, 'final');
+      assert.equal(sent.allowed, true);
+      if (sent.allowed) quota.commit(sent.reservation.reservationId);
+      return [];
+    };
+
+    try {
+      await (client as any).processMessage({
+        message_id: 2,
+        from_user_id: 'user-a',
+        to_user_id: 'bot-user',
+        client_id: 'inbound-client-2',
+        create_time_ms: Date.now(),
+        message_type: 1,
+        message_state: 0,
+        context_token: 'context-a',
+        item_list: [{ type: 1, text_item: { text: '0' } }],
+      });
+
+      assert.equal(drainCalls, 1);
+      assert.equal(outbox.listPending('user-a').length, 1);
+      assert.equal(quota.getTokenBudget('user-a').sentItems, 2);
+    } finally {
+      (client as any).drainOutbox = originalDrain;
+    }
+  });
+});
+
 test('a replayed inbound after restart does not replace the current context token', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'wx-replay-'));
   try {

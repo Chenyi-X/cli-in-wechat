@@ -459,15 +459,44 @@ export class ILinkClient {
       msg.from_user_id,
       this.accountId,
     ).filter((item) => !this.isRecoveryNotice(item)).length;
+    const tokenChanged = inbound.tokenVersion !== previousTokenVersion;
 
     if (pendingTextCountBeforeDrain > 0
       && this.quota.openInboundRecoveryWindow(msg.from_user_id)) {
       log.info(`[msg] 新入站已打开恢复发送窗口: ${msg.from_user_id.substring(0, 12)}...`);
     }
+    const tokenSentItemsBeforeDrain = this.quota.getTokenBudget(msg.from_user_id).sentItems;
 
     // A new, deduplicated inbound message is the safe trigger for draining text
     // that was waiting for a usable context token or an ambiguous ret=-2 response.
     await this.drainOutbox(msg.from_user_id);
+
+    // The inbound may have raced with an earlier send drain. In that case the
+    // first snapshot was empty, but the serialized drain can expose durable
+    // backlog after it finishes. With an unchanged token, open the explicit
+    // inbound recovery window now and give that backlog one send pass.
+    let pendingTextCountAfterDrain = this.outbox.listPending(
+      msg.from_user_id,
+      this.accountId,
+    ).filter((item) => !this.isRecoveryNotice(item)).length;
+    const tokenSentItemsAfterDrain = this.quota.getTokenBudget(msg.from_user_id).sentItems;
+    if (pendingTextCountBeforeDrain === 0
+      && pendingTextCountAfterDrain > 0
+      && !tokenChanged
+      && tokenSentItemsAfterDrain === tokenSentItemsBeforeDrain
+      && this.quota.openInboundRecoveryWindow(msg.from_user_id)) {
+      log.info(`[msg] drain 期间发现积压，已打开恢复发送窗口: ${msg.from_user_id.substring(0, 12)}...`);
+      await this.drainOutbox(msg.from_user_id);
+      pendingTextCountAfterDrain = this.outbox.listPending(
+        msg.from_user_id,
+        this.accountId,
+      ).filter((item) => !this.isRecoveryNotice(item)).length;
+    }
+
+    const recoveryPendingTextCount = Math.max(
+      pendingTextCountBeforeDrain,
+      pendingTextCountAfterDrain,
+    );
 
     if (!text && !refText && mediaItems.length === 0) return;
 
@@ -480,7 +509,7 @@ export class ILinkClient {
           text,
           refText,
           mediaItems.length > 0 ? mediaItems : undefined,
-          pendingTextCountBeforeDrain > 0 ? { pendingTextCount: pendingTextCountBeforeDrain } : undefined,
+          recoveryPendingTextCount > 0 ? { pendingTextCount: recoveryPendingTextCount } : undefined,
         );
       } catch (err) {
         log.error('消息处理器异常:', err);
