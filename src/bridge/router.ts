@@ -175,8 +175,8 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
     const batches = this.splitNormalActivityLines(lines);
     if (batches.length <= 1) return { split: false, unsentLines: lines, hasUnconfirmed: false };
 
-    let allBatchesDurable = true;
     let hasUnconfirmed = false;
+    const unconfirmedLines: string[] = [];
     let previousBatchConfirmed = true;
     for (let i = 0; i < batches.length; i++) {
       const title = `Activity (${i + 1}/${batches.length})`;
@@ -188,19 +188,9 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
       const confirmed = Array.isArray(results)
         && results.length > 0
         && results.every((result) => result.status === 'sent');
-      const durable = Array.isArray(results)
-        && results.length > 0
-        && results.every((result) => (
-          result.status === 'sent'
-          || result.status === 'queued'
-          || result.status === 'rate-limited'
-          || result.status === 'waiting-for-token'
-        ));
-      if (!durable) {
-        allBatchesDurable = false;
-      }
       if (!confirmed) {
         hasUnconfirmed = true;
+        unconfirmedLines.push(...batches[i]);
       }
       if (previousBatchConfirmed && confirmed && i < batches.length - 1) {
         await this.sleep(NORMAL_ACTIVITY_SPLIT_DELAY_MS);
@@ -209,7 +199,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
     }
     return {
       split: true,
-      unsentLines: allBatchesDurable ? [] : batches.flat(),
+      unsentLines: unconfirmedLines,
       hasUnconfirmed,
     };
   }

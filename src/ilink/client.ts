@@ -800,7 +800,12 @@ export class ILinkClient {
         this.quota.commit(reservation.reservation.reservationId);
         this.outbox.ack(item.itemId);
         this.outbox.ack(`delivery-notice:${item.itemId}`);
-        if (item.priority === 'final') finalDelivered = true;
+        if (item.priority === 'final') {
+          finalDelivered = true;
+          // Once the final result is confirmed, stale streamed output from the
+          // same task must never be appended after it on a later recovery.
+          this.outbox.supersedeIntermediate(this.accountId, userId, item.generation);
+        }
         results.push(this.resultForItem(item, 'sent'));
       } catch (err) {
         this.quota.release(reservation.reservation.reservationId);

@@ -545,8 +545,26 @@ test('sendNormalActivityBatches queues every remaining batch after the first is 
   const delivery = await (router as any).sendNormalActivityBatches('u1', lines);
 
   assert.ok(sendCount > 1, 'all activity batches must enter the outbound scheduler');
-  assert.deepEqual(delivery.unsentLines, []);
+  assert.deepEqual(delivery.unsentLines, lines);
   assert.equal(messages.filter((message) => message.text.startsWith('Activity')).length, sendCount);
+});
+
+test('sendNormalActivityBatches returns every unconfirmed batch for the final result', async () => {
+  const { router, messages } = createRouter();
+  const lines = Array.from({ length: 20 }, (_, i) => `- Shell Command: item ${i + 1} ${'q'.repeat(90)}`);
+  const batches = (router as any).splitNormalActivityLines(lines);
+  let sendCount = 0;
+  (router as any).ilink.sendText = async (_uid: string, text: string) => {
+    sendCount += 1;
+    messages.push({ uid: _uid, text });
+    return sendCount === 1 ? [{ status: 'sent' }] : [{ status: 'queued' }];
+  };
+
+  const delivery = await (router as any).sendNormalActivityBatches('u1', lines);
+
+  assert.ok(batches.length > 1);
+  assert.deepEqual(delivery.unsentLines, batches.slice(1).flat());
+  assert.equal(delivery.hasUnconfirmed, true);
 });
 
 test('exec sanitizes stale malformed model before adapter execution', async () => {

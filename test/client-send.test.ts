@@ -681,7 +681,7 @@ test('rate backoff keeps new intermediate text durable for the next inbound toke
   });
 });
 
-test('a fresh inbound token drains the final result and queued intermediate text', async () => {
+test('a fresh inbound token drains the final result and drops stale intermediate text', async () => {
   await withStores(async (outbox, quota) => {
     const client = new ILinkClient(credentials, { outbox, quota });
     quota.recordInbound('user-a', 'message-1', 'context-a');
@@ -720,10 +720,10 @@ test('a fresh inbound token drains the final result and queued intermediate text
         item_list: [],
       });
 
-      assert.equal(requestCount, 3);
+      assert.equal(requestCount, 2);
       assert.deepEqual(
         payloads.slice(1).map((payload) => payload.msg.item_list[0].text_item.text),
-        ['最终结果', '之前被保护的中间消息'],
+        ['最终结果'],
       );
       assert.deepEqual(outbox.listPending('user-a'), []);
     } finally {
@@ -793,6 +793,58 @@ test('a final result does not delete durable intermediate messages from the same
     assert.equal(pending.length, 2);
     assert.deepEqual(pending.map((item) => item.priority), ['final', 'intermediate']);
     assert.equal(pending.some((item) => item.text === '需要在恢复后补发的中间文本'), true);
+  });
+});
+
+test('a confirmed final drops stale intermediate and activity items from the same generation', async () => {
+  await withStores(async (outbox, quota) => {
+    const client = new ILinkClient(credentials, { outbox, quota });
+    quota.recordInbound('user-a', 'message-1', 'context-a');
+    (client as any).contextTokens.set('user-a', 'context-a');
+    const staleIntermediate = outbox.enqueueText({
+      accountId: 'account-a',
+      userId: 'user-a',
+      generation: 1,
+      tokenVersion: 1,
+      priority: 'intermediate',
+      text: '过时的中间文本',
+    });
+    outbox.enqueueText({
+      accountId: 'account-a',
+      userId: 'user-a',
+      generation: 1,
+      tokenVersion: 1,
+      priority: 'activity',
+      text: '过时的 Activity',
+    });
+    outbox.enqueueText({
+      itemId: `delivery-notice:${staleIntermediate.itemId}`,
+      accountId: 'account-a',
+      userId: 'user-a',
+      generation: 1,
+      tokenVersion: 1,
+      priority: 'control',
+      text: '过时的恢复提示',
+    });
+
+    const originalFetch = globalThis.fetch;
+    const payloads: Array<Record<string, any>> = [];
+    globalThis.fetch = async (_input, init) => {
+      payloads.push(JSON.parse(String(init?.body)));
+      return new Response(JSON.stringify({ ret: 0, message_id: payloads.length }), { status: 200 });
+    };
+    try {
+      const results = await client.sendText('user-a', '最终结果', { priority: 'final' });
+
+      assert.ok(results.some((result) => result.status === 'sent'));
+      assert.deepEqual(
+        payloads.map((payload) => payload.msg.item_list[0].text_item.text),
+        ['最终结果'],
+      );
+      assert.deepEqual(outbox.list('user-a'), []);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 });
 
