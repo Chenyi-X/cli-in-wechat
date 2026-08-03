@@ -1243,6 +1243,66 @@ test('a fresh inbound requeues a legacy ret=-2 failure left by the running proce
   });
 });
 
+test('an inbound recovery requeues a failed item referenced by its durable notice', async () => {
+  await withStores(async (outbox, quota) => {
+    const client = new ILinkClient(credentials, { outbox, quota });
+    quota.recordInbound('user-a', 'message-1', 'context-a');
+    (client as any).contextTokens.set('user-a', 'context-a');
+
+    const item = outbox.enqueueText({
+      accountId: 'account-a',
+      userId: 'user-a',
+      generation: 1,
+      tokenVersion: 1,
+      priority: 'final',
+      text: '恢复提示关联的正文必须继续发送',
+    });
+    outbox.markPermanentFailure(item.itemId, {
+      errmsg: 'Prepare failed',
+    });
+    outbox.enqueueText({
+      itemId: `delivery-notice:${item.itemId}`,
+      accountId: 'account-a',
+      userId: 'user-a',
+      generation: 1,
+      tokenVersion: 1,
+      priority: 'control',
+      text: '消息发送暂时受限，收到新的消息后自动续发。',
+    });
+
+    const recoveries: Array<{ pendingTextCount: number } | undefined> = [];
+    client.onMessage((_msg, _text, _refText, _media, recovery) => {
+      recoveries.push(recovery);
+    });
+
+    const originalFetch = globalThis.fetch;
+    const payloads: Array<Record<string, any>> = [];
+    globalThis.fetch = async (_input, init) => {
+      payloads.push(JSON.parse(String(init?.body)));
+      return new Response(JSON.stringify({ ret: 0, message_id: payloads.length }), { status: 200 });
+    };
+    try {
+      await (client as any).processMessage({
+        message_id: 2,
+        from_user_id: 'user-a',
+        to_user_id: 'bot-user',
+        client_id: 'inbound-client-2',
+        create_time_ms: Date.now(),
+        message_type: 1,
+        message_state: 0,
+        context_token: '',
+        item_list: [{ type: 1, text_item: { text: '0' } }],
+      });
+
+      assert.equal(payloads.at(-1)?.msg.item_list[0].text_item.text, '恢复提示关联的正文必须继续发送');
+      assert.deepEqual(outbox.listPending('user-a'), []);
+      assert.deepEqual(recoveries, [{ pendingTextCount: 1 }]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
 test('sendImage reserves caption and image as one media request', async () => {
   await withStores(async (outbox, quota) => {
     const dir = mkdtempSync(join(tmpdir(), 'wxmedia-'));

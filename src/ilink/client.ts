@@ -410,13 +410,24 @@ export class ILinkClient {
       itemListBytes: Buffer.byteLength(JSON.stringify(msg.item_list), 'utf8'),
     });
 
+    const recoveryNoticeTargets = new Set(
+      this.outbox
+        .listPending(msg.from_user_id, this.accountId)
+        .filter((item) => item.itemId.startsWith('delivery-notice:'))
+        .map((item) => item.itemId.slice('delivery-notice:'.length)),
+    );
     const requeued = this.outbox.requeuePermanentFailures((item) => {
       if (item.accountId !== this.accountId || item.userId !== msg.from_user_id) return false;
       // Local quota failures are recoverable on any new, de-duplicated inbound.
       // The token may remain byte-identical, so this must not depend on a token
       // version change. The current token budget is still enforced by reserve().
       if (item.tokenVersion > inbound.tokenVersion) return false;
-      return this.isLocalBudgetFailure(item) || item.terminalError?.ret === -2;
+      // A durable delivery notice is an explicit promise that its target is
+      // retryable. This also recovers legacy items whose old process lost the
+      // structured ret=-2 fields while marking the target terminal.
+      return this.isLocalBudgetFailure(item)
+        || item.terminalError?.ret === -2
+        || recoveryNoticeTargets.has(item.itemId);
     });
     if (requeued > 0) {
       log.warn(`[msg] 新入站已重新排队 ${requeued} 个可恢复发送项`);
