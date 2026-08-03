@@ -427,6 +427,7 @@ export class ILinkClient {
       // structured ret=-2 fields while marking the target terminal.
       return this.isLocalBudgetFailure(item)
         || item.terminalError?.ret === -2
+        || item.recoveryRequired === true
         || recoveryNoticeTargets.has(item.itemId);
     });
     if (requeued > 0) {
@@ -840,6 +841,7 @@ export class ILinkClient {
           this.noteRateLimit(userId);
           if (item.priority !== 'control') {
             try {
+              this.outbox.markRecoveryRequired(item.itemId);
               this.outbox.enqueueText({
                 itemId: `delivery-notice:${item.itemId}`,
                 accountId: this.accountId,
@@ -857,6 +859,7 @@ export class ILinkClient {
         } else if (this.isUnconfirmedResponse(details)) {
           if (item.priority !== 'control') {
             try {
+              this.outbox.markRecoveryRequired(item.itemId);
               this.outbox.enqueueText({
                 itemId: `delivery-notice:${item.itemId}`,
                 accountId: this.accountId,
@@ -873,6 +876,7 @@ export class ILinkClient {
           this.quota.noteRateBackoff(userId, Date.now() + BASE_RATE_LIMIT_COOLDOWN_MS);
           this.deliveryStates.set(userId, 'WAITING_INBOUND');
         } else {
+          this.outbox.clearRecoveryRequired(item.itemId);
           this.outbox.markPermanentFailure(item.itemId, details);
           this.enqueueVisibleFailureNotice(item, details);
           this.deliveryStates.set(userId, 'PERMANENT_FAILURE');

@@ -36,6 +36,7 @@ export interface OutboxTextItem {
   createdAt: number;
   expiresAt: number;
   state: 'pending' | 'permanent-failure';
+  recoveryRequired?: boolean;
   terminalError?: {
     ret?: number;
     errcode?: number;
@@ -241,6 +242,26 @@ export class OutboxStore {
     if (!item || item.state === 'permanent-failure') return false;
     const nextItems = new Map(this.items);
     nextItems.set(itemId, { ...item, state: 'permanent-failure', terminalError: error });
+    this.persistState(nextItems, this.nextSequence);
+    this.publish(nextItems, this.nextSequence);
+    return true;
+  }
+
+  markRecoveryRequired(itemId: string): boolean {
+    const item = this.items.get(itemId);
+    if (!item || item.recoveryRequired) return false;
+    const nextItems = new Map(this.items);
+    nextItems.set(itemId, { ...item, recoveryRequired: true });
+    this.persistState(nextItems, this.nextSequence);
+    this.publish(nextItems, this.nextSequence);
+    return true;
+  }
+
+  clearRecoveryRequired(itemId: string): boolean {
+    const item = this.items.get(itemId);
+    if (!item || !item.recoveryRequired) return false;
+    const nextItems = new Map(this.items);
+    nextItems.set(itemId, { ...item, recoveryRequired: undefined });
     this.persistState(nextItems, this.nextSequence);
     this.publish(nextItems, this.nextSequence);
     return true;

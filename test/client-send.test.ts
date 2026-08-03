@@ -1303,6 +1303,55 @@ test('an inbound recovery requeues a failed item referenced by its durable notic
   });
 });
 
+test('an acknowledged recovery notice keeps an ambiguous item recoverable', async () => {
+  await withStores(async (outbox, quota) => {
+    const client = new ILinkClient(credentials, { outbox, quota });
+    quota.recordInbound('user-a', 'message-1', 'context-a');
+    (client as any).contextTokens.set('user-a', 'context-a');
+
+    const originalFetch = globalThis.fetch;
+    let requestCount = 0;
+    globalThis.fetch = async () => {
+      requestCount += 1;
+      return new Response(JSON.stringify(
+        requestCount === 1
+          ? { ret: -2, errcode: 17, errmsg: 'Prepare failed' }
+          : { ret: 0, message_id: requestCount },
+      ), { status: 200 });
+    };
+    try {
+      await client.sendText('user-a', '曾经被提示后仍要恢复的正文', { priority: 'final' });
+
+      const item = outbox.listPending('user-a').find((candidate) => candidate.priority === 'final');
+      assert.ok(item);
+      const notice = outbox.get(`delivery-notice:${item.itemId}`);
+      assert.ok(notice);
+
+      // Model the notice being displayed and acknowledged before an older
+      // process persisted the ambiguous body as terminal.
+      outbox.ack(notice.itemId);
+      outbox.markPermanentFailure(item.itemId, { errmsg: 'Prepare failed' });
+
+      await (client as any).processMessage({
+        message_id: 2,
+        from_user_id: 'user-a',
+        to_user_id: 'bot-user',
+        client_id: 'inbound-client-2',
+        create_time_ms: Date.now(),
+        message_type: 1,
+        message_state: 0,
+        context_token: 'context-a',
+        item_list: [{ type: 1, text_item: { text: '0' } }],
+      });
+
+      assert.equal(requestCount, 2);
+      assert.deepEqual(outbox.listPending('user-a'), []);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
 test('sendImage reserves caption and image as one media request', async () => {
   await withStores(async (outbox, quota) => {
     const dir = mkdtempSync(join(tmpdir(), 'wxmedia-'));
