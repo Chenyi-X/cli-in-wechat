@@ -39,6 +39,8 @@ interface UserQuotaState {
   reservedItems: number;
   reservedBytes: number;
   reservations: Record<string, ReservationRecord>;
+  rateBackoffUntil: number;
+  rateBackoffGeneration: number;
 }
 
 interface PersistedQuotaState {
@@ -73,6 +75,11 @@ export interface QuotaReservation {
   priority: QuotaPriority;
 }
 
+export interface QuotaContext {
+  generation: number;
+  tokenVersion: number;
+}
+
 export type ReserveResult =
   | { allowed: false; reason: 'final-reserved' | 'budget-exhausted' }
   | { allowed: true; reservation: QuotaReservation };
@@ -93,6 +100,8 @@ function emptyState(accountId: string, userId: string): UserQuotaState {
     reservedItems: 0,
     reservedBytes: 0,
     reservations: {},
+    rateBackoffUntil: 0,
+    rateBackoffGeneration: 0,
   };
 }
 
@@ -123,6 +132,8 @@ export class QuotaManager {
     state.seenInboundIds.push(messageId);
     if (state.seenInboundIds.length > 1_000) state.seenInboundIds.shift();
     state.inboundGeneration += 1;
+    state.rateBackoffUntil = 0;
+    state.rateBackoffGeneration = state.inboundGeneration;
 
     if (contextToken) {
       const nextFingerprint = fingerprint(contextToken);
@@ -154,7 +165,30 @@ export class QuotaManager {
     };
   }
 
-  reserve(userId: string, bytes: number, priority: QuotaPriority): ReserveResult {
+  noteRateBackoff(userId: string, until: number): void {
+    const state = this.getState(userId);
+    state.rateBackoffUntil = Math.max(state.rateBackoffUntil, until);
+    state.rateBackoffGeneration = state.inboundGeneration;
+    this.persist();
+  }
+
+  clearRateBackoff(userId: string): void {
+    const state = this.getState(userId);
+    if (state.rateBackoffUntil === 0 && state.rateBackoffGeneration === state.inboundGeneration) return;
+    state.rateBackoffUntil = 0;
+    state.rateBackoffGeneration = state.inboundGeneration;
+    this.persist();
+  }
+
+  getRateBackoff(userId: string): { until: number; generation: number } {
+    const state = this.getState(userId);
+    return {
+      until: state.rateBackoffUntil,
+      generation: state.rateBackoffGeneration,
+    };
+  }
+
+  reserve(userId: string, bytes: number, priority: QuotaPriority, context?: QuotaContext): ReserveResult {
     if (!Number.isInteger(bytes) || bytes < 0) throw new RangeError('bytes must be a non-negative integer');
 
     const state = this.getState(userId);
@@ -189,8 +223,8 @@ export class QuotaManager {
       reservation: {
         reservationId,
         userId,
-        generation: state.inboundGeneration,
-        tokenVersion: state.tokenVersion,
+        generation: context?.generation ?? state.inboundGeneration,
+        tokenVersion: context?.tokenVersion ?? state.tokenVersion,
         items: 1,
         bytes,
         priority,
@@ -257,6 +291,10 @@ export class QuotaManager {
         state.reservations = {};
         state.reservedItems = 0;
         state.reservedBytes = 0;
+        state.rateBackoffUntil = Number.isFinite(state.rateBackoffUntil) ? state.rateBackoffUntil : 0;
+        state.rateBackoffGeneration = Number.isInteger(state.rateBackoffGeneration)
+          ? state.rateBackoffGeneration
+          : state.inboundGeneration;
         this.users.set(key, state);
       }
     } catch {
@@ -266,6 +304,16 @@ export class QuotaManager {
 
   private persist(): void {
     const users: Record<string, UserQuotaState> = {};
+    if (existsSync(this.filePath)) {
+      try {
+        const parsed = JSON.parse(readFileSync(this.filePath, 'utf8')) as PersistedQuotaState;
+        if (parsed.schemaVersion === 1 && parsed.users) {
+          Object.assign(users, parsed.users);
+        }
+      } catch {
+        // Keep the current in-memory account state if the old snapshot is corrupt.
+      }
+    }
     for (const [key, state] of this.users) users[key] = state;
     const payload: PersistedQuotaState = { schemaVersion: 1, users };
     atomicWrite(this.filePath, JSON.stringify(payload, null, 2));

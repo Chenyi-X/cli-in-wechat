@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { execSync } from 'node:child_process';
 import { log } from '../utils/logger.js';
-import { ILinkClient } from '../ilink/client.js';
+import { ILinkClient, type DeliveryContext } from '../ilink/client.js';
 import { AdapterRegistry } from '../adapters/registry.js';
 import { SessionManager } from './session.js';
 import { formatResponse } from './formatter.js';
@@ -155,7 +155,11 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
     await new Promise((resolve) => setTimeout(resolve, ms));
   }
 
-  private async sendNormalActivityBatches(uid: string, lines: string[]): Promise<boolean> {
+  private async sendNormalActivityBatches(
+    uid: string,
+    lines: string[],
+    deliveryContext?: DeliveryContext,
+  ): Promise<boolean> {
     const batches = this.splitNormalActivityLines(lines);
     if (batches.length <= 1) return false;
 
@@ -164,6 +168,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
       await this.ilink.sendText(uid, [title, ...batches[i]].join('\n'), {
         streamType: 'intermediate',
         priority: 'activity',
+        ...deliveryContext,
       });
       if (i < batches.length - 1) await this.sleep(NORMAL_ACTIVITY_SPLIT_DELAY_MS);
     }
@@ -1059,6 +1064,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
     const abort = new AbortController();
     this.active.set(`${uid}:${tool1}`, { abort, tool: `${tool1}>${tool2}` });
     this.active.set(`${uid}:${tool2}`, { abort, tool: `${tool1}>${tool2}` });
+    const deliveryContext = this.ilink.getDeliveryContext?.(uid);
     const stopTyping = await this.ilink.startTyping(uid);
     const start = Date.now();
 
@@ -1069,7 +1075,10 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
 
       if (abort.signal.aborted || r1.error) {
         if (!abort.signal.aborted) {
-          await this.ilink.sendText(uid, formatResponse(n1 + r1.text, { tool: adapter1.displayName, error: true }), { priority: 'final' });
+          await this.ilink.sendText(uid, formatResponse(n1 + r1.text, { tool: adapter1.displayName, error: true }), {
+            priority: 'final',
+            ...deliveryContext,
+          });
         }
         return;
       }
@@ -1098,11 +1107,14 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
         tool: `${adapter1.displayName} → ${adapter2.displayName}`,
         duration: elapsed,
         error: r2.error,
-      }), { priority: 'final' });
+      }), { priority: 'final', ...deliveryContext });
     } catch (err: unknown) {
       if (!abort.signal.aborted) {
         log.error(`[chain] 失败:`, err);
-        await this.ilink.sendText(uid, `链式调用失败: ${(err as Error).message}`);
+        await this.ilink.sendText(uid, `链式调用失败: ${(err as Error).message}`, {
+          priority: 'final',
+          ...deliveryContext,
+        });
       }
     } finally {
       stopTyping();
@@ -1216,10 +1228,11 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
 
     const abort = new AbortController();
     this.active.set(`${uid}:${toolName}`, { abort, tool: toolName });
-    const stopTyping = await this.ilink.startTyping(uid);
-    const start = Date.now();
     const settings = this.sessions.get(uid);
     const msgMode = this.normalizeMsgMode(settings.msgMode);
+    const deliveryContext = this.ilink.getDeliveryContext?.(uid);
+    const stopTyping = await this.ilink.startTyping(uid);
+    const start = Date.now();
 
     // Track if we've streamed text (to avoid duplicate with final result)
     let hasStreamedText = false;
@@ -1230,7 +1243,16 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
     const enqueueIntermediateSend = (text: string): void => {
       if (!text.trim()) return;
       sendQueue = sendQueue
-        .then(() => this.ilink.sendText(uid, text, { streamType: 'intermediate' }).then(() => undefined))
+        .then(async () => {
+          const results = await this.ilink.sendText(uid, text, {
+            streamType: 'intermediate',
+            ...deliveryContext,
+          });
+          const confirmed = Array.isArray(results)
+            && results.length > 0
+            && results.every((result) => result.status === 'sent');
+          if (!confirmed) intermediateSendFailed = true;
+        })
         .catch((err) => {
           intermediateSendFailed = true;
           log.error(`[${toolName}] 发送中间消息失败:`, err);
@@ -1333,7 +1355,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
       }
 
       // Parse [SEND_FILE: path] markers and send files
-      const { text: cleanText, sentFiles, failedFiles } = await this.parseAndSendFiles(uid, result.text);
+      const { text: cleanText, sentFiles, failedFiles } = await this.parseAndSendFiles(uid, result.text, deliveryContext);
 
       // Store for >> relay; auto-switch defaultTool to last used tool
       this.lastResponse.set(uid, { tool: adapter.displayName, text: cleanText });
@@ -1341,7 +1363,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
 
       // Send thinking content if enabled (only in compact mode, non-compact already streamed)
       if (settings.showThoughts && result.thinking && msgMode === 'compact') {
-        await this.ilink.sendText(uid, `💭 思考:\n${result.thinking}\n\n---`);
+        await this.ilink.sendText(uid, `💭 思考:\n${result.thinking}\n\n---`, deliveryContext);
       }
 
       const sentNotice = sentFiles.length > 0
@@ -1352,7 +1374,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
         : '';
 
       const splitActivitySent = msgMode === 'normal' && finalActivityLines.length > 0
-        ? await this.sendNormalActivityBatches(uid, finalActivityLines)
+        ? await this.sendNormalActivityBatches(uid, finalActivityLines, deliveryContext)
         : false;
 
       const finalActivityBlock = msgMode === 'normal' && finalActivityLines.length > 0 && !splitActivitySent
@@ -1360,27 +1382,29 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
         : '';
 
       // If text was already streamed, only send footer (avoid duplicate large-body resend).
-      if (hasStreamedText) {
-        const tailNotice = intermediateSendFailed
-          ? `${notice}[部分中间消息发送失败]${sentNotice}${failedNotice}`
-          : `${notice}${sentNotice}${failedNotice}`;
+      if (hasStreamedText && !intermediateSendFailed) {
+        const tailNotice = `${notice}${sentNotice}${failedNotice}`;
         await this.ilink.sendText(uid, formatResponse(`${finalActivityBlock}${tailNotice}`.trim(), {
           tool: adapter.displayName,
           duration: result.duration || (Date.now() - start),
           error: result.error,
-        }), { priority: 'final' });
+        }), { priority: 'final', ...deliveryContext });
       } else {
         // compact mode or no streamed text: send full result
-        await this.ilink.sendText(uid, formatResponse(`${finalActivityBlock}${notice}${cleanText}${sentNotice}${failedNotice}`, {
+        const recoveryNotice = hasStreamedText && intermediateSendFailed ? '[部分中间消息发送失败]\n' : '';
+        await this.ilink.sendText(uid, formatResponse(`${finalActivityBlock}${notice}${recoveryNotice}${cleanText}${sentNotice}${failedNotice}`, {
           tool: adapter.displayName,
           duration: result.duration || (Date.now() - start),
           error: result.error,
-        }), { priority: 'final' });
+        }), { priority: 'final', ...deliveryContext });
       }
     } catch (err: unknown) {
       if (!abort.signal.aborted) {
         log.error(`[${toolName}] 失败:`, err);
-        await this.ilink.sendText(uid, `失败: ${(err as Error).message}`);
+        await this.ilink.sendText(uid, `失败: ${(err as Error).message}`, {
+          priority: 'final',
+          ...deliveryContext,
+        });
       }
     } finally {
       // Defensive cleanup for pending timer when task exits early.
@@ -1390,7 +1414,11 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
     }
   }
 
-  private async parseAndSendFiles(uid: string, text: string): Promise<{ text: string; sentFiles: string[]; failedFiles: string[] }> {
+  private async parseAndSendFiles(
+    uid: string,
+    text: string,
+    deliveryContext?: DeliveryContext,
+  ): Promise<{ text: string; sentFiles: string[]; failedFiles: string[] }> {
     const { existsSync } = await import('node:fs');
     const sentFiles: string[] = [];
     const failedFiles: string[] = [];
@@ -1416,11 +1444,11 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
         const ext = filePath.split('.').pop()?.toLowerCase();
         let results;
         if (['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'].includes(ext || '')) {
-          results = await this.ilink.sendImage(uid, filePath);
+          results = await this.ilink.sendImage(uid, filePath, undefined, deliveryContext);
         } else if (['mp4', 'mov', 'avi', 'mkv', 'webm'].includes(ext || '')) {
-          results = await this.ilink.sendVideo(uid, filePath);
+          results = await this.ilink.sendVideo(uid, filePath, deliveryContext);
         } else {
-          results = await this.ilink.sendFile(uid, filePath);
+          results = await this.ilink.sendFile(uid, filePath, undefined, deliveryContext);
         }
         const failed = results.find((item: { status: string }) => item.status !== 'sent');
         if (failed) {
@@ -1431,6 +1459,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
         log.info(`[SEND_FILE] 已发送: ${filePath}`);
       } catch (err) {
         log.error(`[SEND_FILE] 发送失败: ${filePath}`, err);
+        failedFiles.push(`${filePath}: ${(err as Error).message || String(err)}`);
       }
     }
 

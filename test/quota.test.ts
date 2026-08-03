@@ -94,3 +94,34 @@ test('QuotaManager clears in-flight reservations after a crash/restart', () => {
     assert.equal(retry.allowed, true);
   });
 });
+
+test('QuotaManager persists rate backoff until a fresh inbound message', () => {
+  withQuota((filePath) => {
+    const quota = new QuotaManager(filePath, 'account-a');
+    quota.recordInbound('user-a', 'message-1', 'token-a');
+    const until = Date.now() + 60_000;
+
+    quota.noteRateBackoff('user-a', until);
+    const restarted = new QuotaManager(filePath, 'account-a');
+    assert.equal(restarted.getRateBackoff('user-a').until, until);
+
+    restarted.recordInbound('user-a', 'message-2', 'token-b');
+    assert.equal(restarted.getRateBackoff('user-a').until, 0);
+  });
+});
+
+test('QuotaManager preserves another account when sharing a state file', () => {
+  withQuota((filePath) => {
+    const first = new QuotaManager(filePath, 'account-a', limits);
+    first.recordInbound('user-a', 'message-a', 'token-a');
+    const reservation = first.reserve('user-a', 8, 'final');
+    assert.equal(reservation.allowed, true);
+    first.commit(reservation.reservation.reservationId);
+
+    const second = new QuotaManager(filePath, 'account-b', limits);
+    second.recordInbound('user-b', 'message-b', 'token-b');
+
+    const reloadedFirst = new QuotaManager(filePath, 'account-a', limits);
+    assert.equal(reloadedFirst.snapshot('user-a').sentItems, 1);
+  });
+});

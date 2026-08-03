@@ -1,5 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 
 import { Router } from '../src/bridge/router.js';
 import { DEFAULT_SETTINGS } from '../src/adapters/base.js';
@@ -190,6 +193,125 @@ test('plain 继续 reaches the Agent when no durable delivery is waiting', async
   await router.handle(makeMessage('u1'), '继续', '');
 
   assert.equal(capturedPrompt, '继续');
+});
+
+test('exec sends the complete final body when intermediate delivery was not confirmed', async () => {
+  const { router } = createRouter();
+  const sent: Array<{ text: string; options?: Record<string, unknown> }> = [];
+  (router as any).ilink.sendText = async (_uid: string, text: string, options?: Record<string, unknown>) => {
+    sent.push({ text, options });
+    return options?.streamType === 'intermediate'
+      ? [{ status: 'rate-limited' }]
+      : [{ status: 'sent' }];
+  };
+  (router as any).registry = {
+    get: () => ({
+      displayName: 'Gemini',
+      capabilities: { sessionResume: false },
+      execute: async (_prompt: string, options: any) => {
+        options.onIntermediate?.({ type: 'text', content: 'partial text' });
+        return { text: 'complete final body', duration: 1, error: false };
+      },
+    }),
+  };
+
+  await (router as any).exec('u1', 'gemini', 'prompt');
+
+  const final = sent.find((message) => message.options?.priority === 'final');
+  assert.ok(final?.text.includes('complete final body'), JSON.stringify(sent));
+});
+
+test('chain final output keeps the delivery context captured at task start', async () => {
+  const { router } = createRouter();
+  const sent: Array<{ text: string; options?: Record<string, unknown> }> = [];
+  (router as any).ilink.getDeliveryContext = () => ({ generation: 4, tokenVersion: 2 });
+  (router as any).ilink.sendText = async (_uid: string, text: string, options?: Record<string, unknown>) => {
+    sent.push({ text, options });
+    return [{ status: 'sent' }];
+  };
+  const adapter = {
+    displayName: 'Tool',
+    capabilities: { sessionResume: false },
+    execute: async () => ({ text: 'chain output', duration: 1, error: false }),
+  };
+  (router as any).registry = { get: () => adapter };
+
+  await (router as any).chain('u1', 'gemini', 'codex', 'prompt');
+
+  const final = sent.find((message) => message.options?.priority === 'final');
+  assert.equal(final?.options?.generation, 4);
+  assert.equal(final?.options?.tokenVersion, 2);
+});
+
+test('exec failure keeps the delivery context captured at task start', async () => {
+  const { router } = createRouter();
+  const sent: Array<{ text: string; options?: Record<string, unknown> }> = [];
+  (router as any).ilink.getDeliveryContext = () => ({ generation: 4, tokenVersion: 2 });
+  (router as any).ilink.sendText = async (_uid: string, text: string, options?: Record<string, unknown>) => {
+    sent.push({ text, options });
+    return [{ status: 'sent' }];
+  };
+  (router as any).registry = {
+    get: () => ({
+      displayName: 'Gemini',
+      capabilities: { sessionResume: false },
+      execute: async () => {
+        throw new Error('adapter failed');
+      },
+    }),
+  };
+
+  await (router as any).exec('u1', 'gemini', 'prompt');
+
+  assert.equal(sent[0]?.options?.priority, 'final');
+  assert.equal(sent[0]?.options?.generation, 4);
+  assert.equal(sent[0]?.options?.tokenVersion, 2);
+});
+
+test('exec captures delivery context before asynchronous typing setup', async () => {
+  const { router } = createRouter();
+  const sent: Array<{ text: string; options?: Record<string, unknown> }> = [];
+  let context = { generation: 1, tokenVersion: 1 };
+  (router as any).ilink.getDeliveryContext = () => context;
+  (router as any).ilink.startTyping = async () => {
+    context = { generation: 2, tokenVersion: 2 };
+    return () => {};
+  };
+  (router as any).ilink.sendText = async (_uid: string, text: string, options?: Record<string, unknown>) => {
+    sent.push({ text, options });
+    return [{ status: 'sent' }];
+  };
+  (router as any).registry = {
+    get: () => ({
+      displayName: 'Gemini',
+      capabilities: { sessionResume: false },
+      execute: async () => ({ text: 'result', duration: 1, error: false }),
+    }),
+  };
+
+  await (router as any).exec('u1', 'gemini', 'prompt');
+
+  const final = sent.find((message) => message.options?.priority === 'final');
+  assert.equal(final?.options?.generation, 1);
+  assert.equal(final?.options?.tokenVersion, 1);
+});
+
+test('parseAndSendFiles reports unexpected media exceptions', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wx-router-media-'));
+  const filePath = join(dir, 'image.png');
+  writeFileSync(filePath, 'image');
+  try {
+    const { router } = createRouter();
+    (router as any).ilink.sendImage = async () => {
+      throw new Error('upload broke');
+    };
+
+    const result = await (router as any).parseAndSendFiles('u1', `[SEND_FILE: ${filePath}]`);
+
+    assert.match(result.failedFiles[0], /upload broke/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('handleSlash /model strips accidental /. suffix from model name', async () => {

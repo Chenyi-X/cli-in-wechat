@@ -1,5 +1,5 @@
 import { randomUUID, randomBytes } from 'node:crypto';
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, statSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { generateWechatUin, encryptAesEcb, aesEcbPaddedSize, encodeMessageAesKey, md5 } from '../utils/crypto.js';
 import { log } from '../utils/logger.js';
@@ -7,7 +7,7 @@ import { fetchWithRetry, describeNetworkError, isRetryableNetworkError } from '.
 import { DATA_DIR, savePollCursor, loadPollCursor, saveContextTokens, loadContextTokens } from '../config.js';
 import { downloadImage, downloadFile, downloadVideo, type DownloadedMedia } from '../utils/media.js';
 import { OutboxStore, type OutboxPriority } from './outbox.js';
-import { QuotaManager } from './quota.js';
+import { QuotaManager, type QuotaReservation } from './quota.js';
 import { chunkUtf8Text } from './text-chunk.js';
 import { classifyApiFailure, ILinkApiError, type ApiErrorDetails, type SendResult } from './send-result.js';
 import type {
@@ -39,6 +39,11 @@ export type DeliveryState =
   | 'RATE_BACKOFF'
   | 'PERMANENT_FAILURE';
 
+export interface DeliveryContext {
+  generation: number;
+  tokenVersion: number;
+}
+
 interface UserRateLimitState {
   consecutiveRet2: number;
   suppressIntermediateUntil: number;
@@ -62,7 +67,7 @@ export class ILinkClient {
   private credentials: Credentials;
   private pollCursor: string;
   private running = false;
-  private contextTokens = loadContextTokens();
+  private contextTokens: Map<string, string>;
   private typingTickets = new Map<string, { ticket: string; ts: number }>();
   private handlers: MessageHandler[] = [];
   private sendQueues = new Map<string, Promise<unknown>>();
@@ -86,8 +91,9 @@ export class ILinkClient {
 
   constructor(credentials: Credentials, options: ILinkClientOptions = {}) {
     this.credentials = credentials;
-    this.pollCursor = loadPollCursor();
     this.accountId = options.accountId || credentials.ilinkBotId;
+    this.pollCursor = loadPollCursor(this.accountId);
+    this.contextTokens = loadContextTokens(this.accountId);
     this.outbox = options.outbox || new OutboxStore(join(DATA_DIR, 'outbox.json'));
     this.quota = options.quota || new QuotaManager(join(DATA_DIR, 'quota.json'), this.accountId);
   }
@@ -277,7 +283,7 @@ export class ILinkClient {
 
       if (data.get_updates_buf) {
         this.pollCursor = data.get_updates_buf;
-        savePollCursor(this.pollCursor);
+        savePollCursor(this.pollCursor, this.accountId);
       }
 
       return data.msgs || [];
@@ -304,16 +310,21 @@ export class ILinkClient {
       String(msg.message_id),
       msg.context_token,
     );
+    if (inbound.duplicate) {
+      log.debug(`[msg] 持久化判重命中，跳过重放 message_id=${msg.message_id}`);
+      return;
+    }
+
     this.contextTokens.set(msg.from_user_id, msg.context_token);
-    saveContextTokens(this.contextTokens);
+    saveContextTokens(this.contextTokens, this.accountId);
 
     // A real, deduplicated inbound message is the explicit recovery signal. It
     // clears only the local send backoff; quota counters and generations remain intact.
-    if (!inbound.duplicate) this.resetRateLimitOnInbound(msg.from_user_id);
+    this.resetRateLimitOnInbound(msg.from_user_id);
 
     // A new, deduplicated inbound message is the safe trigger for draining text
     // that was waiting for a usable context token or an ambiguous ret=-2 response.
-    if (!inbound.duplicate) await this.drainOutbox(msg.from_user_id);
+    await this.drainOutbox(msg.from_user_id);
 
     log.debug(`[msg] item_list=${JSON.stringify(redactSecrets(msg.item_list))}`);
     const { text, refText, mediaItems } = await parseMessage(msg);
@@ -334,9 +345,20 @@ export class ILinkClient {
     return this.contextTokens.get(userId);
   }
 
+  getDeliveryContext(userId: string): DeliveryContext {
+    const snapshot = this.quota.snapshot(userId);
+    return {
+      generation: snapshot.inboundGeneration,
+      tokenVersion: snapshot.tokenVersion,
+    };
+  }
+
   getDeliveryState(userId: string): { state: DeliveryState; waitingForInbound: boolean; pendingTextCount: number } {
-    const pendingTextCount = this.outbox.list(userId, this.accountId).length;
-    const state = this.deliveryStates.get(userId) || (pendingTextCount > 0 ? 'WAITING_INBOUND' : 'READY');
+    const allItems = this.outbox.list(userId, this.accountId);
+    const pendingTextCount = allItems.filter((item) => item.state === 'pending').length;
+    const hasPermanentFailure = allItems.some((item) => item.state === 'permanent-failure');
+    const state = this.deliveryStates.get(userId)
+      || (hasPermanentFailure ? 'PERMANENT_FAILURE' : pendingTextCount > 0 ? 'WAITING_INBOUND' : 'READY');
     return {
       state,
       // Derive from durable work as well, so a restarted process still gates
@@ -376,10 +398,12 @@ export class ILinkClient {
 
   private resetRateLimitOnInbound(userId: string): void {
     const state = this.rateLimitStates.get(userId);
-    if (!state) return;
-    state.consecutiveRet2 = 0;
-    state.suppressIntermediateUntil = 0;
-    state.blockAllSendsUntil = 0;
+    if (state) {
+      state.consecutiveRet2 = 0;
+      state.suppressIntermediateUntil = 0;
+      state.blockAllSendsUntil = 0;
+    }
+    this.quota.clearRateBackoff(userId);
   }
 
   private nextCooldownMs(consecutiveRet2: number): number {
@@ -391,6 +415,17 @@ export class ILinkClient {
   private gateSendWindow(userId: string, streamType: SendStreamType): boolean {
     const state = this.getRateLimitState(userId);
     const now = Date.now();
+    const snapshot = this.quota.snapshot(userId);
+    const persistedBackoff = this.quota.getRateBackoff(userId);
+
+    if (persistedBackoff.generation === snapshot.inboundGeneration && now < persistedBackoff.until) {
+      if (streamType === 'intermediate') {
+        log.debug('[send] 中间消息命中持久化发送冷却，直接跳过');
+      } else {
+        log.debug(`[send] 命中持久化限流冷却窗口，等待新的入站消息: ${userId.substring(0, 12)}...`);
+      }
+      return false;
+    }
 
     if (streamType === 'intermediate' && now < state.suppressIntermediateUntil) {
       log.debug(`[send] 跳过中间消息(保护模式): ${userId.substring(0, 12)}...`);
@@ -412,35 +447,42 @@ export class ILinkClient {
   async sendText(
     userId: string,
     text: string,
-    options?: { streamType?: SendStreamType; priority?: OutboxPriority },
+    options?: {
+      streamType?: SendStreamType;
+      priority?: OutboxPriority;
+      generation?: number;
+      tokenVersion?: number;
+    },
   ): Promise<SendResult[]> {
     const streamType = options?.streamType || 'regular';
     const priority = options?.priority || (streamType === 'intermediate' ? 'intermediate' : 'control');
     const snapshot = this.quota.snapshot(userId);
+    const generation = options?.generation ?? snapshot.inboundGeneration;
+    const tokenVersion = options?.tokenVersion ?? snapshot.tokenVersion;
     const capacityFailures: SendResult[] = [];
+    const chunks = chunkUtf8Text(text, 2_000);
 
-    if (priority === 'final') {
-      this.outbox.supersedeIntermediate(this.accountId, userId, snapshot.inboundGeneration);
-    }
-
-    for (const chunk of chunkUtf8Text(text, 2_000)) {
-      try {
-        this.outbox.enqueueText({
-          accountId: this.accountId,
-          userId,
-          generation: snapshot.inboundGeneration,
-          tokenVersion: snapshot.tokenVersion,
-          priority,
-          text: chunk,
-        });
-      } catch (err) {
+    try {
+      this.outbox.enqueueTextBatch(chunks.map((chunk) => ({
+        accountId: this.accountId,
+        userId,
+        generation,
+        tokenVersion,
+        priority,
+        text: chunk,
+      })));
+      if (priority === 'final') {
+        this.outbox.supersedeIntermediate(this.accountId, userId, generation);
+      }
+    } catch (err) {
+      for (const chunk of chunks) {
         log.error(`[send] 文本进入 outbox 失败: ${userId}`, err);
         capacityFailures.push({
           status: priority === 'activity' || priority === 'intermediate' ? 'suppressed' : 'permanent-failure',
           itemId: 'outbox-capacity',
           userId,
-          generation: snapshot.inboundGeneration,
-          tokenVersion: snapshot.tokenVersion,
+          generation,
+          tokenVersion,
           attemptedBytes: Buffer.byteLength(chunk, 'utf8'),
           error: { errmsg: err instanceof Error ? err.message : String(err) },
         });
@@ -455,7 +497,7 @@ export class ILinkClient {
   }
 
   private async drainOutboxNow(userId: string, streamType: SendStreamType): Promise<SendResult[]> {
-    const items = this.outbox.list(userId, this.accountId);
+    const items = this.outbox.listPending(userId, this.accountId);
     const token = this.contextTokens.get(userId);
     if (!token) {
       if (items.length > 0) {
@@ -466,15 +508,24 @@ export class ILinkClient {
     }
     if (items.length === 0) {
       this.waitingForInbound.delete(userId);
-      this.deliveryStates.set(userId, 'READY');
+      const hasPermanentFailure = this.outbox.list(userId, this.accountId)
+        .some((item) => item.state === 'permanent-failure');
+      if (!hasPermanentFailure) this.deliveryStates.set(userId, 'READY');
       return [];
     }
 
     this.deliveryStates.set(userId, 'SENDING');
     const results: SendResult[] = [];
     for (const item of items) {
+      // A previous item may have removed this snapshot entry (for example, a
+      // recovery notice cleared after its original result was confirmed).
+      if (!this.outbox.get(item.itemId)) continue;
+
       const reservation = this.quota.reserve(userId, item.bytes, item.priority);
       if (!reservation.allowed) {
+        this.outbox.markPermanentFailure(item.itemId, {
+          errmsg: `本地发送预算不足: ${reservation.reason}`,
+        });
         results.push(this.resultForItem(item,
           reservation.reason === 'final-reserved' ? 'suppressed' : 'permanent-failure',
           { errmsg: `本地发送预算不足: ${reservation.reason}` }));
@@ -500,6 +551,7 @@ export class ILinkClient {
         );
         this.quota.commit(reservation.reservation.reservationId);
         this.outbox.ack(item.itemId);
+        this.outbox.ack(`delivery-notice:${item.itemId}`);
         results.push(this.resultForItem(item, 'sent'));
       } catch (err) {
         this.quota.release(reservation.reservation.reservationId);
@@ -524,6 +576,7 @@ export class ILinkClient {
           }
           this.deliveryStates.set(userId, 'RATE_BACKOFF');
         } else {
+          this.outbox.markPermanentFailure(item.itemId, details);
           this.deliveryStates.set(userId, 'PERMANENT_FAILURE');
         }
         results.push(this.resultForItem(item, failure?.status || 'permanent-failure', details));
@@ -531,14 +584,16 @@ export class ILinkClient {
         break;
       }
     }
-    if (this.outbox.list(userId, this.accountId).length > 0) {
+    if (this.outbox.listPending(userId, this.accountId).length > 0) {
       this.waitingForInbound.add(userId);
       if (this.deliveryStates.get(userId) === 'SENDING') {
         this.deliveryStates.set(userId, 'WAITING_INBOUND');
       }
     } else {
       this.waitingForInbound.delete(userId);
-      this.deliveryStates.set(userId, 'READY');
+      const hasPermanentFailure = this.outbox.list(userId, this.accountId)
+        .some((item) => item.state === 'permanent-failure');
+      if (!hasPermanentFailure) this.deliveryStates.set(userId, 'READY');
     }
     return results;
   }
@@ -570,6 +625,7 @@ export class ILinkClient {
     const until = Date.now() + this.nextCooldownMs(state.consecutiveRet2);
     state.blockAllSendsUntil = Math.max(state.blockAllSendsUntil, until);
     state.suppressIntermediateUntil = Math.max(state.suppressIntermediateUntil, until);
+    this.quota.noteRateBackoff(userId, until);
     this.deliveryStates.set(userId, 'RATE_BACKOFF');
     log.warn(`[send] ret=-2 歧义响应，暂停高频重试 ${Math.round((until - Date.now()) / 1000)}s`);
   }
@@ -626,14 +682,19 @@ export class ILinkClient {
     }
 
     const data = (await res.json()) as Partial<SendMessageResponse>;
-    if (data.ret !== undefined && data.ret !== 0) {
-      throw new ILinkApiError({ ret: data.ret, errcode: data.errcode, errmsg: data.errmsg });
+    if (data.ret !== 0) {
+      throw new ILinkApiError({ ret: data.ret, errcode: data.errcode, errmsg: data.errmsg || 'sendmessage response did not confirm ret=0' });
     }
   }
 
   // ─── File/Image/Video Upload & Send ──────────────────────
 
-  async sendFile(userId: string, filePath: string, title?: string): Promise<SendResult[]> {
+  async sendFile(
+    userId: string,
+    filePath: string,
+    title?: string,
+    deliveryContext?: DeliveryContext,
+  ): Promise<SendResult[]> {
     const token = this.contextTokens.get(userId);
     if (!token) {
       log.error(`无法发送文件给 ${userId}: 缺少 context_token`);
@@ -642,6 +703,14 @@ export class ILinkClient {
 
     if (!existsSync(filePath)) {
       return [this.mediaResult(userId, 'permanent-failure', { errmsg: `文件不存在: ${filePath}` })];
+    }
+
+    const bytes = statSync(filePath).size;
+    const reservation = this.quota.reserve(userId, bytes, 'media', deliveryContext);
+    if (!reservation.allowed) {
+      return [this.mediaResult(userId,
+        reservation.reason === 'final-reserved' ? 'suppressed' : 'permanent-failure',
+        { errmsg: `媒体发送预算不足: ${reservation.reason}` })];
     }
 
     try {
@@ -659,16 +728,22 @@ export class ILinkClient {
           },
         },
       }];
-      const result = await this.sendMediaMessage(userId, token, itemList, upload.rawsize);
+      const result = await this.sendMediaMessage(userId, token, itemList, upload.rawsize, reservation.reservation);
       if (result[0]?.status === 'sent') log.info(`[sendFile] 已发送: ${fileName}`);
       return result;
     } catch (err) {
+      this.quota.release(reservation.reservation.reservationId);
       log.error(`[sendFile] 发送失败: ${filePath}`, err);
       return [this.mediaFailureResult(userId, err)];
     }
   }
 
-  async sendImage(userId: string, imagePath: string, caption?: string): Promise<SendResult[]> {
+  async sendImage(
+    userId: string,
+    imagePath: string,
+    caption?: string,
+    deliveryContext?: DeliveryContext,
+  ): Promise<SendResult[]> {
     const token = this.contextTokens.get(userId);
     if (!token) {
       log.error(`无法发送图片给 ${userId}: 缺少 context_token`);
@@ -677,6 +752,14 @@ export class ILinkClient {
 
     if (!existsSync(imagePath)) {
       return [this.mediaResult(userId, 'permanent-failure', { errmsg: `图片不存在: ${imagePath}` })];
+    }
+
+    const bytes = statSync(imagePath).size + (caption ? Buffer.byteLength(caption, 'utf8') : 0);
+    const reservation = this.quota.reserve(userId, bytes, 'media', deliveryContext);
+    if (!reservation.allowed) {
+      return [this.mediaResult(userId,
+        reservation.reason === 'final-reserved' ? 'suppressed' : 'permanent-failure',
+        { errmsg: `媒体发送预算不足: ${reservation.reason}` })];
     }
 
     try {
@@ -698,17 +781,19 @@ export class ILinkClient {
         userId,
         token,
         itemList,
-        upload.rawsize + (caption ? Buffer.byteLength(caption, 'utf8') : 0),
+        bytes,
+        reservation.reservation,
       );
       if (result[0]?.status === 'sent') log.info(`[sendImage] 已发送图片: ${basename(imagePath)}`);
       return result;
     } catch (err) {
+      this.quota.release(reservation.reservation.reservationId);
       log.error(`[sendImage] 发送失败: ${imagePath}`, err);
       return [this.mediaFailureResult(userId, err)];
     }
   }
 
-  async sendVideo(userId: string, videoPath: string): Promise<SendResult[]> {
+  async sendVideo(userId: string, videoPath: string, deliveryContext?: DeliveryContext): Promise<SendResult[]> {
     const token = this.contextTokens.get(userId);
     if (!token) {
       log.error(`无法发送视频给 ${userId}: 缺少 context_token`);
@@ -717,6 +802,14 @@ export class ILinkClient {
 
     if (!existsSync(videoPath)) {
       return [this.mediaResult(userId, 'permanent-failure', { errmsg: `视频不存在: ${videoPath}` })];
+    }
+
+    const bytes = statSync(videoPath).size;
+    const reservation = this.quota.reserve(userId, bytes, 'media', deliveryContext);
+    if (!reservation.allowed) {
+      return [this.mediaResult(userId,
+        reservation.reason === 'final-reserved' ? 'suppressed' : 'permanent-failure',
+        { errmsg: `媒体发送预算不足: ${reservation.reason}` })];
     }
 
     try {
@@ -732,10 +825,11 @@ export class ILinkClient {
           video_size: upload.filesize,
         },
       }];
-      const result = await this.sendMediaMessage(userId, token, itemList, upload.rawsize);
+      const result = await this.sendMediaMessage(userId, token, itemList, upload.rawsize, reservation.reservation);
       if (result[0]?.status === 'sent') log.info(`[sendVideo] 已发送视频: ${basename(videoPath)}`);
       return result;
     } catch (err) {
+      this.quota.release(reservation.reservation.reservationId);
       log.error(`[sendVideo] 发送失败: ${videoPath}`, err);
       return [this.mediaFailureResult(userId, err)];
     }
@@ -766,29 +860,22 @@ export class ILinkClient {
     contextToken: string,
     itemList: MessageItem[],
     bytes: number,
+    reservation: QuotaReservation,
   ): Promise<SendResult[]> {
     return this.enqueueSend(userId, async () => {
-      const snapshot = this.quota.snapshot(userId);
-      const reservation = this.quota.reserve(userId, bytes, 'media');
-      if (!reservation.allowed) {
-        return [this.mediaResult(userId,
-          reservation.reason === 'final-reserved' ? 'suppressed' : 'permanent-failure',
-          { errmsg: `媒体发送预算不足: ${reservation.reason}` })];
-      }
-
       const item = {
         itemId: `media-${randomUUID()}`,
         userId,
-        generation: snapshot.inboundGeneration,
-        tokenVersion: snapshot.tokenVersion,
+        generation: reservation.generation,
+        tokenVersion: reservation.tokenVersion,
         bytes,
       };
       try {
         await this.sendRawMessageWithRetry(userId, contextToken, itemList, 'regular');
-        this.quota.commit(reservation.reservation.reservationId);
+        this.quota.commit(reservation.reservationId);
         return [this.resultForItem(item, 'sent')];
       } catch (err) {
-        this.quota.release(reservation.reservation.reservationId);
+        this.quota.release(reservation.reservationId);
         const details = this.errorDetails(err);
         const failure = classifyApiFailure(details);
         if (failure?.ambiguous) this.noteRateLimit(userId);

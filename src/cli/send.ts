@@ -1,12 +1,5 @@
-import { randomUUID } from 'node:crypto';
-import { generateWechatUin } from '../utils/crypto.js';
-import { fetchWithRetry } from '../utils/http.js';
-import { loadCredentials, loadContextTokens } from '../config.js';
-import { chunkUtf8Text } from '../ilink/text-chunk.js';
-import type { Credentials } from '../ilink/types.js';
-
-const CHANNEL_VERSION = '1.0.2';
-const MAX_CHUNK_SIZE = 2000;
+import { loadCredentials } from '../config.js';
+import { ILinkClient } from '../ilink/client.js';
 
 export async function sendCommand(args: string[]): Promise<void> {
   // ─── Parse arguments ─────────────────────────────────
@@ -49,27 +42,16 @@ export async function sendCommand(args: string[]): Promise<void> {
   // ─── Determine target user ───────────────────────────
   const userId = targetUser || credentials.ilinkUserId;
 
-  // ─── Load context_token ──────────────────────────────
-  const contextTokens = loadContextTokens();
-  const contextToken = contextTokens.get(userId);
-
-  if (!contextToken) {
-    if (targetUser) {
-      console.error(`错误: 用户 ${userId} 未发送过消息给 bot，无法发送。`);
-    } else {
-      console.error('错误: 你还没有从微信给 bot 发过消息，请先发一条消息。');
-    }
-    process.exit(1);
-  }
-
   // ─── Send message ────────────────────────────────────
   try {
-    const chunks = chunkUtf8Text(message, MAX_CHUNK_SIZE);
-    for (let i = 0; i < chunks.length; i++) {
-      await sendRawMessage(credentials, userId, contextToken, chunks[i]);
-      if (i < chunks.length - 1) {
-        await sleep(300);
+    const client = new ILinkClient(credentials);
+    const results = await client.sendText(userId, message);
+    const failures = results.filter((result) => result.status !== 'sent');
+    if (failures.length > 0) {
+      for (const failure of failures) {
+        console.error(`发送未完成: ${failure.status}: ${failure.error?.errmsg || '结果已进入持久化队列或终态记录'}`);
       }
+      process.exit(1);
     }
     console.log('已发送');
   } catch (err) {
@@ -77,52 +59,6 @@ export async function sendCommand(args: string[]): Promise<void> {
     process.exit(1);
   }
 }
-
-async function sendRawMessage(
-  credentials: Credentials,
-  userId: string,
-  contextToken: string,
-  text: string,
-): Promise<void> {
-  const res = await fetchWithRetry(
-    `${credentials.baseUrl}/ilink/bot/sendmessage`,
-    {
-      label: 'cli-send',
-      retries: 2,
-      timeoutMs: 30_000,
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'AuthorizationType': 'ilink_bot_token',
-        'Authorization': `Bearer ${credentials.botToken}`,
-        'X-WECHAT-UIN': generateWechatUin(),
-      },
-      body: JSON.stringify({
-        msg: {
-          from_user_id: '',
-          to_user_id: userId,
-          client_id: randomUUID(),
-          message_type: 2,
-          message_state: 2,
-          context_token: contextToken,
-          item_list: [{ type: 1 as const, text_item: { text } }],
-        },
-        base_info: { channel_version: CHANNEL_VERSION },
-      }),
-    },
-  );
-
-  if (!res.ok) {
-    const body = await res.text().catch(() => '');
-    throw new Error(`HTTP ${res.status} ${body}`);
-  }
-
-  const data = (await res.json()) as { ret?: number; errmsg?: string };
-  if (data.ret !== undefined && data.ret !== 0) {
-    throw new Error(data.errmsg || `ret=${data.ret}`);
-  }
-}
-
 async function readStdin(): Promise<string> {
   const chunks: Buffer[] = [];
   return new Promise((resolve, reject) => {
@@ -131,7 +67,6 @@ async function readStdin(): Promise<string> {
     process.stdin.on('error', reject);
   });
 }
-
 function printUsage(): void {
   console.log(`用法: wcli send [选项] <消息>
 
@@ -142,8 +77,4 @@ function printUsage(): void {
   wcli send "hello"                    发送消息给自己
   wcli send "hello" -u wx_xxxxxx       发送给指定用户
   echo "hello" | wcli send             从标准输入读取消息`);
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
 }

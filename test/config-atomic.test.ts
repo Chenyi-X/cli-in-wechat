@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, statSync
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
-import { atomicWrite } from '../src/config.js';
+import { accountStatePath, atomicWrite } from '../src/config.js';
 
 function withTmpDir(fn: (dir: string) => void): void {
   const dir = mkdtempSync(join(tmpdir(), 'wxcfg-'));
@@ -61,4 +61,14 @@ test('atomicWrite: a reader never observes a partially-written file', () => {
       assert.equal(readFileSync(f, 'utf8'), p);
     }
   });
+});
+
+test('account state paths are isolated by account id', () => {
+  const first = accountStatePath('account-a', 'context_tokens.json');
+  const second = accountStatePath('account-b', 'context_tokens.json');
+
+  assert.notEqual(first, second);
+  assert.match(first, /accounts/);
+  assert.match(second, /accounts/);
+  assert.equal(first.endsWith('context_tokens.json'), true);
 });

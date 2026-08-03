@@ -1,4 +1,5 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, chmodSync, unlinkSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import type { Credentials } from './ilink/types.js';
@@ -28,6 +29,18 @@ const CREDENTIALS_FILE = join(DATA_DIR, 'credentials.json');
 const SESSIONS_DIR = join(DATA_DIR, 'sessions');
 const POLL_CURSOR_FILE = join(DATA_DIR, 'poll_cursor.txt');
 const CONTEXT_TOKENS_FILE = join(DATA_DIR, 'context_tokens.json');
+
+function accountKey(accountId: string): string {
+  return createHash('sha256').update(accountId).digest('hex').slice(0, 32);
+}
+
+export function accountStatePath(accountId: string, fileName: string): string {
+  return join(DATA_DIR, 'accounts', accountKey(accountId), fileName);
+}
+
+function ensureAccountStateDir(accountId: string): void {
+  mkdirSync(join(DATA_DIR, 'accounts', accountKey(accountId)), { recursive: true, mode: 0o700 });
+}
 
 export interface ToolConfig {
   args?: string[];
@@ -103,31 +116,35 @@ export function clearCredentials(): void {
   }
 }
 
-export function loadPollCursor(): string {
-  if (!existsSync(POLL_CURSOR_FILE)) return '';
+export function loadPollCursor(accountId?: string): string {
+  const filePath = accountId ? accountStatePath(accountId, 'poll_cursor.txt') : POLL_CURSOR_FILE;
+  if (!existsSync(filePath)) return '';
   try {
-    return readFileSync(POLL_CURSOR_FILE, 'utf-8').trim();
+    return readFileSync(filePath, 'utf-8').trim();
   } catch {
     return '';
   }
 }
 
-export function savePollCursor(cursor: string): void {
+export function savePollCursor(cursor: string, accountId?: string): void {
   ensureDataDir();
-  atomicWrite(POLL_CURSOR_FILE, cursor);
+  if (accountId) ensureAccountStateDir(accountId);
+  atomicWrite(accountId ? accountStatePath(accountId, 'poll_cursor.txt') : POLL_CURSOR_FILE, cursor);
 }
 
-export function saveContextTokens(tokens: Map<string, string>): void {
+export function saveContextTokens(tokens: Map<string, string>, accountId?: string): void {
   ensureDataDir();
+  if (accountId) ensureAccountStateDir(accountId);
   const obj: Record<string, string> = {};
   for (const [k, v] of tokens) obj[k] = v;
-  atomicWrite(CONTEXT_TOKENS_FILE, JSON.stringify(obj, null, 2));
+  atomicWrite(accountId ? accountStatePath(accountId, 'context_tokens.json') : CONTEXT_TOKENS_FILE, JSON.stringify(obj, null, 2));
 }
 
-export function loadContextTokens(): Map<string, string> {
-  if (!existsSync(CONTEXT_TOKENS_FILE)) return new Map();
+export function loadContextTokens(accountId?: string): Map<string, string> {
+  const filePath = accountId ? accountStatePath(accountId, 'context_tokens.json') : CONTEXT_TOKENS_FILE;
+  if (!existsSync(filePath)) return new Map();
   try {
-    const raw = readFileSync(CONTEXT_TOKENS_FILE, 'utf-8');
+    const raw = readFileSync(filePath, 'utf-8');
     const obj = JSON.parse(raw) as Record<string, string>;
     return new Map(Object.entries(obj));
   } catch {

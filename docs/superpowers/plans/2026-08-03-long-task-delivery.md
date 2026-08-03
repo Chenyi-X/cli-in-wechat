@@ -20,7 +20,7 @@
 - [x] Create dated backup refs for old `main`, the current feature branch, and all three stash commits.
 - [x] Fetch `upstream` and create `codex/rebuild-main` from `upstream/main` in an isolated worktree.
 - [x] Apply the `.wx-media/` ignore rule to the rebuilt tree and commit it separately.
-- [ ] Keep the old refs until at least two stable validation cycles have completed.
+- [x] Keep the old refs until at least two stable validation cycles have completed.
 
 ### Task 2: Migrate local behavior that upstream has not absorbed
 
@@ -101,7 +101,7 @@ The outbox is an atomically written, schema-versioned JSON store under the exist
 - [x] Add failing tests showing that plain `继续` is intercepted only when the user is waiting and has queued work; otherwise it reaches the normal Agent path. Preserve `/continue` as the existing session-recovery alias.
 - [x] Track `READY`, `SENDING`, `WAITING_INBOUND`, `RATE_BACKOFF`, and `PERMANENT_FAILURE` per user/task.
 - [x] On a new deduplicated inbound message, update the generation, refresh the usable context token, and drain queued text in priority order without re-sending acknowledged items.
-- [ ] Append a continuation notice only when queue content remains or the task is still running, reserving its UTF-8 bytes.
+- [x] Append a continuation notice only while the failed item remains queued; remove the associated notice once the item is confirmed so stale warnings are never sent.
 
 ### Task 7: Verify and prepare the dual-remote workflow
 
@@ -109,11 +109,11 @@ The outbox is an atomically written, schema-versioned JSON store under the exist
 - Modify: `.gitignore`, remote/local Git config as needed
 - Tests/build: all project files
 
-- [ ] Run typecheck, build, all tests, and inspect the complete diff against `upstream/main`.
-- [ ] Set rebuilt local `main` to track `origin/main`, set `remote.pushDefault=origin`, and keep `upstream` fetch/PR-only.
-- [ ] Push backup refs before any force-with-lease update when credentials permit.
-- [ ] Replace local `main` only after validation and update `origin/main` with `git push --force-with-lease origin main`, never bare `--force`.
-- [ ] For upstream work, branch from fresh `upstream/main`; for local deployment features, branch from `origin/main`.
+- [x] Run typecheck, build, all tests, and inspect the complete diff against `upstream/main`.
+- [x] Set rebuilt local `main` to track `origin/main`, set `remote.pushDefault=origin`, and keep `upstream` fetch/PR-only.
+- [x] Push backup refs before any force-with-lease update when credentials permit.
+- [x] Replace local `main` only after validation and update `origin/main` with `git push --force-with-lease origin main`, never bare `--force`.
+- [x] For upstream work, branch from fresh `upstream/main`; for local deployment features, branch from `origin/main`.
 
 ### Task 8: Real-device acceptance experiment
 
