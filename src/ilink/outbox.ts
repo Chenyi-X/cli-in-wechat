@@ -12,6 +12,7 @@ export interface OutboxTextInput {
   generation: number;
   tokenVersion: number;
   priority: OutboxPriority;
+  batchId?: string;
   text: string;
   itemId?: string;
   createdAt?: number;
@@ -29,6 +30,7 @@ export interface OutboxTextItem {
   generation: number;
   tokenVersion: number;
   priority: OutboxPriority;
+  batchId?: string;
   text: string;
   bytes: number;
   createdAt: number;
@@ -144,6 +146,7 @@ export class OutboxStore {
         generation: input.generation,
         tokenVersion: input.tokenVersion,
         priority: input.priority,
+        batchId: input.batchId,
         text: input.text,
         bytes,
         createdAt,

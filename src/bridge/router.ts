@@ -26,6 +26,12 @@ const TOOL_ALIASES: Record<string, string> = {
 const NORMAL_ACTIVITY_MAX_LINES_PER_MESSAGE = 12;
 const NORMAL_ACTIVITY_MAX_CHARS_PER_MESSAGE = 1400;
 const NORMAL_ACTIVITY_SPLIT_DELAY_MS = 5000;
+const AUTO_DELIVERABLE_EXTENSIONS = new Set([
+  'csv', 'doc', 'docx', 'gif', 'htm', 'html', 'jpeg', 'jpg', 'md', 'pdf',
+  'png', 'txt', 'webp', 'xls', 'xlsx', 'zip',
+]);
+const AUTO_DELIVERABLE_SKIP_DIRS = new Set(['.git', '.wx-media', 'node_modules']);
+const AUTO_DELIVERABLE_MAX_DEPTH = 3;
 
 interface NormalActivityDelivery {
   split: boolean;
@@ -168,6 +174,8 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
     const batches = this.splitNormalActivityLines(lines);
     if (batches.length <= 1) return { split: false, unsentLines: lines };
 
+    let allBatchesDurable = true;
+    let previousBatchConfirmed = true;
     for (let i = 0; i < batches.length; i++) {
       const title = `Activity (${i + 1}/${batches.length})`;
       const results = await this.ilink.sendText(uid, [title, ...batches[i]].join('\n'), {
@@ -178,12 +186,26 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
       const confirmed = Array.isArray(results)
         && results.length > 0
         && results.every((result) => result.status === 'sent');
-      if (!confirmed) {
-        return { split: true, unsentLines: batches.slice(i).flat() };
+      const durable = Array.isArray(results)
+        && results.length > 0
+        && results.every((result) => (
+          result.status === 'sent'
+          || result.status === 'queued'
+          || result.status === 'rate-limited'
+          || result.status === 'waiting-for-token'
+        ));
+      if (!durable) {
+        allBatchesDurable = false;
       }
-      if (i < batches.length - 1) await this.sleep(NORMAL_ACTIVITY_SPLIT_DELAY_MS);
+      if (previousBatchConfirmed && confirmed && i < batches.length - 1) {
+        await this.sleep(NORMAL_ACTIVITY_SPLIT_DELAY_MS);
+      }
+      previousBatchConfirmed = confirmed;
     }
-    return { split: true, unsentLines: [] };
+    return {
+      split: true,
+      unsentLines: allBatchesDurable ? [] : batches.flat(),
+    };
   }
 
 
@@ -1176,8 +1198,8 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
 
     if (signal.aborted) return { result: { text: '已取消', error: true }, notice: '' };
 
-    // 追加 SEND_FILE 提示到 prompt
-    const sendFileHint = '\n\n[提示: 如果需要发送文件/图片到微信，在响应中包含标记 [SEND_FILE: 文件路径]]';
+    // File delivery is a protocol between the adapter and the router, not a best-effort hint.
+    const sendFileHint = '\n\n[文件交付协议 - 必须遵守] 如果你创建、生成或导出了用户要求的文件/图片/HTML，必须在响应末尾为每个文件单独输出一行 [SEND_FILE: 绝对路径]。不要只描述文件已生成，也不要使用 Markdown 链接代替该标记。';
     const enhancedPrompt = prompt + sendFileHint;
 
     const result = await adapter.execute(enhancedPrompt, {
@@ -1261,6 +1283,8 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
     const deliveryContext = this.ilink.getDeliveryContext?.(uid);
     const stopTyping = await this.ilink.startTyping(uid);
     const start = Date.now();
+    const workDir = this.sessions.get(uid).workDir || this.config.workDir;
+    const artifactSnapshot = this.snapshotAutoDeliverables(workDir);
 
     // Track if we've streamed text (to avoid duplicate with final result)
     let hasStreamedText = false;
@@ -1382,8 +1406,17 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
         this.sessions.setSession(uid, toolName, result.sessionId);
       }
 
-      // Parse [SEND_FILE: path] markers and send files
-      const { text: cleanText, sentFiles, failedFiles } = await this.parseAndSendFiles(uid, result.text, deliveryContext);
+      // Parse explicit markers, then recover files created by a task that clearly requested
+      // an artifact even when the model forgot the delivery marker.
+      const autoFiles = this.shouldAutoDeliverArtifact(prompt)
+        ? this.findChangedAutoDeliverables(workDir, artifactSnapshot)
+        : [];
+      const { text: cleanText, sentFiles, failedFiles } = await this.parseAndSendFiles(
+        uid,
+        result.text,
+        deliveryContext,
+        autoFiles,
+      );
 
       // Store for >> relay; auto-switch defaultTool to last used tool
       this.lastResponse.set(uid, { tool: adapter.displayName, text: cleanText });
@@ -1446,6 +1479,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
     uid: string,
     text: string,
     deliveryContext?: DeliveryContext,
+    fallbackPaths: string[] = [],
   ): Promise<{ text: string; sentFiles: string[]; failedFiles: string[] }> {
     const { existsSync } = await import('node:fs');
     const sentFiles: string[] = [];
@@ -1453,14 +1487,24 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
     const regex = /\[SEND_FILE:\s*([^\]]+)\]/g;
     let match;
     const workDir = this.sessions.get(uid).workDir || this.config.workDir;
+    const requestedPaths: string[] = [];
 
     while ((match = regex.exec(text)) !== null) {
-      let filePath = match[1].trim();
+      requestedPaths.push(match[1].trim());
+    }
+    requestedPaths.push(...fallbackPaths);
+
+    const sentPathSet = new Set<string>();
+    for (const requestedPath of requestedPaths) {
+      let filePath = requestedPath;
       
       // 处理相对路径
       if (!filePath.match(/^[A-Za-z]:/) && !filePath.startsWith('/')) {
         filePath = join(workDir, filePath);
       }
+      const normalizedPath = filePath.replace(/[\\/]$/, '').toLowerCase();
+      if (sentPathSet.has(normalizedPath)) continue;
+      sentPathSet.add(normalizedPath);
 
       try {
         if (!existsSync(filePath)) {
@@ -1494,5 +1538,58 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
     // 移除标记
     const cleanText = text.replace(regex, '').trim();
     return { text: cleanText, sentFiles, failedFiles };
+  }
+
+  private shouldAutoDeliverArtifact(prompt: string): boolean {
+    const hasArtifact = /(?:文件|附件|报告|文档|html?|pdf|docx?|xlsx?|csv|markdown|图片|压缩包)/iu.test(prompt);
+    const hasDeliveryIntent = /(?:输出|生成|创建|导出|保存|写入|发送|发给我|给我|提供|交付|下载)/iu.test(prompt);
+    return hasArtifact && hasDeliveryIntent;
+  }
+
+  private snapshotAutoDeliverables(workDir: string): Map<string, { path: string; signature: string }> {
+    const snapshot = new Map<string, { path: string; signature: string }>();
+    const visit = (dir: string, depth: number): void => {
+      if (depth > AUTO_DELIVERABLE_MAX_DEPTH) return;
+      let entries;
+      try {
+        entries = readdirSync(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const entry of entries) {
+        if (entry.isDirectory() && AUTO_DELIVERABLE_SKIP_DIRS.has(entry.name)) continue;
+        const fullPath = join(dir, entry.name);
+        if (entry.isDirectory()) {
+          visit(fullPath, depth + 1);
+          continue;
+        }
+        const ext = entry.name.split('.').pop()?.toLowerCase();
+        if (!ext || !AUTO_DELIVERABLE_EXTENSIONS.has(ext)) continue;
+        try {
+          const stat = statSync(fullPath);
+          snapshot.set(fullPath.toLowerCase(), {
+            path: fullPath,
+            signature: `${stat.mtimeMs}:${stat.size}`,
+          });
+        } catch {
+          // A concurrently removed file is not a deliverable.
+        }
+      }
+    };
+    visit(workDir, 0);
+    return snapshot;
+  }
+
+  private findChangedAutoDeliverables(
+    workDir: string,
+    before: Map<string, { path: string; signature: string }>,
+  ): string[] {
+    const changed: string[] = [];
+    const after = this.snapshotAutoDeliverables(workDir);
+    for (const [normalizedPath, signature] of after) {
+      if (before.get(normalizedPath)?.signature === signature.signature) continue;
+      changed.push(signature.path);
+    }
+    return changed.sort();
   }
 }

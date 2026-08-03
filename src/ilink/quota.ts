@@ -25,7 +25,7 @@ export const DEFAULT_QUOTA_LIMITS: QuotaLimits = {
   // Conservative local guards based on observed behavior. These are not
   // claims about an official iLink quota and should remain configurable.
   maxItemsPerToken: 10,
-  maxIntermediateItemsPerToken: 6,
+  maxIntermediateItemsPerToken: 9,
   finalReserveItemsPerToken: 3,
 };
 
@@ -101,7 +101,7 @@ export interface QuotaContext {
 }
 
 export type ReserveResult =
-  | { allowed: false; reason: 'final-reserved' | 'budget-exhausted' | 'intermediate-budget' | 'token-budget-exhausted' }
+  | { allowed: false; reason: 'final-reserved' | 'budget-exhausted' | 'item-too-large' | 'intermediate-budget' | 'token-budget-exhausted' }
   | { allowed: true; reservation: QuotaReservation };
 
 function fingerprint(token: string): string {
@@ -279,14 +279,21 @@ export class QuotaManager {
     const tokenReservedItems = Object.values(state.reservations)
       .filter((reservation) => reservation.tokenVersion === state.tokenVersion)
       .reduce((sum, reservation) => sum + reservation.items, 0);
+    const tokenReservedBytes = Object.values(state.reservations)
+      .filter((reservation) => reservation.tokenVersion === state.tokenVersion)
+      .reduce((sum, reservation) => sum + reservation.bytes, 0);
     const maxTokenItems = priority === 'final' || priority === 'control'
       ? this.limits.maxItemsPerToken
       : priority === 'intermediate' || priority === 'activity'
         ? this.limits.maxIntermediateItemsPerToken
         : Math.max(0, this.limits.maxItemsPerToken - this.limits.finalReserveItemsPerToken);
     const tokenItemsAvailable = state.tokenSentItems + tokenReservedItems + 1 <= maxTokenItems;
-    const itemsAvailable = state.sentItems + state.reservedItems + 1 <= maxItems;
-    const bytesAvailable = state.sentBytes + state.reservedBytes + bytes <= maxBytes;
+    const itemsAvailable = state.tokenSentItems + tokenReservedItems + 1 <= maxItems;
+    const bytesAvailable = state.tokenSentBytes + tokenReservedBytes + bytes <= maxBytes;
+
+    if (bytes > this.limits.maxBytes) {
+      return { allowed: false, reason: 'item-too-large' };
+    }
 
     if (!tokenItemsAvailable) {
       return {
@@ -298,8 +305,8 @@ export class QuotaManager {
     }
 
     if (!itemsAvailable || !bytesAvailable) {
-      const overallItemsAvailable = state.sentItems + state.reservedItems + 1 <= this.limits.maxItems;
-      const overallBytesAvailable = state.sentBytes + state.reservedBytes + bytes <= this.limits.maxBytes;
+      const overallItemsAvailable = state.tokenSentItems + tokenReservedItems + 1 <= this.limits.maxItems;
+      const overallBytesAvailable = state.tokenSentBytes + tokenReservedBytes + bytes <= this.limits.maxBytes;
       return {
         allowed: false,
         reason: priority !== 'final' && overallItemsAvailable && overallBytesAvailable

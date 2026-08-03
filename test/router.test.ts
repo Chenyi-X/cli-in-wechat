@@ -399,6 +399,36 @@ test('parseAndSendFiles reports unexpected media exceptions', async () => {
   }
 });
 
+test('exec sends a newly generated HTML deliverable when the model omits SEND_FILE', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wx-router-generated-file-'));
+  try {
+    const { router } = createRouter();
+    (router as any).config.workDir = dir;
+    (router as any).sessions.get('u1').workDir = dir;
+    const sentFiles: string[] = [];
+    (router as any).ilink.sendFile = async (_uid: string, filePath: string) => {
+      sentFiles.push(filePath);
+      return [{ status: 'sent' }];
+    };
+    (router as any).registry = {
+      get: () => ({
+        displayName: 'Claude',
+        capabilities: { sessionResume: false },
+        execute: async () => {
+          writeFileSync(join(dir, 'research.html'), '<html>result</html>');
+          return { text: '调研完成，HTML 文件已经生成。', duration: 1, error: false };
+        },
+      }),
+    };
+
+    await (router as any).exec('u1', 'claude', '调研并输出 HTML 文件给我');
+
+    assert.deepEqual(sentFiles, [join(dir, 'research.html')]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('handleSlash /model strips accidental /. suffix from model name', async () => {
   const { router, sessions, messages } = createRouter();
 
@@ -466,6 +496,23 @@ test('sendNormalActivityBatches waits 5 seconds between oversized batches', asyn
   const activityMessages = messages.filter((m) => m.text.startsWith('Activity'));
   assert.ok(activityMessages.length > 1);
   assert.deepEqual(delays, Array(activityMessages.length - 1).fill(5000));
+});
+
+test('sendNormalActivityBatches queues every remaining batch after the first is blocked', async () => {
+  const { router, messages } = createRouter();
+  let sendCount = 0;
+  const lines = Array.from({ length: 20 }, (_, i) => `- Shell Command: item ${i + 1} ${'z'.repeat(90)}`);
+  (router as any).ilink.sendText = async (_uid: string, text: string) => {
+    sendCount += 1;
+    messages.push({ uid: _uid, text });
+    return sendCount === 1 ? [{ status: 'queued' }] : [{ status: 'rate-limited' }];
+  };
+
+  const delivery = await (router as any).sendNormalActivityBatches('u1', lines);
+
+  assert.ok(sendCount > 1, 'all activity batches must enter the outbound scheduler');
+  assert.deepEqual(delivery.unsentLines, []);
+  assert.equal(messages.filter((message) => message.text.startsWith('Activity')).length, sendCount);
 });
 
 test('exec sanitizes stale malformed model before adapter execution', async () => {

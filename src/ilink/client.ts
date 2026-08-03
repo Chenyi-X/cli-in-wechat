@@ -4,12 +4,13 @@ import { basename, join } from 'node:path';
 import { generateWechatUin, encryptAesEcb, aesEcbPaddedSize, encodeMessageAesKey, md5 } from '../utils/crypto.js';
 import { log } from '../utils/logger.js';
 import { fetchWithRetry, describeNetworkError, isRetryableNetworkError } from '../utils/http.js';
-import { DATA_DIR, savePollCursor, loadPollCursor, saveContextTokens, loadContextTokens } from '../config.js';
+import { DATA_DIR, accountStatePath, savePollCursor, loadPollCursor, saveContextTokens, loadContextTokens } from '../config.js';
 import { downloadImage, downloadFile, downloadVideo, type DownloadedMedia } from '../utils/media.js';
 import { OutboxStore, type OutboxPriority, type OutboxTextItem } from './outbox.js';
 import { QuotaManager, type QuotaReservation } from './quota.js';
 import { chunkUtf8Text } from './text-chunk.js';
 import { classifyApiFailure, ILinkApiError, type ApiErrorDetails, type SendResult } from './send-result.js';
+import { DeliveryDiagnostics, type DeliveryDiagnosticInput } from './diagnostics.js';
 import type {
   Credentials,
   WeixinMessage,
@@ -25,7 +26,7 @@ const CDN_BASE_URL = 'https://novac2c.cdn.weixin.qq.com/c2c';
 const BASE_RATE_LIMIT_COOLDOWN_MS = 150_000; // ~2.5 minutes
 const MAX_RATE_LIMIT_COOLDOWN_MS = 420_000; // ~7 minutes
 const LEGACY_MISSING_RET_ERROR = 'sendmessage response did not confirm ret=0';
-const RECOVERY_NOTICE_TEXT = '发送预算保护：最终结果已排队。请回复任意消息刷新 context_token，系统会自动续发。';
+const RECOVERY_NOTICE_TEXT = '发送预算保护：已达到当前 context_token 的安全发送边界，后续消息已排队。请回复任意消息刷新 context_token，系统会自动续发。';
 
 // Upload media types
 const UPLOAD_MEDIA_TYPE_IMAGE = 1;
@@ -56,10 +57,20 @@ interface UserRateLimitState {
   blockAllSendsUntil: number;
 }
 
+interface DeliveryTraceContext {
+  itemId?: string;
+  itemSequence?: number;
+  bubbleSequence?: number;
+  generation?: number;
+  tokenVersion?: number;
+  priority?: string;
+}
+
 export interface ILinkClientOptions {
   outbox?: OutboxStore;
   quota?: QuotaManager;
   accountId?: string;
+  diagnostics?: DeliveryDiagnostics;
 }
 
 export type MessageHandler = (
@@ -84,6 +95,7 @@ export class ILinkClient {
   private readonly accountId: string;
   private readonly outbox: OutboxStore;
   private readonly quota: QuotaManager;
+  private readonly diagnostics?: DeliveryDiagnostics;
   private backoffMs = 1000;
   private abortController: AbortController | null = null;
   private consecutiveFailures = 0;
@@ -103,6 +115,10 @@ export class ILinkClient {
     this.contextTokens = loadContextTokens(this.accountId);
     this.outbox = options.outbox || new OutboxStore(join(DATA_DIR, 'outbox.json'));
     this.quota = options.quota || new QuotaManager(join(DATA_DIR, 'quota.json'), this.accountId);
+    this.diagnostics = options.diagnostics
+      || (!options.outbox && !options.quota
+        ? new DeliveryDiagnostics(accountStatePath(this.accountId, 'delivery-diagnostics.jsonl'))
+        : undefined);
     const recovered = this.outbox.requeuePermanentFailures((item) =>
       item.accountId === this.accountId
       && item.terminalError?.ret === undefined
@@ -336,6 +352,35 @@ export class ILinkClient {
       + `generation=${inbound.inboundGeneration} tokenVersion=${inbound.tokenVersion} `
       + `tokenChanged=${inbound.tokenVersion !== previousTokenVersion} tokenHash=${tokenHash(msg.context_token)}`,
     );
+    const inboundText = msg.item_list
+      .map((item) => item.text_item?.text || '')
+      .join('');
+    this.recordDiagnostic({
+      event: 'inbound',
+      accountId: this.accountId,
+      userId: msg.from_user_id,
+      contextToken: msg.context_token,
+      inboundMessageId: String(msg.message_id),
+      tokenChanged: inbound.tokenVersion !== previousTokenVersion,
+      generation: inbound.inboundGeneration,
+      tokenVersion: inbound.tokenVersion,
+      itemCount: msg.item_list.length,
+      jsLength: inboundText.length,
+      utf8Bytes: Buffer.byteLength(inboundText, 'utf8'),
+      itemListBytes: Buffer.byteLength(JSON.stringify(msg.item_list), 'utf8'),
+    });
+
+    const requeued = this.outbox.requeuePermanentFailures((item) => {
+      if (item.accountId !== this.accountId || item.userId !== msg.from_user_id) return false;
+      // Local quota failures are recoverable on any new, de-duplicated inbound.
+      // The token may remain byte-identical, so this must not depend on a token
+      // version change. The current token budget is still enforced by reserve().
+      if (item.tokenVersion > inbound.tokenVersion) return false;
+      return item.terminalError?.errmsg?.startsWith('本地发送预算不足: ') === true;
+    });
+    if (requeued > 0) {
+      log.warn(`[msg] 新入站已重新排队 ${requeued} 个本地预算阻塞项`);
+    }
 
     this.contextTokens.set(msg.from_user_id, msg.context_token);
     saveContextTokens(this.contextTokens, this.accountId);
@@ -517,55 +562,17 @@ export class ILinkClient {
     const capacityFailures: SendResult[] = [];
     const chunks = chunkUtf8Text(text, 2_000);
 
-    const lowPriority = priority === 'intermediate' || priority === 'activity';
-    const suppressedResults = (error: ApiErrorDetails): SendResult[] => chunks.map((chunk) => ({
-        status: 'suppressed' as const,
-        itemId: 'rate-backoff-suppressed',
-        userId,
-        generation,
-        tokenVersion,
-        attemptedBytes: Buffer.byteLength(chunk, 'utf8'),
-        error,
-      }));
-
-    if (lowPriority && !this.gateSendWindow(userId, 'intermediate')) {
-      return suppressedResults({ ret: -2, errmsg: '发送冷却中，跳过中间消息' });
-    }
-
-    if (lowPriority && !this.quota.canReserveForPriority(userId, priority)) {
-      let warningQueued = false;
-      if (this.quota.claimTokenBudgetNotice(userId)) {
-        try {
-          this.outbox.enqueueText({
-            itemId: `token-budget-notice:${this.accountId}:${userId}:${tokenVersion}`,
-            accountId: this.accountId,
-            userId,
-            generation,
-            tokenVersion,
-            priority: 'control',
-            text: '发送预算保护：中间消息已暂停，最终结果将优先发送。若最终结果仍未完整显示，请回复任意消息刷新 context_token，系统会自动续发。',
-          });
-          warningQueued = true;
-        } catch (err) {
-          log.error(`[send] 无法写入预算保护提示: ${userId}`, err);
-        }
-      }
-      const warningResults = warningQueued ? await this.drainOutbox(userId, streamType) : [];
-      return [...suppressedResults({ errmsg: '已达到本地中间消息预算，跳过后续中间消息' }), ...warningResults];
-    }
-
     try {
+      const batchId = chunks.length > 1 ? randomUUID() : undefined;
       this.outbox.enqueueTextBatch(chunks.map((chunk) => ({
         accountId: this.accountId,
         userId,
         generation,
         tokenVersion,
         priority,
+        batchId,
         text: chunk,
       })));
-      if (priority === 'final') {
-        this.outbox.supersedeIntermediate(this.accountId, userId, generation);
-      }
     } catch (err) {
       for (const chunk of chunks) {
         log.error(`[send] 文本进入 outbox 失败: ${userId}`, err);
@@ -617,20 +624,39 @@ export class ILinkClient {
 
     this.deliveryStates.set(userId, 'SENDING');
     const results: SendResult[] = [];
+    let finalDelivered = false;
     for (const item of items) {
       // A previous item may have removed this snapshot entry (for example, a
       // recovery notice cleared after its original result was confirmed).
       if (!this.outbox.get(item.itemId)) continue;
 
-      // Keep one local token slot available for an actionable recovery notice.
-      // The remote quota is not an official fixed number, but this guard makes
-      // the observed boundary visible to the user before the final item hits it.
-      const noticeId = `token-budget-notice:${this.accountId}:${userId}:${item.tokenVersion}`;
-      const noticeAlreadyVisible = this.quota.hasTokenBudgetNotice(userId)
-        && !this.outbox.get(noticeId);
-      if (item.priority !== 'control'
-        && this.quota.getTokenBudget(userId).remainingItems <= 1
-        && !noticeAlreadyVisible) {
+      // A notice is useful only while the item that caused it is durable. Older
+      // versions could leave the notice behind after that item was evicted or
+      // acknowledged, which would send a misleading warning after the final result.
+      if (item.priority === 'control' && item.itemId.startsWith('delivery-notice:')
+        && !this.outbox.get(item.itemId.slice('delivery-notice:'.length))) {
+        this.outbox.ack(item.itemId);
+        continue;
+      }
+      if (item.priority === 'control' && item.itemId.startsWith('token-budget-notice:')
+        && finalDelivered) {
+        this.outbox.ack(item.itemId);
+        continue;
+      }
+
+      // A final text may have multiple UTF-8 chunks. Never send a partial final
+      // batch merely because the last chunk is the one that crosses the local
+      // token guard.
+      const batchItems = item.batchId
+        ? items.filter((candidate) => candidate.batchId === item.batchId
+          && candidate.priority === item.priority
+          && this.outbox.get(candidate.itemId))
+        : [item];
+      const remainingItems = this.quota.getTokenBudget(userId).remainingItems;
+      const needsRecovery = item.priority !== 'control'
+        && (remainingItems <= 1
+          || (item.priority === 'final' && batchItems.length > remainingItems));
+      if (needsRecovery) {
         const noticeResult = await this.sendRecoveryNotice(userId, item);
         if (noticeResult) results.push(noticeResult);
         results.push(this.resultForItem(item, 'queued', {
@@ -644,12 +670,14 @@ export class ILinkClient {
       const reservation = this.quota.reserve(userId, item.bytes, item.priority);
       if (!reservation.allowed) {
         if (reservation.reason === 'intermediate-budget') {
-          this.outbox.ack(item.itemId);
-          this.outbox.ack(`delivery-notice:${item.itemId}`);
-          results.push(this.resultForItem(item, 'suppressed', {
-            errmsg: '已达到本地中间消息预算，跳过后续中间消息',
+          const noticeResult = await this.sendRecoveryNotice(userId, item);
+          if (noticeResult) results.push(noticeResult);
+          results.push(this.resultForItem(item, 'queued', {
+            errmsg: '已达到本地中间消息预算，等待新的 context_token 后自动续发',
           }));
-          continue;
+          this.quota.noteRateBackoff(userId, Date.now() + BASE_RATE_LIMIT_COOLDOWN_MS);
+          this.deliveryStates.set(userId, 'WAITING_INBOUND');
+          break;
         }
         if (reservation.reason === 'token-budget-exhausted') {
           this.quota.noteRateBackoff(userId, Date.now() + BASE_RATE_LIMIT_COOLDOWN_MS);
@@ -674,12 +702,23 @@ export class ILinkClient {
           }));
           break;
         }
+        if (reservation.reason === 'final-reserved' || reservation.reason === 'budget-exhausted') {
+          const noticeResult = await this.sendRecoveryNotice(userId, item);
+          if (noticeResult) results.push(noticeResult);
+          results.push(this.resultForItem(item, 'queued', {
+            errmsg: `本地发送预算暂时不足: ${reservation.reason}，等待新的 context_token 后自动续发`,
+          }));
+          this.quota.noteRateBackoff(userId, Date.now() + BASE_RATE_LIMIT_COOLDOWN_MS);
+          this.deliveryStates.set(userId, 'WAITING_INBOUND');
+          break;
+        }
+
         this.outbox.markPermanentFailure(item.itemId, {
           errmsg: `本地发送预算不足: ${reservation.reason}`,
         });
-        results.push(this.resultForItem(item,
-          reservation.reason === 'final-reserved' ? 'suppressed' : 'permanent-failure',
-          { errmsg: `本地发送预算不足: ${reservation.reason}` }));
+        results.push(this.resultForItem(item, 'permanent-failure', {
+          errmsg: `本地发送预算不足: ${reservation.reason}`,
+        }));
         continue;
       }
 
@@ -700,10 +739,19 @@ export class ILinkClient {
           [{ type: 1 as const, text_item: { text: item.text } }],
           item.priority === 'intermediate' || item.priority === 'activity' ? 'intermediate' : streamType,
           item.clientId,
+          {
+            itemId: item.itemId,
+            itemSequence: item.sequence,
+            bubbleSequence: item.sequence,
+            generation: item.generation,
+            tokenVersion: item.tokenVersion,
+            priority: item.priority,
+          },
         );
         this.quota.commit(reservation.reservation.reservationId);
         this.outbox.ack(item.itemId);
         this.outbox.ack(`delivery-notice:${item.itemId}`);
+        if (item.priority === 'final') finalDelivered = true;
         results.push(this.resultForItem(item, 'sent'));
       } catch (err) {
         this.quota.release(reservation.reservation.reservationId);
@@ -711,9 +759,6 @@ export class ILinkClient {
         const failure = classifyApiFailure(details);
         if (failure?.ambiguous) {
           this.noteRateLimit(userId);
-          if (item.priority !== 'final') {
-            this.outbox.supersedeIntermediate(this.accountId, userId, item.generation);
-          }
           if (item.priority !== 'control') {
             try {
               this.outbox.enqueueText({
@@ -755,7 +800,7 @@ export class ILinkClient {
   }
 
   private async sendRecoveryNotice(userId: string, triggerItem: OutboxTextItem): Promise<SendResult | undefined> {
-    const noticeId = `token-budget-notice:${this.accountId}:${userId}:${triggerItem.tokenVersion}`;
+    const noticeId = `token-budget-notice:${tokenHash(this.accountId)}:${tokenHash(userId)}:${triggerItem.tokenVersion}`;
     let notice = this.outbox.get(noticeId);
     if (!notice) {
       if (!this.quota.claimTokenBudgetNotice(userId)) return undefined;
@@ -803,6 +848,14 @@ export class ILinkClient {
         [{ type: 1 as const, text_item: { text: notice.text } }],
         'regular',
         notice.clientId,
+        {
+          itemId: notice.itemId,
+          itemSequence: notice.sequence,
+          bubbleSequence: notice.sequence,
+          generation: notice.generation,
+          tokenVersion: notice.tokenVersion,
+          priority: notice.priority,
+        },
       );
       this.quota.commit(reservation.reservation.reservationId);
       this.outbox.ack(notice.itemId);
@@ -869,6 +922,15 @@ export class ILinkClient {
     return { errmsg: err instanceof Error ? err.message : String(err) };
   }
 
+  private recordDiagnostic(input: DeliveryDiagnosticInput): void {
+    if (!this.diagnostics) return;
+    try {
+      this.diagnostics.record(input);
+    } catch (err) {
+      log.warn('[send] 持久化发送诊断失败:', err);
+    }
+  }
+
   private noteRateLimit(userId: string): void {
     const state = this.getRateLimitState(userId);
     state.consecutiveRet2 += 1;
@@ -886,13 +948,27 @@ export class ILinkClient {
     itemList: MessageItem[],
     streamType: SendStreamType = 'regular',
     clientId: string = randomUUID(),
+    trace?: DeliveryTraceContext,
   ): Promise<void> {
     const state = this.getRateLimitState(userId);
     if (!this.gateSendWindow(userId, streamType)) {
+      this.recordDiagnostic({
+        event: 'skipped',
+        accountId: this.accountId,
+        userId,
+        contextToken,
+        clientId,
+        ...trace,
+        itemCount: itemList.length,
+        jsLength: itemList.map((item) => item.text_item?.text || '').join('').length,
+        utf8Bytes: Buffer.byteLength(itemList.map((item) => item.text_item?.text || '').join(''), 'utf8'),
+        itemListBytes: Buffer.byteLength(JSON.stringify(itemList), 'utf8'),
+        response: { ret: -2, errmsg: '发送冷却中，等待新的入站消息' },
+      });
       throw new ILinkApiError({ ret: -2, errmsg: '发送冷却中，等待新的入站消息' });
     }
 
-    await this.sendRawMessage(userId, contextToken, itemList, clientId);
+    await this.sendRawMessage(userId, contextToken, itemList, clientId, trace);
     state.consecutiveRet2 = 0;
     state.blockAllSendsUntil = 0;
   }
@@ -902,62 +978,108 @@ export class ILinkClient {
     contextToken: string,
     itemList: MessageItem[],
     clientId: string = randomUUID(),
+    trace?: DeliveryTraceContext,
   ): Promise<void> {
     const serializedItems = JSON.stringify(itemList);
     const textItems = itemList
       .map((item) => item.text_item?.text || '')
       .join('');
+    const diagnosticBase: DeliveryDiagnosticInput = {
+      event: 'request',
+      accountId: this.accountId,
+      userId,
+      contextToken,
+      clientId,
+      ...trace,
+      itemCount: itemList.length,
+      jsLength: textItems.length,
+      utf8Bytes: Buffer.byteLength(textItems, 'utf8'),
+      itemListBytes: Buffer.byteLength(serializedItems, 'utf8'),
+    };
+    this.recordDiagnostic(diagnosticBase);
     log.debug(
       `[send] request client=${clientId} user=${userId.substring(0, 12)}... `
       + `tokenHash=${tokenHash(contextToken)} items=${itemList.length} `
       + `jsLength=${textItems.length} utf8Bytes=${Buffer.byteLength(textItems, 'utf8')} `
       + `itemListBytes=${Buffer.byteLength(serializedItems, 'utf8')}`,
     );
-    const res = await fetchWithRetry(
-      `${this.credentials.baseUrl}/ilink/bot/sendmessage`,
-      {
-        method: 'POST',
-        headers: this.headers(),
-        body: JSON.stringify({
-          msg: {
-            from_user_id: '',
-            to_user_id: userId,
-            client_id: clientId,
-            message_type: 2,
-            message_state: 2,
-            context_token: contextToken,
-            item_list: itemList,
-          },
-          base_info: this.baseInfo(),
-        }),
-        label: 'send',
-        retries: 2,
-        timeoutMs: 30_000,
-      },
-    );
-
-    if (!res.ok) {
-      const body = await res.text().catch(() => '');
-      throw new ILinkApiError({ httpStatus: res.status, errmsg: `发送消息失败: HTTP ${res.status} ${body}` });
-    }
-
-    const rawBody = await res.text();
-    let data: Partial<SendMessageResponse>;
+    let responseRecorded = false;
     try {
-      data = (rawBody ? JSON.parse(rawBody) : {}) as Partial<SendMessageResponse>;
-    } catch {
-      log.error(`[send] response parse failed client=${clientId} http=${res.status} bodyBytes=${Buffer.byteLength(rawBody, 'utf8')}`);
-      throw new ILinkApiError({
+      const res = await fetchWithRetry(
+        `${this.credentials.baseUrl}/ilink/bot/sendmessage`,
+        {
+          method: 'POST',
+          headers: this.headers(),
+          body: JSON.stringify({
+            msg: {
+              from_user_id: '',
+              to_user_id: userId,
+              client_id: clientId,
+              message_type: 2,
+              message_state: 2,
+              context_token: contextToken,
+              item_list: itemList,
+            },
+            base_info: this.baseInfo(),
+          }),
+          label: 'send',
+          retries: 2,
+          timeoutMs: 30_000,
+        },
+      );
+
+      if (!res.ok) {
+        const body = await res.text().catch(() => '');
+        const response = { httpStatus: res.status, errmsg: `HTTP ${res.status}` };
+        this.recordDiagnostic({ ...diagnosticBase, event: 'response', response });
+        responseRecorded = true;
+        throw new ILinkApiError({ httpStatus: res.status, errmsg: `发送消息失败: HTTP ${res.status} ${body}` });
+      }
+
+      const rawBody = await res.text();
+      let data: Partial<SendMessageResponse>;
+      try {
+        data = (rawBody ? JSON.parse(rawBody) : {}) as Partial<SendMessageResponse>;
+      } catch {
+        log.error(`[send] response parse failed client=${clientId} http=${res.status} bodyBytes=${Buffer.byteLength(rawBody, 'utf8')}`);
+        const response = { httpStatus: res.status, errmsg: 'sendmessage response was not valid JSON' };
+        this.recordDiagnostic({ ...diagnosticBase, event: 'response', response });
+        responseRecorded = true;
+        throw new ILinkApiError({
+          httpStatus: res.status,
+          errmsg: 'sendmessage response was not valid JSON',
+        });
+      }
+      const response = {
+        ret: data.ret,
+        errcode: data.errcode,
+        errmsg: data.errmsg,
         httpStatus: res.status,
-        errmsg: 'sendmessage response was not valid JSON',
-      });
-    }
-    log.debug(`[send] response client=${clientId} http=${res.status} bodyBytes=${Buffer.byteLength(rawBody, 'utf8')} json=${JSON.stringify(redactSecrets(data))}`);
-    // sendmessage success responses from iLink may omit ret/errcode entirely.
-    // Treat only an explicitly non-zero ret as an API failure; requiring ret=0
-    // turns successful HTTP sends into durable permanent failures.
-    if (data.ret !== undefined && data.ret !== 0) {
-      throw new ILinkApiError({ ret: data.ret, errcode: data.errcode, errmsg: data.errmsg || LEGACY_MISSING_RET_ERROR });
+      };
+      this.recordDiagnostic({ ...diagnosticBase, event: 'response', response });
+      responseRecorded = true;
+      log.debug(`[send] response client=${clientId} http=${res.status} bodyBytes=${Buffer.byteLength(rawBody, 'utf8')} json=${JSON.stringify(redactSecrets(data))}`);
+      // sendmessage success responses from iLink may omit ret/errcode entirely.
+      // Treat only an explicitly non-zero ret as an API failure; requiring ret=0
+      // turns successful HTTP sends into durable permanent failures.
+      if (data.ret !== undefined && data.ret !== 0) {
+        throw new ILinkApiError({ ret: data.ret, errcode: data.errcode, errmsg: data.errmsg || LEGACY_MISSING_RET_ERROR });
+      }
+    } catch (err) {
+      if (!responseRecorded) {
+        const details = this.errorDetails(err);
+        this.recordDiagnostic({
+          ...diagnosticBase,
+          event: 'error',
+          response: {
+            ret: details.ret,
+            errcode: details.errcode,
+            errmsg: details.errmsg?.slice(0, 500),
+            httpStatus: details.httpStatus,
+          },
+        });
+      }
+      throw err;
     }
   }
 
@@ -1145,7 +1267,19 @@ export class ILinkClient {
         bytes,
       };
       try {
-        await this.sendRawMessageWithRetry(userId, contextToken, itemList, 'regular');
+        await this.sendRawMessageWithRetry(
+          userId,
+          contextToken,
+          itemList,
+          'regular',
+          item.itemId,
+          {
+            itemId: item.itemId,
+            generation: item.generation,
+            tokenVersion: item.tokenVersion,
+            priority: 'media',
+          },
+        );
         this.quota.commit(reservation.reservationId);
         return [this.resultForItem(item, 'sent')];
       } catch (err) {
