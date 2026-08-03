@@ -6,7 +6,7 @@ import { log } from '../utils/logger.js';
 import { fetchWithRetry, describeNetworkError, isRetryableNetworkError } from '../utils/http.js';
 import { DATA_DIR, savePollCursor, loadPollCursor, saveContextTokens, loadContextTokens } from '../config.js';
 import { downloadImage, downloadFile, downloadVideo, type DownloadedMedia } from '../utils/media.js';
-import { OutboxStore, type OutboxPriority } from './outbox.js';
+import { OutboxStore, type OutboxPriority, type OutboxTextItem } from './outbox.js';
 import { QuotaManager, type QuotaReservation } from './quota.js';
 import { chunkUtf8Text } from './text-chunk.js';
 import { classifyApiFailure, ILinkApiError, type ApiErrorDetails, type SendResult } from './send-result.js';
@@ -25,6 +25,7 @@ const CDN_BASE_URL = 'https://novac2c.cdn.weixin.qq.com/c2c';
 const BASE_RATE_LIMIT_COOLDOWN_MS = 150_000; // ~2.5 minutes
 const MAX_RATE_LIMIT_COOLDOWN_MS = 420_000; // ~7 minutes
 const LEGACY_MISSING_RET_ERROR = 'sendmessage response did not confirm ret=0';
+const RECOVERY_NOTICE_TEXT = '发送预算保护：最终结果已排队。请回复任意消息刷新 context_token，系统会自动续发。';
 
 // Upload media types
 const UPLOAD_MEDIA_TYPE_IMAGE = 1;
@@ -620,6 +621,25 @@ export class ILinkClient {
       // recovery notice cleared after its original result was confirmed).
       if (!this.outbox.get(item.itemId)) continue;
 
+      // Keep one local token slot available for an actionable recovery notice.
+      // The remote quota is not an official fixed number, but this guard makes
+      // the observed boundary visible to the user before the final item hits it.
+      const noticeId = `token-budget-notice:${this.accountId}:${userId}:${item.tokenVersion}`;
+      const noticeAlreadyVisible = this.quota.hasTokenBudgetNotice(userId)
+        && !this.outbox.get(noticeId);
+      if (item.priority !== 'control'
+        && this.quota.getTokenBudget(userId).remainingItems <= 1
+        && !noticeAlreadyVisible) {
+        const noticeResult = await this.sendRecoveryNotice(userId, item);
+        if (noticeResult) results.push(noticeResult);
+        results.push(this.resultForItem(item, 'queued', {
+          errmsg: '最终结果已排队，等待新的 context_token',
+        }));
+        this.quota.noteRateBackoff(userId, Date.now() + BASE_RATE_LIMIT_COOLDOWN_MS);
+        this.deliveryStates.set(userId, 'WAITING_INBOUND');
+        break;
+      }
+
       const reservation = this.quota.reserve(userId, item.bytes, item.priority);
       if (!reservation.allowed) {
         if (reservation.reason === 'intermediate-budget') {
@@ -731,6 +751,69 @@ export class ILinkClient {
       if (!hasPermanentFailure) this.deliveryStates.set(userId, 'READY');
     }
     return results;
+  }
+
+  private async sendRecoveryNotice(userId: string, triggerItem: OutboxTextItem): Promise<SendResult | undefined> {
+    const noticeId = `token-budget-notice:${this.accountId}:${userId}:${triggerItem.tokenVersion}`;
+    let notice = this.outbox.get(noticeId);
+    if (!notice) {
+      if (!this.quota.claimTokenBudgetNotice(userId)) return undefined;
+      try {
+        notice = this.outbox.enqueueText({
+          itemId: noticeId,
+          accountId: this.accountId,
+          userId,
+          generation: triggerItem.generation,
+          tokenVersion: triggerItem.tokenVersion,
+          priority: 'control',
+          text: RECOVERY_NOTICE_TEXT,
+        });
+      } catch (err) {
+        log.error(`[send] 无法写入恢复提示: ${userId}`, err);
+        return undefined;
+      }
+    }
+
+    const token = this.contextTokens.get(userId);
+    if (!token) return this.resultForItem(notice, 'waiting-for-token', { errmsg: '缺少 context_token' });
+
+    const reservation = this.quota.reserve(userId, notice.bytes, 'control', {
+      generation: notice.generation,
+      tokenVersion: notice.tokenVersion,
+    });
+    if (!reservation.allowed) {
+      return this.resultForItem(notice, 'queued', {
+        errmsg: `恢复提示发送预算不足: ${reservation.reason}`,
+      });
+    }
+    if (!this.gateSendWindow(userId, 'regular')) {
+      this.quota.release(reservation.reservation.reservationId);
+      return this.resultForItem(notice, 'rate-limited', {
+        ret: -2,
+        errmsg: '恢复提示等待新的入站消息',
+      });
+    }
+
+    try {
+      log.debug(`[send] recovery notice item=${notice.itemId} client=${notice.clientId}`);
+      await this.sendRawMessageWithRetry(
+        userId,
+        token,
+        [{ type: 1 as const, text_item: { text: notice.text } }],
+        'regular',
+        notice.clientId,
+      );
+      this.quota.commit(reservation.reservation.reservationId);
+      this.outbox.ack(notice.itemId);
+      return this.resultForItem(notice, 'sent');
+    } catch (err) {
+      this.quota.release(reservation.reservation.reservationId);
+      const details = this.errorDetails(err);
+      const failure = classifyApiFailure(details);
+      if (failure?.ambiguous) this.noteRateLimit(userId);
+      else this.outbox.markPermanentFailure(notice.itemId, details);
+      return this.resultForItem(notice, failure?.status || 'permanent-failure', details);
+    }
   }
 
   private resultForItem(

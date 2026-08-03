@@ -78,6 +78,13 @@ export interface QuotaSnapshot {
   reservedBytes: number;
 }
 
+export interface TokenBudgetSnapshot {
+  maxItems: number;
+  sentItems: number;
+  reservedItems: number;
+  remainingItems: number;
+}
+
 export interface QuotaReservation {
   reservationId: string;
   userId: string;
@@ -221,12 +228,25 @@ export class QuotaManager {
     };
   }
 
+  getTokenBudget(userId: string): TokenBudgetSnapshot {
+    const state = this.getState(userId);
+    const reservedItems = Object.values(state.reservations)
+      .filter((reservation) => reservation.tokenVersion === state.tokenVersion)
+      .reduce((sum, reservation) => sum + reservation.items, 0);
+    return {
+      maxItems: this.limits.maxItemsPerToken,
+      sentItems: state.tokenSentItems,
+      reservedItems,
+      remainingItems: Math.max(0, this.limits.maxItemsPerToken - state.tokenSentItems - reservedItems),
+    };
+  }
+
   canReserveForPriority(userId: string, priority: QuotaPriority): boolean {
     const state = this.getState(userId);
     const reservedForToken = Object.values(state.reservations)
       .filter((reservation) => reservation.tokenVersion === state.tokenVersion)
       .reduce((sum, reservation) => sum + reservation.items, 0);
-    const maxItems = priority === 'final'
+    const maxItems = priority === 'final' || priority === 'control'
       ? this.limits.maxItemsPerToken
       : priority === 'intermediate' || priority === 'activity'
         ? this.limits.maxIntermediateItemsPerToken
@@ -242,11 +262,15 @@ export class QuotaManager {
     return true;
   }
 
+  hasTokenBudgetNotice(userId: string): boolean {
+    return this.getState(userId).tokenBudgetNoticeVersion === this.getState(userId).tokenVersion;
+  }
+
   reserve(userId: string, bytes: number, priority: QuotaPriority, context?: QuotaContext): ReserveResult {
     if (!Number.isInteger(bytes) || bytes < 0) throw new RangeError('bytes must be a non-negative integer');
 
     const state = this.getState(userId);
-    const maxItems = priority === 'final'
+    const maxItems = priority === 'final' || priority === 'control'
       ? this.limits.maxItems
       : Math.max(0, this.limits.maxItems - this.limits.finalReserveItems);
     const maxBytes = priority === 'final'
@@ -255,7 +279,7 @@ export class QuotaManager {
     const tokenReservedItems = Object.values(state.reservations)
       .filter((reservation) => reservation.tokenVersion === state.tokenVersion)
       .reduce((sum, reservation) => sum + reservation.items, 0);
-    const maxTokenItems = priority === 'final'
+    const maxTokenItems = priority === 'final' || priority === 'control'
       ? this.limits.maxItemsPerToken
       : priority === 'intermediate' || priority === 'activity'
         ? this.limits.maxIntermediateItemsPerToken

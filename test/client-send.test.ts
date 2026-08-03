@@ -111,6 +111,39 @@ test('sendText drains every UTF-8 chunk after an HTTP success without ret', asyn
   });
 });
 
+test('protects the final queue with a visible recovery notice before the token budget is exhausted', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wxclient-recovery-notice-'));
+  const outbox = new OutboxStore(join(dir, 'outbox.json'));
+  const quota = new QuotaManager(join(dir, 'quota.json'), 'account-a', {
+    maxItemsPerToken: 3,
+    maxIntermediateItemsPerToken: 3,
+    finalReserveItemsPerToken: 1,
+  });
+  const client = new ILinkClient(credentials, { outbox, quota });
+  quota.recordInbound('user-a', 'message-1', 'context-a');
+  (client as any).contextTokens.set('user-a', 'context-a');
+
+  const originalFetch = globalThis.fetch;
+  const payloads: Array<Record<string, any>> = [];
+  globalThis.fetch = async (_input, init) => {
+    payloads.push(JSON.parse(String(init?.body)));
+    return new Response(JSON.stringify({ ret: 0 }), { status: 200 });
+  };
+  try {
+    await client.sendText('user-a', '第一块', { priority: 'final' });
+    await client.sendText('user-a', '第二块', { priority: 'final' });
+    await client.sendText('user-a', '第三块', { priority: 'final' });
+
+    assert.equal(payloads.length, 3);
+    assert.match(payloads[2].msg.item_list[0].text_item.text, /回复任意消息刷新 context_token/);
+    assert.deepEqual(outbox.listPending('user-a').map((item) => item.text), ['第三块']);
+    assert.equal(client.getDeliveryState('user-a').state, 'WAITING_INBOUND');
+  } finally {
+    globalThis.fetch = originalFetch;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('ret=-2 is queued as an ambiguous rate limit without application retries', async () => {
   await withStores(async (outbox, quota) => {
     const client = new ILinkClient(credentials, { outbox, quota });
