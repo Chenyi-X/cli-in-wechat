@@ -347,12 +347,13 @@ export class ILinkClient {
     log.debug(`[msg] item_list=${JSON.stringify(redactSecrets(msg.item_list))}`);
     const { text, refText, mediaItems } = await parseMessage(msg);
 
-    // Preserve the state observed before the automatic drain. A plain "继续"
-    // must remain a recovery command even when that drain completes before the
-    // Router sees the message and the durable queue is already empty.
-    const pendingTextCountBeforeDrain = text.trim() === '继续'
-      ? this.outbox.listPending(msg.from_user_id, this.accountId).length
-      : 0;
+    // Preserve the state observed before the automatic drain. Any inbound
+    // message can refresh the token; when durable text was waiting, the same
+    // message must not also start a second Agent task after recovery.
+    const pendingTextCountBeforeDrain = this.outbox.listPending(
+      msg.from_user_id,
+      this.accountId,
+    ).length;
 
     // A new, deduplicated inbound message is the safe trigger for draining text
     // that was waiting for a usable context token or an ambiguous ret=-2 response.

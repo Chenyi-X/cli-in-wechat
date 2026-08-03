@@ -636,6 +636,48 @@ test('a recovery inbound carries the pre-drain pending count to message handlers
   });
 });
 
+test('any inbound with queued text carries a recovery snapshot before normal routing', async () => {
+  await withStores(async (outbox, quota) => {
+    const client = new ILinkClient(credentials, { outbox, quota });
+    quota.recordInbound('user-a', 'message-1', 'context-a');
+    (client as any).contextTokens.set('user-a', 'context-a');
+    outbox.enqueueText({
+      accountId: 'account-a',
+      userId: 'user-a',
+      generation: 1,
+      tokenVersion: 1,
+      priority: 'final',
+      text: '待恢复的最终结果',
+    });
+
+    let handlerArgs: unknown[] | undefined;
+    client.onMessage((...args: unknown[]) => {
+      handlerArgs = args;
+    });
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response(JSON.stringify({ ret: 0 }), { status: 200 });
+    try {
+      await (client as any).processMessage({
+        message_id: 2,
+        from_user_id: 'user-a',
+        to_user_id: 'bot-user',
+        client_id: 'inbound-client-2',
+        create_time_ms: Date.now(),
+        message_type: 1,
+        message_state: 0,
+        context_token: 'context-b',
+        item_list: [{ type: 1 as const, text_item: { text: '如何' } }],
+      });
+
+      assert.equal(handlerArgs?.[1], '如何');
+      assert.deepEqual(handlerArgs?.[4], { pendingTextCount: 1 });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
 test('a replayed inbound after restart does not replace the current context token', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'wx-replay-'));
   try {

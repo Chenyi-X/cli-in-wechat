@@ -230,6 +230,12 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
       }
     }
 
+    // The client already drained durable text before invoking the router. If
+    // this inbound arrived while text was waiting, consume it as the recovery
+    // trigger instead of accidentally starting a second Agent task (for
+    // example, a user replying "如何" to a recovery prompt).
+    if (recovery && recovery.pendingTextCount > 0) return;
+
     // ── Parse: @tool1>tool2 chain, @tool single, >> relay, plain text ──
 
     // Pattern: @tool1>tool2 prompt  →  chain: tool1 processes, output feeds tool2

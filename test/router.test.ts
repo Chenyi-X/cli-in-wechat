@@ -208,6 +208,18 @@ test('plain 继续 uses the inbound recovery snapshot after automatic drain', as
   assert.equal(execCalled, false);
 });
 
+test('an arbitrary recovery inbound is consumed instead of starting a second Agent task', async () => {
+  const { router } = createRouter();
+  let execCalled = false;
+  router.exec = async () => {
+    execCalled = true;
+  };
+
+  await router.handle(makeMessage('u1'), '如何', '', undefined, { pendingTextCount: 1 });
+
+  assert.equal(execCalled, false);
+});
+
 test('exec sends the complete final body when intermediate delivery was not confirmed', async () => {
   const { router } = createRouter();
   const sent: Array<{ text: string; options?: Record<string, unknown> }> = [];
