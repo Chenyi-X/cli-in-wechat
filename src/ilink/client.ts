@@ -416,14 +416,22 @@ export class ILinkClient {
       // The token may remain byte-identical, so this must not depend on a token
       // version change. The current token budget is still enforced by reserve().
       if (item.tokenVersion > inbound.tokenVersion) return false;
-      return this.isLocalBudgetFailure(item);
+      return this.isLocalBudgetFailure(item) || item.terminalError?.ret === -2;
     });
     if (requeued > 0) {
-      log.warn(`[msg] 新入站已重新排队 ${requeued} 个本地预算阻塞项`);
+      log.warn(`[msg] 新入站已重新排队 ${requeued} 个可恢复发送项`);
     }
 
-    this.contextTokens.set(msg.from_user_id, msg.context_token);
-    saveContextTokens(this.contextTokens, this.accountId);
+    if (msg.context_token) {
+      this.contextTokens.set(msg.from_user_id, msg.context_token);
+      saveContextTokens(this.contextTokens, this.accountId);
+    } else {
+      log.warn(
+        `[msg] 入站缺少 context_token，${this.contextTokens.has(msg.from_user_id)
+          ? '保留已有 token 继续恢复发送'
+          : '当前没有可用 token，等待后续入站消息'}`,
+      );
+    }
 
     // A real, deduplicated inbound message is the explicit recovery signal. It
     // clears only the local send backoff; quota counters and generations remain intact.

@@ -974,6 +974,48 @@ test('a new inbound drains a guarded final result when the token string is uncha
   });
 });
 
+test('recovery keeps the last usable context token when inbound omits one', async () => {
+  await withStores(async (outbox, quota) => {
+    const client = new ILinkClient(credentials, { outbox, quota });
+    quota.recordInbound('user-a', 'message-1', 'context-a');
+    (client as any).contextTokens.set('user-a', 'context-a');
+    outbox.enqueueText({
+      accountId: 'account-a',
+      userId: 'user-a',
+      generation: 1,
+      tokenVersion: 1,
+      priority: 'final',
+      text: '缺少入站 token 时仍要恢复的最终结果',
+    });
+
+    const originalFetch = globalThis.fetch;
+    const payloads: Array<Record<string, any>> = [];
+    globalThis.fetch = async (_input, init) => {
+      payloads.push(JSON.parse(String(init?.body)));
+      return new Response(JSON.stringify({ ret: 0, message_id: payloads.length }), { status: 200 });
+    };
+    try {
+      await (client as any).processMessage({
+        message_id: 2,
+        from_user_id: 'user-a',
+        to_user_id: 'bot-user',
+        client_id: 'inbound-client-2',
+        create_time_ms: Date.now(),
+        message_type: 1,
+        message_state: 0,
+        context_token: '',
+        item_list: [{ type: 1, text_item: { text: '0' } }],
+      });
+
+      assert.equal(payloads[0]?.msg.context_token, 'context-a');
+      assert.equal(payloads[0]?.msg.item_list[0].text_item.text, '缺少入站 token 时仍要恢复的最终结果');
+      assert.deepEqual(outbox.listPending('user-a'), []);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
 test('durable queue decisions persist structured diagnostics', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'wxclient-queued-diagnostics-'));
   const outbox = new OutboxStore(join(dir, 'outbox.json'));
@@ -1145,6 +1187,59 @@ test('a restarted client requeues legacy ret=-2 send failures for inbound recove
     assert.equal(outbox.get(item.itemId)?.state, 'pending');
     assert.equal(outbox.get(item.itemId)?.clientId, item.clientId);
     assert.equal(restarted.getDeliveryState('user-a').pendingTextCount, 1);
+  });
+});
+
+test('a fresh inbound requeues a legacy ret=-2 failure left by the running process', async () => {
+  await withStores(async (outbox, quota) => {
+    const client = new ILinkClient(credentials, { outbox, quota });
+    quota.recordInbound('user-a', 'message-1', 'context-a');
+    (client as any).contextTokens.set('user-a', 'context-a');
+
+    const item = outbox.enqueueText({
+      accountId: 'account-a',
+      userId: 'user-a',
+      generation: 1,
+      tokenVersion: 1,
+      priority: 'final',
+      text: '运行中 ret=-2 后必须续发的最终结果',
+    });
+    outbox.markPermanentFailure(item.itemId, {
+      ret: -2,
+      errcode: 17,
+      errmsg: 'prepare failed',
+    });
+
+    const recoveries: Array<{ pendingTextCount: number } | undefined> = [];
+    client.onMessage((_msg, _text, _refText, _media, recovery) => {
+      recoveries.push(recovery);
+    });
+
+    const originalFetch = globalThis.fetch;
+    const payloads: Array<Record<string, any>> = [];
+    globalThis.fetch = async (_input, init) => {
+      payloads.push(JSON.parse(String(init?.body)));
+      return new Response(JSON.stringify({ ret: 0, message_id: payloads.length }), { status: 200 });
+    };
+    try {
+      await (client as any).processMessage({
+        message_id: 2,
+        from_user_id: 'user-a',
+        to_user_id: 'bot-user',
+        client_id: 'inbound-client-2',
+        create_time_ms: Date.now(),
+        message_type: 1,
+        message_state: 0,
+        context_token: 'context-a',
+        item_list: [{ type: 1, text_item: { text: '0' } }],
+      });
+
+      assert.equal(payloads.at(-1)?.msg.item_list[0].text_item.text, '运行中 ret=-2 后必须续发的最终结果');
+      assert.deepEqual(outbox.listPending('user-a'), []);
+      assert.deepEqual(recoveries, [{ pendingTextCount: 1 }]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 });
 
