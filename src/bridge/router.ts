@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { execSync } from 'node:child_process';
 import { log } from '../utils/logger.js';
-import { ILinkClient, type DeliveryContext } from '../ilink/client.js';
+import { ILinkClient, type DeliveryContext, type InboundRecoveryContext } from '../ilink/client.js';
 import { AdapterRegistry } from '../adapters/registry.js';
 import { SessionManager } from './session.js';
 import { formatResponse } from './formatter.js';
@@ -27,6 +27,11 @@ const NORMAL_ACTIVITY_MAX_LINES_PER_MESSAGE = 12;
 const NORMAL_ACTIVITY_MAX_CHARS_PER_MESSAGE = 1400;
 const NORMAL_ACTIVITY_SPLIT_DELAY_MS = 5000;
 
+interface NormalActivityDelivery {
+  split: boolean;
+  unsentLines: string[];
+}
+
 export class Router {
   private ilink: ILinkClient;
   private registry: AdapterRegistry;
@@ -45,8 +50,8 @@ export class Router {
   }
 
   start(): void {
-    this.ilink.onMessage((msg, text, refText, media) => {
-      this.handle(msg, text, refText, media).catch((e) => log.error('路由异常:', e));
+    this.ilink.onMessage((msg, text, refText, media, recovery) => {
+      this.handle(msg, text, refText, media, recovery).catch((e) => log.error('路由异常:', e));
     });
   }
 
@@ -159,24 +164,36 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
     uid: string,
     lines: string[],
     deliveryContext?: DeliveryContext,
-  ): Promise<boolean> {
+  ): Promise<NormalActivityDelivery> {
     const batches = this.splitNormalActivityLines(lines);
-    if (batches.length <= 1) return false;
+    if (batches.length <= 1) return { split: false, unsentLines: lines };
 
     for (let i = 0; i < batches.length; i++) {
       const title = `Activity (${i + 1}/${batches.length})`;
-      await this.ilink.sendText(uid, [title, ...batches[i]].join('\n'), {
+      const results = await this.ilink.sendText(uid, [title, ...batches[i]].join('\n'), {
         streamType: 'intermediate',
         priority: 'activity',
         ...deliveryContext,
       });
+      const confirmed = Array.isArray(results)
+        && results.length > 0
+        && results.every((result) => result.status === 'sent');
+      if (!confirmed) {
+        return { split: true, unsentLines: batches.slice(i).flat() };
+      }
       if (i < batches.length - 1) await this.sleep(NORMAL_ACTIVITY_SPLIT_DELAY_MS);
     }
-    return true;
+    return { split: true, unsentLines: [] };
   }
 
 
-  private async handle(msg: WeixinMessage, text: string, refText: string, media?: DownloadedMedia[]): Promise<void> {
+  private async handle(
+    msg: WeixinMessage,
+    text: string,
+    refText: string,
+    media?: DownloadedMedia[],
+    recovery?: InboundRecoveryContext,
+  ): Promise<void> {
     const uid = msg.from_user_id;
     if (this.config.allowedUsers.length > 0 && !this.config.allowedUsers.includes(uid)) return;
 
@@ -201,8 +218,13 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
     // A plain "继续" is a delivery recovery control only while durable text is
     // waiting for this user's inbound message. Otherwise it remains an Agent prompt.
     if (trimmed === '继续') {
-      const delivery = this.ilink.getDeliveryState(uid);
-      if (delivery.waitingForInbound && delivery.pendingTextCount > 0) {
+      const shouldRecover = recovery
+        ? recovery.pendingTextCount > 0
+        : (() => {
+          const delivery = this.ilink.getDeliveryState(uid);
+          return delivery.waitingForInbound && delivery.pendingTextCount > 0;
+        })();
+      if (shouldRecover) {
         await this.ilink.resumePendingText(uid);
         return;
       }
@@ -1373,12 +1395,12 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
         ? `\n[文件发送失败: ${failedFiles.join('; ')}]`
         : '';
 
-      const splitActivitySent = msgMode === 'normal' && finalActivityLines.length > 0
+      const activityDelivery = msgMode === 'normal' && finalActivityLines.length > 0
         ? await this.sendNormalActivityBatches(uid, finalActivityLines, deliveryContext)
-        : false;
+        : { split: false, unsentLines: [] };
 
-      const finalActivityBlock = msgMode === 'normal' && finalActivityLines.length > 0 && !splitActivitySent
-        ? `Activity\n${finalActivityLines.join('\n')}\n\n`
+      const finalActivityBlock = msgMode === 'normal' && activityDelivery.unsentLines.length > 0
+        ? `Activity\n${activityDelivery.unsentLines.join('\n')}\n\n`
         : '';
 
       // If text was already streamed, only send footer (avoid duplicate large-body resend).

@@ -24,6 +24,7 @@ const HTTP_TIMEOUT_MS = 45_000;
 const CDN_BASE_URL = 'https://novac2c.cdn.weixin.qq.com/c2c';
 const BASE_RATE_LIMIT_COOLDOWN_MS = 150_000; // ~2.5 minutes
 const MAX_RATE_LIMIT_COOLDOWN_MS = 420_000; // ~7 minutes
+const LEGACY_MISSING_RET_ERROR = 'sendmessage response did not confirm ret=0';
 
 // Upload media types
 const UPLOAD_MEDIA_TYPE_IMAGE = 1;
@@ -44,6 +45,10 @@ export interface DeliveryContext {
   tokenVersion: number;
 }
 
+export interface InboundRecoveryContext {
+  pendingTextCount: number;
+}
+
 interface UserRateLimitState {
   consecutiveRet2: number;
   suppressIntermediateUntil: number;
@@ -60,7 +65,8 @@ export type MessageHandler = (
   msg: WeixinMessage,
   text: string,
   refText: string,
-  media?: DownloadedMedia[]
+  media?: DownloadedMedia[],
+  recovery?: InboundRecoveryContext,
 ) => void;
 
 export class ILinkClient {
@@ -96,6 +102,14 @@ export class ILinkClient {
     this.contextTokens = loadContextTokens(this.accountId);
     this.outbox = options.outbox || new OutboxStore(join(DATA_DIR, 'outbox.json'));
     this.quota = options.quota || new QuotaManager(join(DATA_DIR, 'quota.json'), this.accountId);
+    const recovered = this.outbox.requeuePermanentFailures((item) =>
+      item.accountId === this.accountId
+      && item.terminalError?.ret === undefined
+      && item.terminalError?.errcode === undefined
+      && item.terminalError?.errmsg === LEGACY_MISSING_RET_ERROR);
+    if (recovered > 0) {
+      log.warn(`[send] 已恢复 ${recovered} 个旧版误判的未确认发送项，将使用原 client_id 续发`);
+    }
   }
 
   onMessage(handler: MessageHandler): void {
@@ -322,19 +336,33 @@ export class ILinkClient {
     // clears only the local send backoff; quota counters and generations remain intact.
     this.resetRateLimitOnInbound(msg.from_user_id);
 
+    log.debug(`[msg] item_list=${JSON.stringify(redactSecrets(msg.item_list))}`);
+    const { text, refText, mediaItems } = await parseMessage(msg);
+
+    // Preserve the state observed before the automatic drain. A plain "继续"
+    // must remain a recovery command even when that drain completes before the
+    // Router sees the message and the durable queue is already empty.
+    const pendingTextCountBeforeDrain = text.trim() === '继续'
+      ? this.outbox.listPending(msg.from_user_id, this.accountId).length
+      : 0;
+
     // A new, deduplicated inbound message is the safe trigger for draining text
     // that was waiting for a usable context token or an ambiguous ret=-2 response.
     await this.drainOutbox(msg.from_user_id);
 
-    log.debug(`[msg] item_list=${JSON.stringify(redactSecrets(msg.item_list))}`);
-    const { text, refText, mediaItems } = await parseMessage(msg);
     if (!text && !refText && mediaItems.length === 0) return;
 
     log.debug(`收到 [${msg.from_user_id.substring(0, 12)}...]: ${text.substring(0, 60)}${mediaItems.length > 0 ? ` (+${mediaItems.length} media)` : ''}`);
 
     for (const handler of this.handlers) {
       try {
-        handler(msg, text, refText, mediaItems.length > 0 ? mediaItems : undefined);
+        handler(
+          msg,
+          text,
+          refText,
+          mediaItems.length > 0 ? mediaItems : undefined,
+          pendingTextCountBeforeDrain > 0 ? { pendingTextCount: pendingTextCountBeforeDrain } : undefined,
+        );
       } catch (err) {
         log.error('消息处理器异常:', err);
       }
@@ -398,6 +426,20 @@ export class ILinkClient {
 
   private resetRateLimitOnInbound(userId: string): void {
     const state = this.rateLimitStates.get(userId);
+    const snapshot = this.quota.snapshot(userId);
+    const persistedBackoff = this.quota.getRateBackoff(userId);
+    const sameTokenBackoff = persistedBackoff.tokenVersion !== undefined
+      && persistedBackoff.tokenVersion === snapshot.tokenVersion;
+    const legacyBackoff = persistedBackoff.tokenVersion === undefined
+      && persistedBackoff.until > Date.now();
+    if (sameTokenBackoff || legacyBackoff) {
+      if (state) {
+        state.suppressIntermediateUntil = Math.max(state.suppressIntermediateUntil, persistedBackoff.until);
+        state.blockAllSendsUntil = Math.max(state.blockAllSendsUntil, persistedBackoff.until);
+      }
+      this.deliveryStates.set(userId, 'RATE_BACKOFF');
+      return;
+    }
     if (state) {
       state.consecutiveRet2 = 0;
       state.suppressIntermediateUntil = 0;
@@ -418,7 +460,11 @@ export class ILinkClient {
     const snapshot = this.quota.snapshot(userId);
     const persistedBackoff = this.quota.getRateBackoff(userId);
 
-    if (persistedBackoff.generation === snapshot.inboundGeneration && now < persistedBackoff.until) {
+    const sameTokenBackoff = persistedBackoff.tokenVersion !== undefined
+      && persistedBackoff.tokenVersion === snapshot.tokenVersion;
+    const legacyBackoff = persistedBackoff.tokenVersion === undefined
+      && now < persistedBackoff.until;
+    if (sameTokenBackoff || legacyBackoff) {
       if (streamType === 'intermediate') {
         log.debug('[send] 中间消息命中持久化发送冷却，直接跳过');
       } else {
@@ -462,6 +508,43 @@ export class ILinkClient {
     const capacityFailures: SendResult[] = [];
     const chunks = chunkUtf8Text(text, 2_000);
 
+    const lowPriority = priority === 'intermediate' || priority === 'activity';
+    const suppressedResults = (error: ApiErrorDetails): SendResult[] => chunks.map((chunk) => ({
+        status: 'suppressed' as const,
+        itemId: 'rate-backoff-suppressed',
+        userId,
+        generation,
+        tokenVersion,
+        attemptedBytes: Buffer.byteLength(chunk, 'utf8'),
+        error,
+      }));
+
+    if (lowPriority && !this.gateSendWindow(userId, 'intermediate')) {
+      return suppressedResults({ ret: -2, errmsg: '发送冷却中，跳过中间消息' });
+    }
+
+    if (lowPriority && !this.quota.canReserveForPriority(userId, priority)) {
+      let warningQueued = false;
+      if (this.quota.claimTokenBudgetNotice(userId)) {
+        try {
+          this.outbox.enqueueText({
+            itemId: `token-budget-notice:${this.accountId}:${userId}:${tokenVersion}`,
+            accountId: this.accountId,
+            userId,
+            generation,
+            tokenVersion,
+            priority: 'control',
+            text: '发送预算保护：中间消息已暂停，最终结果将优先发送。若最终结果仍未完整显示，请回复任意消息刷新 context_token，系统会自动续发。',
+          });
+          warningQueued = true;
+        } catch (err) {
+          log.error(`[send] 无法写入预算保护提示: ${userId}`, err);
+        }
+      }
+      const warningResults = warningQueued ? await this.drainOutbox(userId, streamType) : [];
+      return [...suppressedResults({ errmsg: '已达到本地中间消息预算，跳过后续中间消息' }), ...warningResults];
+    }
+
     try {
       this.outbox.enqueueTextBatch(chunks.map((chunk) => ({
         accountId: this.accountId,
@@ -486,6 +569,15 @@ export class ILinkClient {
           attemptedBytes: Buffer.byteLength(chunk, 'utf8'),
           error: { errmsg: err instanceof Error ? err.message : String(err) },
         });
+      }
+      if (priority === 'final') {
+        this.enqueueVisibleFailureNotice({
+          itemId: `outbox-capacity:${this.accountId}:${userId}:${generation}:${tokenVersion}`,
+          userId,
+          generation,
+          tokenVersion,
+          priority,
+        }, { errmsg: err instanceof Error ? err.message : String(err) });
       }
     }
 
@@ -523,6 +615,37 @@ export class ILinkClient {
 
       const reservation = this.quota.reserve(userId, item.bytes, item.priority);
       if (!reservation.allowed) {
+        if (reservation.reason === 'intermediate-budget') {
+          this.outbox.ack(item.itemId);
+          this.outbox.ack(`delivery-notice:${item.itemId}`);
+          results.push(this.resultForItem(item, 'suppressed', {
+            errmsg: '已达到本地中间消息预算，跳过后续中间消息',
+          }));
+          continue;
+        }
+        if (reservation.reason === 'token-budget-exhausted') {
+          this.quota.noteRateBackoff(userId, Date.now() + BASE_RATE_LIMIT_COOLDOWN_MS);
+          this.deliveryStates.set(userId, 'RATE_BACKOFF');
+          try {
+            if (this.quota.claimTokenBudgetNotice(userId)) {
+              this.outbox.enqueueText({
+                itemId: `delivery-notice:${item.itemId}`,
+                accountId: this.accountId,
+                userId,
+                generation: item.generation,
+                tokenVersion: item.tokenVersion,
+                priority: 'control',
+                text: '最终结果已排队，等待新的 context_token 后自动续发。',
+              });
+            }
+          } catch (noticeError) {
+            log.error(`[send] 无法写入最终结果恢复提示: ${userId}`, noticeError);
+          }
+          results.push(this.resultForItem(item, 'queued', {
+            errmsg: '当前 token 的最终发送预算已用尽，等待新的 context_token',
+          }));
+          break;
+        }
         this.outbox.markPermanentFailure(item.itemId, {
           errmsg: `本地发送预算不足: ${reservation.reason}`,
         });
@@ -542,6 +665,7 @@ export class ILinkClient {
       }
 
       try {
+        log.debug(`[send] item=${item.itemId} client=${item.clientId} user=${userId.substring(0, 12)}... generation=${item.generation} tokenVersion=${item.tokenVersion} priority=${item.priority} bytes=${item.bytes}`);
         await this.sendRawMessageWithRetry(
           userId,
           token,
@@ -559,6 +683,9 @@ export class ILinkClient {
         const failure = classifyApiFailure(details);
         if (failure?.ambiguous) {
           this.noteRateLimit(userId);
+          if (item.priority !== 'final') {
+            this.outbox.supersedeIntermediate(this.accountId, userId, item.generation);
+          }
           if (item.priority !== 'control') {
             try {
               this.outbox.enqueueText({
@@ -577,6 +704,7 @@ export class ILinkClient {
           this.deliveryStates.set(userId, 'RATE_BACKOFF');
         } else {
           this.outbox.markPermanentFailure(item.itemId, details);
+          this.enqueueVisibleFailureNotice(item, details);
           this.deliveryStates.set(userId, 'PERMANENT_FAILURE');
         }
         results.push(this.resultForItem(item, failure?.status || 'permanent-failure', details));
@@ -614,6 +742,37 @@ export class ILinkClient {
     };
   }
 
+  private enqueueVisibleFailureNotice(
+    item: {
+      itemId: string;
+      userId: string;
+      generation: number;
+      tokenVersion: number;
+      priority: OutboxPriority;
+    },
+    details: ApiErrorDetails,
+  ): void {
+    if (item.priority !== 'final' || item.itemId.startsWith('delivery-failure:')) return;
+    const rawError = details.errmsg
+      || [details.ret !== undefined ? `ret=${details.ret}` : '', details.errcode !== undefined ? `errcode=${details.errcode}` : '']
+        .filter(Boolean)
+        .join(' ')
+      || 'unknown error';
+    try {
+      this.outbox.enqueueText({
+        itemId: `delivery-failure:${item.itemId}`,
+        accountId: this.accountId,
+        userId: item.userId,
+        generation: item.generation,
+        tokenVersion: item.tokenVersion,
+        priority: 'control',
+        text: `最终结果未送达，原始结果已保留为失败记录。请重新发送任务。原始错误: ${rawError}`,
+      });
+    } catch (noticeError) {
+      log.error(`[send] 无法写入最终结果失败提示: ${item.userId}`, noticeError);
+    }
+  }
+
   private errorDetails(err: unknown): ApiErrorDetails {
     if (err instanceof ILinkApiError) return err.details;
     return { errmsg: err instanceof Error ? err.message : String(err) };
@@ -627,7 +786,7 @@ export class ILinkClient {
     state.suppressIntermediateUntil = Math.max(state.suppressIntermediateUntil, until);
     this.quota.noteRateBackoff(userId, until);
     this.deliveryStates.set(userId, 'RATE_BACKOFF');
-    log.warn(`[send] ret=-2 歧义响应，暂停高频重试 ${Math.round((until - Date.now()) / 1000)}s`);
+    log.warn('[send] ret=-2 歧义响应，暂停同 token 重试，等待新的 context_token');
   }
 
   private async sendRawMessageWithRetry(
@@ -681,9 +840,23 @@ export class ILinkClient {
       throw new ILinkApiError({ httpStatus: res.status, errmsg: `发送消息失败: HTTP ${res.status} ${body}` });
     }
 
-    const data = (await res.json()) as Partial<SendMessageResponse>;
-    if (data.ret !== 0) {
-      throw new ILinkApiError({ ret: data.ret, errcode: data.errcode, errmsg: data.errmsg || 'sendmessage response did not confirm ret=0' });
+    const rawBody = await res.text();
+    let data: Partial<SendMessageResponse>;
+    try {
+      data = (rawBody ? JSON.parse(rawBody) : {}) as Partial<SendMessageResponse>;
+    } catch {
+      log.error(`[send] response parse failed client=${clientId} http=${res.status} bodyBytes=${Buffer.byteLength(rawBody, 'utf8')}`);
+      throw new ILinkApiError({
+        httpStatus: res.status,
+        errmsg: 'sendmessage response was not valid JSON',
+      });
+    }
+    log.debug(`[send] response client=${clientId} http=${res.status} bodyBytes=${Buffer.byteLength(rawBody, 'utf8')} json=${JSON.stringify(redactSecrets(data))}`);
+    // sendmessage success responses from iLink may omit ret/errcode entirely.
+    // Treat only an explicitly non-zero ret as an API failure; requiring ret=0
+    // turns successful HTTP sends into durable permanent failures.
+    if (data.ret !== undefined && data.ret !== 0) {
+      throw new ILinkApiError({ ret: data.ret, errcode: data.errcode, errmsg: data.errmsg || LEGACY_MISSING_RET_ERROR });
     }
   }
 

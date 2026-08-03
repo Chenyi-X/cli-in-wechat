@@ -93,6 +93,23 @@ test('OutboxStore acknowledges by stable ID and expires old items', () => {
   });
 });
 
+test('OutboxStore requeues a selected permanent failure with stable identity', () => {
+  withOutbox((filePath) => {
+    const store = new OutboxStore(filePath);
+    const item = store.enqueueText({ ...base, priority: 'final', text: 'retry this send' });
+    store.markPermanentFailure(item.itemId, { errmsg: 'sendmessage response did not confirm ret=0' });
+
+    assert.equal(
+      store.requeuePermanentFailures((candidate) => candidate.terminalError?.errmsg === 'sendmessage response did not confirm ret=0'),
+      1,
+    );
+    const requeued = store.get(item.itemId);
+    assert.equal(requeued?.state, 'pending');
+    assert.equal(requeued?.clientId, item.clientId);
+    assert.equal(requeued?.terminalError, undefined);
+  });
+});
+
 test('OutboxStore enforces caps while preserving higher-priority control work', () => {
   withOutbox((filePath) => {
     const store = new OutboxStore(filePath, {

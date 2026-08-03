@@ -62,7 +62,7 @@ test('sendText acknowledges only after sendmessage ret=0', async () => {
   });
 });
 
-test('sendText does not acknowledge a response that omits ret', async () => {
+test('sendText acknowledges an HTTP success response that omits ret', async () => {
   await withStores(async (outbox, quota) => {
     const client = new ILinkClient(credentials, { outbox, quota });
     quota.recordInbound('user-a', 'message-1', 'context-a');
@@ -70,16 +70,41 @@ test('sendText does not acknowledge a response that omits ret', async () => {
 
     const originalFetch = globalThis.fetch;
     globalThis.fetch = async () => new Response(
-      JSON.stringify({ errcode: 0, errmsg: 'missing ret' }),
+      JSON.stringify({}),
       { status: 200 },
     );
     try {
-      const results = await client.sendText('user-a', '不能确认');
+      const results = await client.sendText('user-a', 'HTTP 成功但响应省略 ret');
 
-      assert.equal(results[0]?.status, 'permanent-failure');
-      assert.equal(results[0]?.error?.errmsg, 'missing ret');
-      assert.equal(outbox.list('user-a').length, 1);
-      assert.equal(quota.snapshot('user-a').sentItems, 0);
+      assert.equal(results[0]?.status, 'sent');
+      assert.deepEqual(outbox.list('user-a'), []);
+      assert.equal(quota.snapshot('user-a').sentItems, 1);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+test('sendText drains every UTF-8 chunk after an HTTP success without ret', async () => {
+  await withStores(async (outbox, quota) => {
+    const client = new ILinkClient(credentials, { outbox, quota });
+    quota.recordInbound('user-a', 'message-1', 'context-a');
+    (client as any).contextTokens.set('user-a', 'context-a');
+
+    const originalFetch = globalThis.fetch;
+    let requestCount = 0;
+    globalThis.fetch = async () => {
+      requestCount += 1;
+      return new Response('{}', { status: 200 });
+    };
+    try {
+      const results = await client.sendText('user-a', 'x'.repeat(4_501), { priority: 'final' });
+
+      assert.equal(requestCount, 3);
+      assert.equal(results.length, 3);
+      assert.ok(results.every((result) => result.status === 'sent'));
+      assert.deepEqual(outbox.list('user-a'), []);
+      assert.equal(quota.snapshot('user-a').sentItems, 3);
     } finally {
       globalThis.fetch = originalFetch;
     }
@@ -119,6 +144,134 @@ test('ret=-2 is queued as an ambiguous rate limit without application retries', 
   });
 });
 
+test('rate backoff suppresses new intermediate text instead of queueing a burst', async () => {
+  await withStores(async (outbox, quota) => {
+    const client = new ILinkClient(credentials, { outbox, quota });
+    quota.recordInbound('user-a', 'message-1', 'context-a');
+    (client as any).contextTokens.set('user-a', 'context-a');
+
+    const originalFetch = globalThis.fetch;
+    let requestCount = 0;
+    globalThis.fetch = async () => {
+      requestCount += 1;
+      return new Response(JSON.stringify({ ret: -2, errcode: 17, errmsg: 'prepare failed' }), { status: 200 });
+    };
+    try {
+      await client.sendText('user-a', '最终结果', { priority: 'final' });
+      const result = await client.sendText('user-a', '冷却期内的中间文本', {
+        streamType: 'intermediate',
+        priority: 'intermediate',
+      });
+
+      assert.equal(result[0]?.status, 'suppressed');
+      assert.equal(requestCount, 1);
+      assert.deepEqual(outbox.listPending('user-a').map((item) => item.priority), ['final', 'control']);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+test('local per-token budget warns before intermediate sends consume the final budget', async () => {
+  await withStores(async (outbox, quota) => {
+    const client = new ILinkClient(credentials, { outbox, quota });
+    quota.recordInbound('user-a', 'message-1', 'context-a');
+    (client as any).contextTokens.set('user-a', 'context-a');
+
+    const originalFetch = globalThis.fetch;
+    let requestCount = 0;
+    const payloads: Array<Record<string, any>> = [];
+    globalThis.fetch = async (_input, init) => {
+      requestCount += 1;
+      payloads.push(JSON.parse(String(init?.body)));
+      return new Response(JSON.stringify({ ret: 0, errcode: 0, errmsg: '' }), { status: 200 });
+    };
+    try {
+      for (let i = 0; i < 7; i++) {
+        const results = await client.sendText('user-a', `中间块 ${i + 1}`, {
+          streamType: 'intermediate',
+          priority: 'intermediate',
+        });
+        if (i === 6) {
+          assert.ok(results.some((result) => result.status === 'suppressed'));
+          assert.ok(payloads.some((payload) => payload.msg.item_list[0].text_item.text.includes('发送预算保护')));
+        }
+      }
+
+      const final = await client.sendText('user-a', 'x'.repeat(4_501), { priority: 'final' });
+
+      assert.ok(final.length === 3 && final.every((result) => result.status === 'sent'));
+      assert.equal(requestCount, 10);
+      assert.deepEqual(outbox.list('user-a'), []);
+      assert.equal(quota.snapshot('user-a').sentItems, 10);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+test('an inbound with the same context token does not bypass an active rate backoff', async () => {
+  await withStores(async (outbox, quota) => {
+    const client = new ILinkClient(credentials, { outbox, quota });
+    quota.recordInbound('user-a', 'message-1', 'context-a');
+    (client as any).contextTokens.set('user-a', 'context-a');
+
+    const originalFetch = globalThis.fetch;
+    let requestCount = 0;
+    globalThis.fetch = async () => {
+      requestCount += 1;
+      return new Response(JSON.stringify({ ret: -2, errcode: 17, errmsg: 'prepare failed' }), { status: 200 });
+    };
+    try {
+      await client.sendText('user-a', '等待恢复的最终结果', { priority: 'final' });
+
+      await (client as any).processMessage({
+        message_id: 2,
+        from_user_id: 'user-a',
+        to_user_id: 'bot-user',
+        client_id: 'inbound-client-2',
+        create_time_ms: Date.now(),
+        message_type: 1,
+        message_state: 0,
+        context_token: 'context-a',
+        item_list: [{ type: 1, text_item: { text: '如何' } }],
+      });
+
+      assert.equal(requestCount, 1);
+      assert.equal(outbox.listPending('user-a').filter((item) => item.priority === 'final').length, 1);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+test('ret=-2 removes stale intermediate backlog but keeps the final result durable', async () => {
+  await withStores(async (outbox, quota) => {
+    const client = new ILinkClient(credentials, { outbox, quota });
+    quota.recordInbound('user-a', 'message-1', 'context-a');
+    (client as any).contextTokens.set('user-a', 'context-a');
+    outbox.enqueueText({
+      accountId: 'account-a', userId: 'user-a', generation: 1, tokenVersion: 1,
+      priority: 'intermediate', text: '过时的中间块',
+    });
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response(
+      JSON.stringify({ ret: -2, errcode: 17, errmsg: 'prepare failed' }),
+      { status: 200 },
+    );
+    try {
+      await client.sendText('user-a', '最终结果', { priority: 'final' });
+
+      const pending = outbox.listPending('user-a');
+      assert.deepEqual(pending.map((item) => item.priority), ['final', 'control']);
+      assert.equal(pending.some((item) => item.text === '过时的中间块'), false);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
 test('permanent send failures become terminal and are not retried automatically', async () => {
   await withStores(async (outbox, quota) => {
     const client = new ILinkClient(credentials, { outbox, quota });
@@ -134,14 +287,74 @@ test('permanent send failures become terminal and are not retried automatically'
     try {
       const first = await client.sendText('user-a', '终态失败', { priority: 'final' });
       assert.equal(first[0]?.status, 'permanent-failure');
-      assert.equal(outbox.list('user-a').length, 1);
-      assert.equal(outbox.list('user-a')[0].state, 'permanent-failure');
+      assert.equal(outbox.list('user-a').find((item) => item.priority === 'final')?.state, 'permanent-failure');
+      assert.equal(outbox.listPending('user-a').filter((item) => item.priority === 'control').length, 1);
 
       await client.resumePendingText('user-a');
-      assert.equal(requestCount, 1);
+      assert.equal(requestCount, 2, 'only the visible failure notice may be attempted');
+      assert.equal(outbox.list('user-a').find((item) => item.priority === 'final')?.state, 'permanent-failure');
     } finally {
       globalThis.fetch = originalFetch;
     }
+  });
+});
+
+test('a permanent final failure leaves a durable visible failure notice', async () => {
+  await withStores(async (outbox, quota) => {
+    const client = new ILinkClient(credentials, { outbox, quota });
+    quota.recordInbound('user-a', 'message-1', 'context-a');
+    (client as any).contextTokens.set('user-a', 'context-a');
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response(JSON.stringify({
+      ret: 5,
+      errcode: 99,
+      errmsg: 'payload rejected',
+    }), { status: 200 });
+    try {
+      const results = await client.sendText('user-a', '最终结果', { priority: 'final' });
+
+      assert.equal(results[0]?.status, 'permanent-failure');
+      assert.equal(outbox.list('user-a').find((item) => item.priority === 'final')?.state, 'permanent-failure');
+      const notices = outbox.listPending('user-a').filter((item) => item.priority === 'control');
+      assert.equal(notices.length, 1);
+      assert.match(notices[0].text, /最终结果未送达/);
+      assert.match(notices[0].text, /payload rejected/);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+test('a restarted client requeues legacy missing-ret send failures', async () => {
+  await withStores(async (outbox, quota) => {
+    const item = outbox.enqueueText({
+      accountId: 'account-a',
+      userId: 'user-a',
+      generation: 1,
+      tokenVersion: 1,
+      priority: 'final',
+      text: '恢复旧的最终结果',
+    });
+    outbox.markPermanentFailure(item.itemId, { errmsg: 'sendmessage response did not confirm ret=0' });
+    const explicitFailure = outbox.enqueueText({
+      accountId: 'account-a',
+      userId: 'user-a',
+      generation: 1,
+      tokenVersion: 1,
+      priority: 'control',
+      text: '不要重试显式错误',
+    });
+    outbox.markPermanentFailure(explicitFailure.itemId, {
+      ret: 5,
+      errmsg: 'sendmessage response did not confirm ret=0',
+    });
+
+    new ILinkClient(credentials, { outbox, quota });
+
+    assert.equal(outbox.get(item.itemId)?.state, 'pending');
+    assert.equal(outbox.get(item.itemId)?.clientId, item.clientId);
+    assert.equal(outbox.get(explicitFailure.itemId)?.state, 'permanent-failure');
   });
 });
 
@@ -295,6 +508,95 @@ test('a fresh inbound message drains the durable result and recovery notice', as
       assert.deepEqual(outbox.list('user-a'), []);
       assert.equal(client.getDeliveryState('user-a').state, 'READY');
       assert.equal(client.getDeliveryState('user-a').waitingForInbound, false);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+test('a restarted client resumes every queued final chunk once after a new token', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wx-final-recovery-'));
+  const outboxPath = join(dir, 'outbox.json');
+  const quotaPath = join(dir, 'quota.json');
+  const originalFetch = globalThis.fetch;
+  try {
+    const firstOutbox = new OutboxStore(outboxPath);
+    const firstQuota = new QuotaManager(quotaPath, 'account-a');
+    const first = new ILinkClient(credentials, { outbox: firstOutbox, quota: firstQuota });
+    firstQuota.recordInbound('user-a', 'message-1', 'context-a');
+    (first as any).contextTokens.set('user-a', 'context-a');
+
+    globalThis.fetch = async () => new Response(JSON.stringify({
+      ret: -2,
+      errcode: 17,
+      errmsg: 'prepare failed',
+    }), { status: 200 });
+    await first.sendText('user-a', 'x'.repeat(4_501), { priority: 'final' });
+
+    const restarted = new ILinkClient(credentials, {
+      outbox: new OutboxStore(outboxPath),
+      quota: new QuotaManager(quotaPath, 'account-a'),
+    });
+    const restartedQuota = (restarted as any).quota as QuotaManager;
+    restartedQuota.recordInbound('user-a', 'message-2', 'context-b');
+    (restarted as any).contextTokens.set('user-a', 'context-b');
+
+    const bodies: Array<Record<string, any>> = [];
+    globalThis.fetch = async (_input, init) => {
+      bodies.push(JSON.parse(String(init?.body)));
+      return new Response(JSON.stringify({ ret: 0 }), { status: 200 });
+    };
+
+    await restarted.resumePendingText('user-a');
+    assert.equal(bodies.length, 3);
+    assert.deepEqual(bodies.map((body) => body.msg.item_list[0].text_item.text).join(''), 'x'.repeat(4_501));
+    assert.equal(new Set(bodies.map((body) => body.msg.client_id)).size, 3);
+    assert.deepEqual(new OutboxStore(outboxPath).list('user-a'), []);
+
+    await restarted.resumePendingText('user-a');
+    assert.equal(bodies.length, 3, 'a second drain must not duplicate acknowledged chunks');
+  } finally {
+    globalThis.fetch = originalFetch;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a recovery inbound carries the pre-drain pending count to message handlers', async () => {
+  await withStores(async (outbox, quota) => {
+    const client = new ILinkClient(credentials, { outbox, quota });
+    quota.recordInbound('user-a', 'message-1', 'context-a');
+    (client as any).contextTokens.set('user-a', 'context-a');
+    outbox.enqueueText({
+      accountId: 'account-a',
+      userId: 'user-a',
+      generation: 1,
+      tokenVersion: 1,
+      priority: 'final',
+      text: '待恢复的最终结果',
+    });
+
+    let handlerArgs: unknown[] | undefined;
+    client.onMessage((...args: unknown[]) => {
+      handlerArgs = args;
+    });
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response(JSON.stringify({ ret: 0 }), { status: 200 });
+    try {
+      await (client as any).processMessage({
+        message_id: 2,
+        from_user_id: 'user-a',
+        to_user_id: 'bot-user',
+        client_id: 'inbound-client-2',
+        create_time_ms: Date.now(),
+        message_type: 1,
+        message_state: 0,
+        context_token: 'context-b',
+        item_list: [{ type: 1, text_item: { text: '继续' } }],
+      });
+
+      assert.equal(handlerArgs?.[1], '继续');
+      assert.deepEqual(handlerArgs?.[4], { pendingTextCount: 1 });
     } finally {
       globalThis.fetch = originalFetch;
     }

@@ -11,6 +11,9 @@ export interface QuotaLimits {
   maxBytes: number;
   finalReserveItems: number;
   finalReserveBytes: number;
+  maxItemsPerToken: number;
+  maxIntermediateItemsPerToken: number;
+  finalReserveItemsPerToken: number;
 }
 
 export const DEFAULT_QUOTA_LIMITS: QuotaLimits = {
@@ -19,10 +22,16 @@ export const DEFAULT_QUOTA_LIMITS: QuotaLimits = {
   maxBytes: 200_000,
   finalReserveItems: 1,
   finalReserveBytes: 2_000,
+  // Conservative local guards based on observed behavior. These are not
+  // claims about an official iLink quota and should remain configurable.
+  maxItemsPerToken: 10,
+  maxIntermediateItemsPerToken: 6,
+  finalReserveItemsPerToken: 3,
 };
 
 interface ReservationRecord {
   userKey: string;
+  tokenVersion: number;
   items: number;
   bytes: number;
 }
@@ -39,8 +48,12 @@ interface UserQuotaState {
   reservedItems: number;
   reservedBytes: number;
   reservations: Record<string, ReservationRecord>;
+  tokenSentItems: number;
+  tokenSentBytes: number;
+  tokenBudgetNoticeVersion?: number;
   rateBackoffUntil: number;
   rateBackoffGeneration: number;
+  rateBackoffTokenVersion?: number;
 }
 
 interface PersistedQuotaState {
@@ -81,7 +94,7 @@ export interface QuotaContext {
 }
 
 export type ReserveResult =
-  | { allowed: false; reason: 'final-reserved' | 'budget-exhausted' }
+  | { allowed: false; reason: 'final-reserved' | 'budget-exhausted' | 'intermediate-budget' | 'token-budget-exhausted' }
   | { allowed: true; reservation: QuotaReservation };
 
 function fingerprint(token: string): string {
@@ -100,6 +113,8 @@ function emptyState(accountId: string, userId: string): UserQuotaState {
     reservedItems: 0,
     reservedBytes: 0,
     reservations: {},
+    tokenSentItems: 0,
+    tokenSentBytes: 0,
     rateBackoffUntil: 0,
     rateBackoffGeneration: 0,
   };
@@ -121,6 +136,7 @@ export class QuotaManager {
 
   recordInbound(userId: string, messageId: string, contextToken: string): InboundResult {
     const state = this.getState(userId);
+    const previousTokenVersion = state.tokenVersion;
     if (state.seenInboundIds.includes(messageId)) {
       return {
         duplicate: true,
@@ -132,15 +148,29 @@ export class QuotaManager {
     state.seenInboundIds.push(messageId);
     if (state.seenInboundIds.length > 1_000) state.seenInboundIds.shift();
     state.inboundGeneration += 1;
-    state.rateBackoffUntil = 0;
-    state.rateBackoffGeneration = state.inboundGeneration;
+    if (state.rateBackoffUntil === 0) {
+      state.rateBackoffGeneration = state.inboundGeneration;
+    }
 
     if (contextToken) {
       const nextFingerprint = fingerprint(contextToken);
       if (state.tokenFingerprint !== nextFingerprint) {
         state.tokenFingerprint = nextFingerprint;
         state.tokenVersion += 1;
+        state.tokenSentItems = 0;
+        state.tokenSentBytes = 0;
+        state.tokenBudgetNoticeVersion = undefined;
       }
+    }
+
+    const tokenChanged = state.tokenVersion > previousTokenVersion;
+    const blockedTokenChanged = state.rateBackoffTokenVersion === undefined
+      ? tokenChanged
+      : state.tokenVersion > state.rateBackoffTokenVersion;
+    if (state.rateBackoffUntil !== 0 && blockedTokenChanged) {
+      state.rateBackoffUntil = 0;
+      state.rateBackoffGeneration = state.inboundGeneration;
+      state.rateBackoffTokenVersion = undefined;
     }
 
     this.persist();
@@ -169,6 +199,7 @@ export class QuotaManager {
     const state = this.getState(userId);
     state.rateBackoffUntil = Math.max(state.rateBackoffUntil, until);
     state.rateBackoffGeneration = state.inboundGeneration;
+    state.rateBackoffTokenVersion = state.tokenVersion;
     this.persist();
   }
 
@@ -177,15 +208,38 @@ export class QuotaManager {
     if (state.rateBackoffUntil === 0 && state.rateBackoffGeneration === state.inboundGeneration) return;
     state.rateBackoffUntil = 0;
     state.rateBackoffGeneration = state.inboundGeneration;
+    state.rateBackoffTokenVersion = undefined;
     this.persist();
   }
 
-  getRateBackoff(userId: string): { until: number; generation: number } {
+  getRateBackoff(userId: string): { until: number; generation: number; tokenVersion?: number } {
     const state = this.getState(userId);
     return {
       until: state.rateBackoffUntil,
       generation: state.rateBackoffGeneration,
+      tokenVersion: state.rateBackoffTokenVersion,
     };
+  }
+
+  canReserveForPriority(userId: string, priority: QuotaPriority): boolean {
+    const state = this.getState(userId);
+    const reservedForToken = Object.values(state.reservations)
+      .filter((reservation) => reservation.tokenVersion === state.tokenVersion)
+      .reduce((sum, reservation) => sum + reservation.items, 0);
+    const maxItems = priority === 'final'
+      ? this.limits.maxItemsPerToken
+      : priority === 'intermediate' || priority === 'activity'
+        ? this.limits.maxIntermediateItemsPerToken
+        : Math.max(0, this.limits.maxItemsPerToken - this.limits.finalReserveItemsPerToken);
+    return state.tokenSentItems + reservedForToken + 1 <= maxItems;
+  }
+
+  claimTokenBudgetNotice(userId: string): boolean {
+    const state = this.getState(userId);
+    if (state.tokenBudgetNoticeVersion === state.tokenVersion) return false;
+    state.tokenBudgetNoticeVersion = state.tokenVersion;
+    this.persist();
+    return true;
   }
 
   reserve(userId: string, bytes: number, priority: QuotaPriority, context?: QuotaContext): ReserveResult {
@@ -198,8 +252,26 @@ export class QuotaManager {
     const maxBytes = priority === 'final'
       ? this.limits.maxBytes
       : Math.max(0, this.limits.maxBytes - this.limits.finalReserveBytes);
+    const tokenReservedItems = Object.values(state.reservations)
+      .filter((reservation) => reservation.tokenVersion === state.tokenVersion)
+      .reduce((sum, reservation) => sum + reservation.items, 0);
+    const maxTokenItems = priority === 'final'
+      ? this.limits.maxItemsPerToken
+      : priority === 'intermediate' || priority === 'activity'
+        ? this.limits.maxIntermediateItemsPerToken
+        : Math.max(0, this.limits.maxItemsPerToken - this.limits.finalReserveItemsPerToken);
+    const tokenItemsAvailable = state.tokenSentItems + tokenReservedItems + 1 <= maxTokenItems;
     const itemsAvailable = state.sentItems + state.reservedItems + 1 <= maxItems;
     const bytesAvailable = state.sentBytes + state.reservedBytes + bytes <= maxBytes;
+
+    if (!tokenItemsAvailable) {
+      return {
+        allowed: false,
+        reason: priority === 'intermediate' || priority === 'activity'
+          ? 'intermediate-budget'
+          : 'token-budget-exhausted',
+      };
+    }
 
     if (!itemsAvailable || !bytesAvailable) {
       const overallItemsAvailable = state.sentItems + state.reservedItems + 1 <= this.limits.maxItems;
@@ -213,7 +285,12 @@ export class QuotaManager {
     }
 
     const reservationId = randomUUID();
-    state.reservations[reservationId] = { userKey: this.key(userId), items: 1, bytes };
+    state.reservations[reservationId] = {
+      userKey: this.key(userId),
+      tokenVersion: state.tokenVersion,
+      items: 1,
+      bytes,
+    };
     state.reservedItems += 1;
     state.reservedBytes += bytes;
     this.persist();
@@ -241,6 +318,10 @@ export class QuotaManager {
     state.reservedBytes -= record.bytes;
     state.sentItems += record.items;
     state.sentBytes += record.bytes;
+    if (record.tokenVersion === state.tokenVersion) {
+      state.tokenSentItems += record.items;
+      state.tokenSentBytes += record.bytes;
+    }
     this.persist();
     return true;
   }
@@ -291,10 +372,20 @@ export class QuotaManager {
         state.reservations = {};
         state.reservedItems = 0;
         state.reservedBytes = 0;
+        // Older quota snapshots did not persist per-token counters. Treat the
+        // current token as exhausted rather than resetting its budget after a
+        // restart; a genuinely new context token resets these counters below.
+        state.tokenSentItems = Number.isInteger(state.tokenSentItems)
+          ? state.tokenSentItems
+          : this.limits.maxItemsPerToken;
+        state.tokenSentBytes = Number.isInteger(state.tokenSentBytes) ? state.tokenSentBytes : 0;
         state.rateBackoffUntil = Number.isFinite(state.rateBackoffUntil) ? state.rateBackoffUntil : 0;
         state.rateBackoffGeneration = Number.isInteger(state.rateBackoffGeneration)
           ? state.rateBackoffGeneration
           : state.inboundGeneration;
+        state.rateBackoffTokenVersion = Number.isInteger(state.rateBackoffTokenVersion)
+          ? state.rateBackoffTokenVersion
+          : state.rateBackoffUntil > 0 ? state.tokenVersion : undefined;
         this.users.set(key, state);
       }
     } catch {

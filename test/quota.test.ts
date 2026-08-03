@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -95,7 +95,41 @@ test('QuotaManager clears in-flight reservations after a crash/restart', () => {
   });
 });
 
-test('QuotaManager persists rate backoff until a fresh inbound message', () => {
+test('QuotaManager does not reset an unknown legacy token budget after restart', () => {
+  withQuota((filePath) => {
+    const userKey = 'account-a\u0000user-a';
+    writeFileSync(filePath, JSON.stringify({
+      schemaVersion: 1,
+      users: {
+        [userKey]: {
+          accountId: 'account-a',
+          userId: 'user-a',
+          inboundGeneration: 1,
+          tokenVersion: 1,
+          seenInboundIds: ['message-1'],
+          sentItems: 7,
+          sentBytes: 128,
+          reservedItems: 0,
+          reservedBytes: 0,
+          reservations: {},
+          rateBackoffUntil: 0,
+          rateBackoffGeneration: 1,
+        },
+      },
+    }));
+
+    const quota = new QuotaManager(filePath, 'account-a');
+    const sameToken = quota.reserve('user-a', 1, 'final');
+    assert.equal(sameToken.allowed, false);
+    assert.equal(sameToken.reason, 'token-budget-exhausted');
+
+    quota.recordInbound('user-a', 'message-2', 'new-token');
+    const newToken = quota.reserve('user-a', 1, 'final');
+    assert.equal(newToken.allowed, true);
+  });
+});
+
+test('QuotaManager keeps rate backoff for the same token and clears it for a new token', () => {
   withQuota((filePath) => {
     const quota = new QuotaManager(filePath, 'account-a');
     quota.recordInbound('user-a', 'message-1', 'token-a');
@@ -105,7 +139,10 @@ test('QuotaManager persists rate backoff until a fresh inbound message', () => {
     const restarted = new QuotaManager(filePath, 'account-a');
     assert.equal(restarted.getRateBackoff('user-a').until, until);
 
-    restarted.recordInbound('user-a', 'message-2', 'token-b');
+    restarted.recordInbound('user-a', 'message-2', 'token-a');
+    assert.equal(restarted.getRateBackoff('user-a').until, until);
+
+    restarted.recordInbound('user-a', 'message-3', 'token-b');
     assert.equal(restarted.getRateBackoff('user-a').until, 0);
   });
 });

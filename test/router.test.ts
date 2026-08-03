@@ -195,6 +195,19 @@ test('plain 继续 reaches the Agent when no durable delivery is waiting', async
   assert.equal(capturedPrompt, '继续');
 });
 
+test('plain 继续 uses the inbound recovery snapshot after automatic drain', async () => {
+  const { router, resumed } = createRouter();
+  let execCalled = false;
+  router.exec = async () => {
+    execCalled = true;
+  };
+
+  await router.handle(makeMessage('u1'), '继续', '', undefined, { pendingTextCount: 1 });
+
+  assert.deepEqual(resumed, ['u1']);
+  assert.equal(execCalled, false);
+});
+
 test('exec sends the complete final body when intermediate delivery was not confirmed', async () => {
   const { router } = createRouter();
   const sent: Array<{ text: string; options?: Record<string, unknown> }> = [];
@@ -219,6 +232,66 @@ test('exec sends the complete final body when intermediate delivery was not conf
 
   const final = sent.find((message) => message.options?.priority === 'final');
   assert.ok(final?.text.includes('complete final body'), JSON.stringify(sent));
+});
+
+test('normal mode includes Activity, tool name, and duration after confirmed streaming', async () => {
+  const { router } = createRouter();
+  const sent: Array<{ text: string; options?: Record<string, unknown> }> = [];
+  (router as any).ilink.sendText = async (_uid: string, text: string, options?: Record<string, unknown>) => {
+    sent.push({ text, options });
+    return [{ status: 'sent' }];
+  };
+  (router as any).registry = {
+    get: () => ({
+      displayName: 'Claude',
+      capabilities: { sessionResume: false },
+      execute: async (_prompt: string, options: any) => {
+        options.onIntermediate?.({
+          type: 'tool_use',
+          content: '- Shell Command: Get-ChildItem',
+          toolName: 'Shell Command',
+        });
+        options.onIntermediate?.({ type: 'text', content: 'partial text' });
+        return { text: 'complete final body', duration: 1_234, error: false };
+      },
+    }),
+  };
+
+  await (router as any).exec('u1', 'claude', 'prompt');
+
+  const final = sent.find((message) => message.options?.priority === 'final');
+  assert.ok(final?.text.includes('Activity'), JSON.stringify(sent));
+  assert.ok(final?.text.includes('Shell Command'), JSON.stringify(sent));
+  assert.ok(final?.text.includes('Claude | 1.2s'), JSON.stringify(sent));
+});
+
+test('normal mode includes Activity in the final result when Activity delivery is suppressed', async () => {
+  const { router } = createRouter();
+  const sent: Array<{ text: string; options?: Record<string, unknown> }> = [];
+  (router as any).ilink.sendText = async (_uid: string, text: string, options?: Record<string, unknown>) => {
+    sent.push({ text, options });
+    return options?.priority === 'activity' ? [{ status: 'rate-limited' }] : [{ status: 'sent' }];
+  };
+  (router as any).sendNormalActivityBatches = async () => ({
+    split: true,
+    unsentLines: ['- Shell Command: Get-ChildItem'],
+  });
+  (router as any).registry = {
+    get: () => ({
+      displayName: 'Claude',
+      capabilities: { sessionResume: false },
+      execute: async (_prompt: string, options: any) => {
+        options.onIntermediate?.({ type: 'tool_use', content: '- Shell Command: Get-ChildItem', toolName: 'Shell Command' });
+        return { text: '完整结果', duration: 2_000, error: false };
+      },
+    }),
+  };
+
+  await (router as any).exec('u1', 'claude', 'prompt');
+
+  const final = sent.find((message) => message.options?.priority === 'final');
+  assert.ok(final?.text.includes('完整结果'), JSON.stringify(sent));
+  assert.ok(final?.text.includes('Activity'), JSON.stringify(sent));
 });
 
 test('chain final output keeps the delivery context captured at task start', async () => {
@@ -370,6 +443,10 @@ test('sendNormalActivityBatches waits 5 seconds between oversized batches', asyn
   const delays: number[] = [];
   (router as any).sleep = async (ms: number) => {
     delays.push(ms);
+  };
+  (router as any).ilink.sendText = async (_uid: string, text: string) => {
+    messages.push({ uid: _uid, text });
+    return [{ status: 'sent' }];
   };
 
   await (router as any).sendNormalActivityBatches('u1', lines);

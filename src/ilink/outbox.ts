@@ -243,6 +243,21 @@ export class OutboxStore {
     return true;
   }
 
+  requeuePermanentFailures(matches: (item: OutboxTextItem) => boolean): number {
+    const nextItems = new Map(this.items);
+    let changed = 0;
+    for (const [itemId, item] of nextItems) {
+      if (item.state !== 'permanent-failure' || !matches(item)) continue;
+      nextItems.set(itemId, { ...item, state: 'pending', terminalError: undefined });
+      changed += 1;
+    }
+    if (changed > 0) {
+      this.persistState(nextItems, this.nextSequence);
+      this.publish(nextItems, this.nextSequence);
+    }
+    return changed;
+  }
+
   supersedeIntermediate(accountId: string, userId: string, generation: number): number {
     const nextItems = new Map(this.items);
     let removed = 0;
