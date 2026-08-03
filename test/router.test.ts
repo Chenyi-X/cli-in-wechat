@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { Router } from '../src/bridge/router.js';
+import { DEFAULT_SETTINGS } from '../src/adapters/base.js';
 import type { BridgeConfig } from '../src/config.js';
 import type { WeixinMessage } from '../src/ilink/types.js';
 
@@ -69,6 +70,18 @@ function makeMessage(uid: string): WeixinMessage {
     item_list: [],
   };
 }
+
+test('default settings allow up to 100 turns', () => {
+  assert.equal(DEFAULT_SETTINGS.maxTurns, 100);
+});
+
+test('/reset restores the independent 100-turn default', async () => {
+  const { router, sessions } = createRouter();
+
+  await router.handleSlash('u1', '/reset');
+
+  assert.equal((sessions.get('u1') as any).maxTurns, 100);
+});
 
 test('getCli prefers @tool in text over quoted footer tool', () => {
   const { router, sessions } = createRouter();

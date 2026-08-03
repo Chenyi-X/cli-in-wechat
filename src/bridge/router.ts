@@ -656,7 +656,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
 
       case 'reset':
         this.sessions.update(uid, {
-          mode: 'auto', effort: 'high', model: '', maxTurns: 30, maxBudget: 0,
+          mode: 'auto', effort: 'high', model: '', maxTurns: 100, maxBudget: 0,
           allowedTools: '', disallowedTools: '', verbose: false, sandbox: '',
           search: false, systemPrompt: '', workDir: '', bare: false, addDir: '',
           sessionName: '', ephemeral: false, profile: '', approvalMode: '',
