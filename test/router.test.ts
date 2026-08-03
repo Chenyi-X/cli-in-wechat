@@ -306,6 +306,40 @@ test('normal mode includes Activity in the final result when Activity delivery i
   assert.ok(final?.text.includes('Activity'), JSON.stringify(sent));
 });
 
+test('normal mode sends the complete final body when Activity is queued', async () => {
+  const { router } = createRouter();
+  const sent: Array<{ text: string; options?: Record<string, unknown> }> = [];
+  (router as any).ilink.sendText = async (_uid: string, text: string, options?: Record<string, unknown>) => {
+    sent.push({ text, options });
+    return options?.priority === 'activity'
+      ? [{ status: 'queued' }]
+      : [{ status: 'sent' }];
+  };
+  (router as any).registry = {
+    get: () => ({
+      displayName: 'Claude',
+      capabilities: { sessionResume: false },
+      execute: async (_prompt: string, options: any) => {
+        for (let i = 0; i < 20; i++) {
+          options.onIntermediate?.({
+            type: 'tool_use',
+            content: `- Shell Command: step ${i + 1} ${'x'.repeat(90)}`,
+            toolName: 'Shell Command',
+          });
+        }
+        options.onIntermediate?.({ type: 'text', content: 'partial text' });
+        return { text: 'complete final body', duration: 2_000, error: false };
+      },
+    }),
+  };
+
+  await (router as any).exec('u1', 'claude', 'prompt');
+
+  const final = sent.find((message) => message.options?.priority === 'final');
+  assert.ok(final?.text.includes('complete final body'), JSON.stringify(sent));
+  assert.match(final?.text || '', /Activity 已排队/);
+});
+
 test('chain final output keeps the delivery context captured at task start', async () => {
   const { router } = createRouter();
   const sent: Array<{ text: string; options?: Record<string, unknown> }> = [];

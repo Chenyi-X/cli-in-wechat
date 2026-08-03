@@ -25,6 +25,7 @@ const HTTP_TIMEOUT_MS = 45_000;
 const CDN_BASE_URL = 'https://novac2c.cdn.weixin.qq.com/c2c';
 const BASE_RATE_LIMIT_COOLDOWN_MS = 150_000; // ~2.5 minutes
 const MAX_RATE_LIMIT_COOLDOWN_MS = 420_000; // ~7 minutes
+const UNCONFIRMED_SEND_RESPONSE = 'sendmessage response did not confirm delivery';
 const LEGACY_MISSING_RET_ERROR = 'sendmessage response did not confirm ret=0';
 const RECOVERY_NOTICE_TEXT = (pendingCount: number): string =>
   `发送预算保护：已达到当前 context_token 的安全发送边界，本轮仍有 ${pendingCount} 条积压消息，请回复任意消息刷新 context_token，系统会自动续发。`;
@@ -125,7 +126,8 @@ export class ILinkClient {
       item.accountId === this.accountId
       && item.terminalError?.ret === undefined
       && item.terminalError?.errcode === undefined
-      && item.terminalError?.errmsg === LEGACY_MISSING_RET_ERROR);
+      && (item.terminalError?.errmsg === UNCONFIRMED_SEND_RESPONSE
+        || item.terminalError?.errmsg === LEGACY_MISSING_RET_ERROR));
     if (recovered > 0) {
       log.warn(`[send] 已恢复 ${recovered} 个旧版误判的未确认发送项，将使用原 client_id 续发`);
     }
@@ -512,20 +514,9 @@ export class ILinkClient {
 
   private resetRateLimitOnInbound(userId: string): void {
     const state = this.rateLimitStates.get(userId);
-    const snapshot = this.quota.snapshot(userId);
-    const persistedBackoff = this.quota.getRateBackoff(userId);
-    const sameTokenBackoff = persistedBackoff.tokenVersion !== undefined
-      && persistedBackoff.tokenVersion === snapshot.tokenVersion;
-    const legacyBackoff = persistedBackoff.tokenVersion === undefined
-      && persistedBackoff.until > Date.now();
-    if (sameTokenBackoff || legacyBackoff) {
-      if (state) {
-        state.suppressIntermediateUntil = Math.max(state.suppressIntermediateUntil, persistedBackoff.until);
-        state.blockAllSendsUntil = Math.max(state.blockAllSendsUntil, persistedBackoff.until);
-      }
-      this.deliveryStates.set(userId, 'RATE_BACKOFF');
-      return;
-    }
+    // A new, deduplicated inbound is an explicit user recovery signal even if
+    // the server repeats the same token string. This clears only transport
+    // backoff; QuotaManager still keeps the token's item/byte counters intact.
     if (state) {
       state.consecutiveRet2 = 0;
       state.suppressIntermediateUntil = 0;
@@ -807,12 +798,34 @@ export class ILinkClient {
             }
           }
           this.deliveryStates.set(userId, 'RATE_BACKOFF');
+        } else if (this.isUnconfirmedResponse(details)) {
+          if (item.priority !== 'control') {
+            try {
+              this.outbox.enqueueText({
+                itemId: `delivery-notice:${item.itemId}`,
+                accountId: this.accountId,
+                userId,
+                generation: item.generation,
+                tokenVersion: item.tokenVersion,
+                priority: 'control',
+                text: '消息发送结果暂未确认，收到新的消息后自动续发。',
+              });
+            } catch (noticeError) {
+              log.error(`[send] 无法写入未确认恢复提示: ${userId}`, noticeError);
+            }
+          }
+          this.quota.noteRateBackoff(userId, Date.now() + BASE_RATE_LIMIT_COOLDOWN_MS);
+          this.deliveryStates.set(userId, 'WAITING_INBOUND');
         } else {
           this.outbox.markPermanentFailure(item.itemId, details);
           this.enqueueVisibleFailureNotice(item, details);
           this.deliveryStates.set(userId, 'PERMANENT_FAILURE');
         }
-        results.push(this.resultForItem(item, failure?.status || 'permanent-failure', details));
+        results.push(this.resultForItem(
+          item,
+          failure?.status || (this.isUnconfirmedResponse(details) ? 'queued' : 'permanent-failure'),
+          details,
+        ));
         // Keep the item durable and wait for a fresh inbound message before trying again.
         break;
       }
@@ -900,8 +913,8 @@ export class ILinkClient {
       const details = this.errorDetails(err);
       const failure = classifyApiFailure(details);
       if (failure?.ambiguous) this.noteRateLimit(userId);
-      else this.outbox.markPermanentFailure(notice.itemId, details);
-      return this.resultForItem(notice, failure?.status || 'permanent-failure', details);
+      else if (!this.isUnconfirmedResponse(details)) this.outbox.markPermanentFailure(notice.itemId, details);
+      return this.resultForItem(notice, failure?.status || (this.isUnconfirmedResponse(details) ? 'queued' : 'permanent-failure'), details);
     }
   }
 
@@ -955,6 +968,11 @@ export class ILinkClient {
   private errorDetails(err: unknown): ApiErrorDetails {
     if (err instanceof ILinkApiError) return err.details;
     return { errmsg: err instanceof Error ? err.message : String(err) };
+  }
+
+  private isUnconfirmedResponse(details: ApiErrorDetails): boolean {
+    return details.errmsg === UNCONFIRMED_SEND_RESPONSE
+      || details.errmsg === LEGACY_MISSING_RET_ERROR;
   }
 
   private isLocalBudgetFailure(item: Pick<OutboxTextItem, 'terminalError'>): boolean {
@@ -1101,11 +1119,14 @@ export class ILinkClient {
       this.recordDiagnostic({ ...diagnosticBase, event: 'response', response });
       responseRecorded = true;
       log.debug(`[send] response client=${clientId} http=${res.status} bodyBytes=${Buffer.byteLength(rawBody, 'utf8')} json=${JSON.stringify(redactSecrets(data))}`);
-      // sendmessage success responses from iLink may omit ret/errcode entirely.
-      // Treat only an explicitly non-zero ret as an API failure; requiring ret=0
-      // turns successful HTTP sends into durable permanent failures.
+      // Some iLink responses omit ret/errcode but include message_id. Treat that
+      // as confirmed success. An empty success body has no delivery evidence and
+      // must remain durable so a later inbound message can retry the same item.
       if (data.ret !== undefined && data.ret !== 0) {
-        throw new ILinkApiError({ ret: data.ret, errcode: data.errcode, errmsg: data.errmsg || LEGACY_MISSING_RET_ERROR });
+        throw new ILinkApiError({ ret: data.ret, errcode: data.errcode, errmsg: data.errmsg || `ret=${data.ret}` });
+      }
+      if (data.ret !== 0 && data.message_id === undefined) {
+        throw new ILinkApiError({ httpStatus: res.status, errmsg: UNCONFIRMED_SEND_RESPONSE });
       }
     } catch (err) {
       if (!responseRecorded) {

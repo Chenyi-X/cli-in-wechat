@@ -330,6 +330,68 @@ test('sendmessage diagnostics survive process log rotation and preserve response
   });
 });
 
+test('keeps a message durable when HTTP 200 does not confirm delivery', async () => {
+  await withStores(async (outbox, quota) => {
+    const client = new ILinkClient(credentials, { outbox, quota });
+    quota.recordInbound('user-a', 'message-1', 'context-a');
+    (client as any).contextTokens.set('user-a', 'context-a');
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response(JSON.stringify({}), { status: 200 });
+    try {
+      const results = await client.sendText('user-a', '必须保留直到确认的消息', { priority: 'final' });
+
+      assert.equal(results[0]?.status, 'queued');
+      assert.equal(outbox.listPending('user-a').some((item) => item.text === '必须保留直到确认的消息'), true);
+      assert.equal(quota.snapshot('user-a').sentItems, 0);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+test('a new inbound drains an unconfirmed message with its original client_id', async () => {
+  await withStores(async (outbox, quota) => {
+    const client = new ILinkClient(credentials, { outbox, quota });
+    quota.recordInbound('user-a', 'message-1', 'context-a');
+    (client as any).contextTokens.set('user-a', 'context-a');
+
+    const originalFetch = globalThis.fetch;
+    let requestCount = 0;
+    const clientIds: string[] = [];
+    globalThis.fetch = async (_input, init) => {
+      requestCount += 1;
+      clientIds.push(JSON.parse(String(init?.body)).msg.client_id);
+      return new Response(
+        JSON.stringify(requestCount === 1 ? {} : { message_id: 2 }),
+        { status: 200 },
+      );
+    };
+    try {
+      const first = await client.sendText('user-a', '等待新入站后续发', { priority: 'final' });
+      assert.equal(first[0]?.status, 'queued');
+
+      await (client as any).processMessage({
+        message_id: 2,
+        from_user_id: 'user-a',
+        to_user_id: 'bot-user',
+        client_id: 'inbound-client-2',
+        create_time_ms: Date.now(),
+        message_type: 1,
+        message_state: 0,
+        context_token: 'context-b',
+        item_list: [{ type: 1, text_item: { text: '0' } }],
+      });
+
+      assert.equal(requestCount, 2);
+      assert.equal(clientIds[0], clientIds[1]);
+      assert.deepEqual(outbox.list('user-a'), []);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
 test('inbound diagnostics persist token and generation evidence without inbound text', async () => {
   await withStores(async (outbox, quota) => {
     const dir = mkdtempSync(join(tmpdir(), 'wxclient-inbound-diagnostics-'));
@@ -367,7 +429,7 @@ test('inbound diagnostics persist token and generation evidence without inbound 
   });
 });
 
-test('sendText acknowledges an HTTP success response that omits ret', async () => {
+test('sendText acknowledges an HTTP success response that omits ret when message_id is present', async () => {
   await withStores(async (outbox, quota) => {
     const client = new ILinkClient(credentials, { outbox, quota });
     quota.recordInbound('user-a', 'message-1', 'context-a');
@@ -375,7 +437,7 @@ test('sendText acknowledges an HTTP success response that omits ret', async () =
 
     const originalFetch = globalThis.fetch;
     globalThis.fetch = async () => new Response(
-      JSON.stringify({}),
+      JSON.stringify({ message_id: 123 }),
       { status: 200 },
     );
     try {
@@ -400,7 +462,7 @@ test('sendText drains every UTF-8 chunk after an HTTP success without ret', asyn
     let requestCount = 0;
     globalThis.fetch = async () => {
       requestCount += 1;
-      return new Response('{}', { status: 200 });
+      return new Response(JSON.stringify({ message_id: requestCount }), { status: 200 });
     };
     try {
       const results = await client.sendText('user-a', 'x'.repeat(4_501), { priority: 'final' });
@@ -716,7 +778,7 @@ test('final chunks stay queued as a batch when the current token cannot fit them
   }
 });
 
-test('an inbound with the same context token does not bypass an active rate backoff', async () => {
+test('a fresh inbound with the same context token gets one recovery attempt', async () => {
   await withStores(async (outbox, quota) => {
     const client = new ILinkClient(credentials, { outbox, quota });
     quota.recordInbound('user-a', 'message-1', 'context-a');
@@ -726,7 +788,9 @@ test('an inbound with the same context token does not bypass an active rate back
     let requestCount = 0;
     globalThis.fetch = async () => {
       requestCount += 1;
-      return new Response(JSON.stringify({ ret: -2, errcode: 17, errmsg: 'prepare failed' }), { status: 200 });
+      return new Response(JSON.stringify(requestCount === 1
+        ? { ret: -2, errcode: 17, errmsg: 'prepare failed' }
+        : { ret: 0 }), { status: 200 });
     };
     try {
       await client.sendText('user-a', '等待恢复的最终结果', { priority: 'final' });
@@ -743,8 +807,8 @@ test('an inbound with the same context token does not bypass an active rate back
         item_list: [{ type: 1, text_item: { text: '如何' } }],
       });
 
-      assert.equal(requestCount, 1);
-      assert.equal(outbox.listPending('user-a').filter((item) => item.priority === 'final').length, 1);
+      assert.equal(requestCount, 2);
+      assert.deepEqual(outbox.listPending('user-a'), []);
     } finally {
       globalThis.fetch = originalFetch;
     }

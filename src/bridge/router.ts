@@ -36,6 +36,7 @@ const AUTO_DELIVERABLE_MAX_DEPTH = 3;
 interface NormalActivityDelivery {
   split: boolean;
   unsentLines: string[];
+  hasUnconfirmed: boolean;
 }
 
 export class Router {
@@ -172,9 +173,10 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
     deliveryContext?: DeliveryContext,
   ): Promise<NormalActivityDelivery> {
     const batches = this.splitNormalActivityLines(lines);
-    if (batches.length <= 1) return { split: false, unsentLines: lines };
+    if (batches.length <= 1) return { split: false, unsentLines: lines, hasUnconfirmed: false };
 
     let allBatchesDurable = true;
+    let hasUnconfirmed = false;
     let previousBatchConfirmed = true;
     for (let i = 0; i < batches.length; i++) {
       const title = `Activity (${i + 1}/${batches.length})`;
@@ -197,6 +199,9 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
       if (!durable) {
         allBatchesDurable = false;
       }
+      if (!confirmed) {
+        hasUnconfirmed = true;
+      }
       if (previousBatchConfirmed && confirmed && i < batches.length - 1) {
         await this.sleep(NORMAL_ACTIVITY_SPLIT_DELAY_MS);
       }
@@ -205,6 +210,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
     return {
       split: true,
       unsentLines: allBatchesDurable ? [] : batches.flat(),
+      hasUnconfirmed,
     };
   }
 
@@ -1436,14 +1442,18 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
 
       const activityDelivery = msgMode === 'normal' && finalActivityLines.length > 0
         ? await this.sendNormalActivityBatches(uid, finalActivityLines, deliveryContext)
-        : { split: false, unsentLines: [] };
+        : { split: false, unsentLines: [], hasUnconfirmed: false };
 
       const finalActivityBlock = msgMode === 'normal' && activityDelivery.unsentLines.length > 0
         ? `Activity\n${activityDelivery.unsentLines.join('\n')}\n\n`
         : '';
+      const activityRecoveryNotice = activityDelivery.hasUnconfirmed
+        ? '\n[Activity 已排队，回复任意消息后自动续发]'
+        : '';
+      const requiresCompleteFinal = intermediateSendFailed || activityDelivery.hasUnconfirmed;
 
       // If text was already streamed, only send footer (avoid duplicate large-body resend).
-      if (hasStreamedText && !intermediateSendFailed) {
+      if (hasStreamedText && !requiresCompleteFinal) {
         const tailNotice = `${notice}${sentNotice}${failedNotice}`;
         await this.ilink.sendText(uid, formatResponse(`${finalActivityBlock}${tailNotice}`.trim(), {
           tool: adapter.displayName,
@@ -1453,7 +1463,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
       } else {
         // compact mode or no streamed text: send full result
         const recoveryNotice = hasStreamedText && intermediateSendFailed ? '[部分中间消息发送失败]\n' : '';
-        await this.ilink.sendText(uid, formatResponse(`${finalActivityBlock}${notice}${recoveryNotice}${cleanText}${sentNotice}${failedNotice}`, {
+        await this.ilink.sendText(uid, formatResponse(`${finalActivityBlock}${notice}${recoveryNotice}${activityRecoveryNotice}${cleanText}${sentNotice}${failedNotice}`, {
           tool: adapter.displayName,
           duration: result.duration || (Date.now() - start),
           error: result.error,
