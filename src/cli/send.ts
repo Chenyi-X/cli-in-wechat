@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { generateWechatUin } from '../utils/crypto.js';
 import { fetchWithRetry } from '../utils/http.js';
 import { loadCredentials, loadContextTokens } from '../config.js';
+import { chunkUtf8Text } from '../ilink/text-chunk.js';
 import type { Credentials } from '../ilink/types.js';
 
 const CHANNEL_VERSION = '1.0.2';
@@ -63,7 +64,7 @@ export async function sendCommand(args: string[]): Promise<void> {
 
   // ─── Send message ────────────────────────────────────
   try {
-    const chunks = chunkText(message, MAX_CHUNK_SIZE);
+    const chunks = chunkUtf8Text(message, MAX_CHUNK_SIZE);
     for (let i = 0; i < chunks.length; i++) {
       await sendRawMessage(credentials, userId, contextToken, chunks[i]);
       if (i < chunks.length - 1) {
@@ -120,31 +121,6 @@ async function sendRawMessage(
   if (data.ret !== undefined && data.ret !== 0) {
     throw new Error(data.errmsg || `ret=${data.ret}`);
   }
-}
-
-function chunkText(text: string, maxLen: number): string[] {
-  if (text.length <= maxLen) return [text];
-
-  const chunks: string[] = [];
-  let remaining = text;
-
-  while (remaining.length > 0) {
-    if (remaining.length <= maxLen) {
-      chunks.push(remaining);
-      break;
-    }
-
-    // Try breaking at paragraph, then line, then space
-    let idx = remaining.lastIndexOf('\n\n', maxLen);
-    if (idx < maxLen * 0.3) idx = remaining.lastIndexOf('\n', maxLen);
-    if (idx < maxLen * 0.3) idx = remaining.lastIndexOf(' ', maxLen);
-    if (idx < maxLen * 0.3) idx = maxLen;
-
-    chunks.push(remaining.substring(0, idx));
-    remaining = remaining.substring(idx).trimStart();
-  }
-
-  return chunks;
 }
 
 async function readStdin(): Promise<string> {

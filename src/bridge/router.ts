@@ -161,7 +161,10 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
 
     for (let i = 0; i < batches.length; i++) {
       const title = `Activity (${i + 1}/${batches.length})`;
-      await this.ilink.sendText(uid, [title, ...batches[i]].join('\n'));
+      await this.ilink.sendText(uid, [title, ...batches[i]].join('\n'), {
+        streamType: 'intermediate',
+        priority: 'activity',
+      });
       if (i < batches.length - 1) await this.sleep(NORMAL_ACTIVITY_SPLIT_DELAY_MS);
     }
     return true;
@@ -188,6 +191,16 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
     if (trimmed.startsWith('/')) {
       await this.handleSlash(uid, trimmed);
       return;
+    }
+
+    // A plain "继续" is a delivery recovery control only while durable text is
+    // waiting for this user's inbound message. Otherwise it remains an Agent prompt.
+    if (trimmed === '继续') {
+      const delivery = this.ilink.getDeliveryState(uid);
+      if (delivery.waitingForInbound && delivery.pendingTextCount > 0) {
+        await this.ilink.resumePendingText(uid);
+        return;
+      }
     }
 
     // ── Parse: @tool1>tool2 chain, @tool single, >> relay, plain text ──
@@ -771,15 +784,19 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
             return true;
           }
           const ext = filePath.split('.').pop()?.toLowerCase();
+          let results;
           if (['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'].includes(ext || '')) {
-            await this.ilink.sendImage(uid, filePath);
-            await reply(`已发送图片: ${filePath}`);
+            results = await this.ilink.sendImage(uid, filePath);
           } else if (['mp4', 'mov', 'avi', 'mkv', 'webm'].includes(ext || '')) {
-            await this.ilink.sendVideo(uid, filePath);
-            await reply(`已发送视频: ${filePath}`);
+            results = await this.ilink.sendVideo(uid, filePath);
           } else {
-            await this.ilink.sendFile(uid, filePath);
-            await reply(`已发送文件: ${filePath}`);
+            results = await this.ilink.sendFile(uid, filePath);
+          }
+          const failure = results.find((item: { status: string }) => item.status !== 'sent');
+          if (failure) {
+            await reply(`发送未完成: ${failure.error?.errmsg || failure.status}`);
+          } else {
+            await reply(`已发送: ${filePath}`);
           }
         } catch (err) {
           await reply(`发送失败: ${(err as Error).message}`);
@@ -1052,7 +1069,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
 
       if (abort.signal.aborted || r1.error) {
         if (!abort.signal.aborted) {
-          await this.ilink.sendText(uid, formatResponse(n1 + r1.text, { tool: adapter1.displayName, error: true }));
+          await this.ilink.sendText(uid, formatResponse(n1 + r1.text, { tool: adapter1.displayName, error: true }), { priority: 'final' });
         }
         return;
       }
@@ -1081,7 +1098,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
         tool: `${adapter1.displayName} → ${adapter2.displayName}`,
         duration: elapsed,
         error: r2.error,
-      }));
+      }), { priority: 'final' });
     } catch (err: unknown) {
       if (!abort.signal.aborted) {
         log.error(`[chain] 失败:`, err);
@@ -1213,7 +1230,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
     const enqueueIntermediateSend = (text: string): void => {
       if (!text.trim()) return;
       sendQueue = sendQueue
-        .then(() => this.ilink.sendText(uid, text, { streamType: 'intermediate' }))
+        .then(() => this.ilink.sendText(uid, text, { streamType: 'intermediate' }).then(() => undefined))
         .catch((err) => {
           intermediateSendFailed = true;
           log.error(`[${toolName}] 发送中间消息失败:`, err);
@@ -1316,7 +1333,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
       }
 
       // Parse [SEND_FILE: path] markers and send files
-      const { text: cleanText, sentFiles } = await this.parseAndSendFiles(uid, result.text);
+      const { text: cleanText, sentFiles, failedFiles } = await this.parseAndSendFiles(uid, result.text);
 
       // Store for >> relay; auto-switch defaultTool to last used tool
       this.lastResponse.set(uid, { tool: adapter.displayName, text: cleanText });
@@ -1330,6 +1347,9 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
       const sentNotice = sentFiles.length > 0
         ? `\n[已发送文件: ${sentFiles.join(', ')}]`
         : '';
+      const failedNotice = failedFiles.length > 0
+        ? `\n[文件发送失败: ${failedFiles.join('; ')}]`
+        : '';
 
       const splitActivitySent = msgMode === 'normal' && finalActivityLines.length > 0
         ? await this.sendNormalActivityBatches(uid, finalActivityLines)
@@ -1342,20 +1362,20 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
       // If text was already streamed, only send footer (avoid duplicate large-body resend).
       if (hasStreamedText) {
         const tailNotice = intermediateSendFailed
-          ? `${notice}[部分中间消息发送失败]${sentNotice}`
-          : `${notice}${sentNotice}`;
+          ? `${notice}[部分中间消息发送失败]${sentNotice}${failedNotice}`
+          : `${notice}${sentNotice}${failedNotice}`;
         await this.ilink.sendText(uid, formatResponse(`${finalActivityBlock}${tailNotice}`.trim(), {
           tool: adapter.displayName,
           duration: result.duration || (Date.now() - start),
           error: result.error,
-        }));
+        }), { priority: 'final' });
       } else {
         // compact mode or no streamed text: send full result
-        await this.ilink.sendText(uid, formatResponse(`${finalActivityBlock}${notice}${cleanText}${sentNotice}`, {
+        await this.ilink.sendText(uid, formatResponse(`${finalActivityBlock}${notice}${cleanText}${sentNotice}${failedNotice}`, {
           tool: adapter.displayName,
           duration: result.duration || (Date.now() - start),
           error: result.error,
-        }));
+        }), { priority: 'final' });
       }
     } catch (err: unknown) {
       if (!abort.signal.aborted) {
@@ -1370,9 +1390,10 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
     }
   }
 
-  private async parseAndSendFiles(uid: string, text: string): Promise<{ text: string; sentFiles: string[] }> {
+  private async parseAndSendFiles(uid: string, text: string): Promise<{ text: string; sentFiles: string[]; failedFiles: string[] }> {
     const { existsSync } = await import('node:fs');
     const sentFiles: string[] = [];
+    const failedFiles: string[] = [];
     const regex = /\[SEND_FILE:\s*([^\]]+)\]/g;
     let match;
     const workDir = this.sessions.get(uid).workDir || this.config.workDir;
@@ -1388,16 +1409,23 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
       try {
         if (!existsSync(filePath)) {
           log.warn(`[SEND_FILE] 文件不存在: ${filePath}`);
+          failedFiles.push(`${filePath}: 文件不存在`);
           continue;
         }
 
         const ext = filePath.split('.').pop()?.toLowerCase();
+        let results;
         if (['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'].includes(ext || '')) {
-          await this.ilink.sendImage(uid, filePath);
+          results = await this.ilink.sendImage(uid, filePath);
         } else if (['mp4', 'mov', 'avi', 'mkv', 'webm'].includes(ext || '')) {
-          await this.ilink.sendVideo(uid, filePath);
+          results = await this.ilink.sendVideo(uid, filePath);
         } else {
-          await this.ilink.sendFile(uid, filePath);
+          results = await this.ilink.sendFile(uid, filePath);
+        }
+        const failed = results.find((item: { status: string }) => item.status !== 'sent');
+        if (failed) {
+          failedFiles.push(`${filePath}: ${failed.error?.errmsg || failed.status}`);
+          continue;
         }
         sentFiles.push(filePath.split(/[\\/]/).pop() || filePath);
         log.info(`[SEND_FILE] 已发送: ${filePath}`);
@@ -1408,6 +1436,6 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
 
     // 移除标记
     const cleanText = text.replace(regex, '').trim();
-    return { text: cleanText, sentFiles };
+    return { text: cleanText, sentFiles, failedFiles };
   }
 }

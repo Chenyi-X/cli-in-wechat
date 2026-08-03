@@ -1,24 +1,27 @@
 import { randomUUID, randomBytes } from 'node:crypto';
-import { readFileSync, existsSync, statSync } from 'node:fs';
-import { basename } from 'node:path';
+import { readFileSync, existsSync } from 'node:fs';
+import { basename, join } from 'node:path';
 import { generateWechatUin, encryptAesEcb, aesEcbPaddedSize, encodeMessageAesKey, md5 } from '../utils/crypto.js';
 import { log } from '../utils/logger.js';
 import { fetchWithRetry, describeNetworkError, isRetryableNetworkError } from '../utils/http.js';
-import { savePollCursor, loadPollCursor, saveContextTokens } from '../config.js';
+import { DATA_DIR, savePollCursor, loadPollCursor, saveContextTokens, loadContextTokens } from '../config.js';
 import { downloadImage, downloadFile, downloadVideo, type DownloadedMedia } from '../utils/media.js';
+import { OutboxStore, type OutboxPriority } from './outbox.js';
+import { QuotaManager } from './quota.js';
+import { chunkUtf8Text } from './text-chunk.js';
+import { classifyApiFailure, ILinkApiError, type ApiErrorDetails, type SendResult } from './send-result.js';
 import type {
   Credentials,
   WeixinMessage,
   GetUpdatesResponse,
   MessageItem,
   GetConfigResponse,
+  SendMessageResponse,
 } from './types.js';
 
 const CHANNEL_VERSION = '1.0.2';
 const HTTP_TIMEOUT_MS = 45_000;
 const CDN_BASE_URL = 'https://novac2c.cdn.weixin.qq.com/c2c';
-const REGULAR_RETRY_DELAYS_MS = [0, 30_000, 60_000, 120_000] as const;
-const INTERMEDIATE_RETRY_DELAYS_MS = [0, 12_000] as const;
 const BASE_RATE_LIMIT_COOLDOWN_MS = 150_000; // ~2.5 minutes
 const MAX_RATE_LIMIT_COOLDOWN_MS = 420_000; // ~7 minutes
 
@@ -29,10 +32,23 @@ const UPLOAD_MEDIA_TYPE_FILE = 3;
 
 type SendStreamType = 'regular' | 'intermediate';
 
+export type DeliveryState =
+  | 'READY'
+  | 'SENDING'
+  | 'WAITING_INBOUND'
+  | 'RATE_BACKOFF'
+  | 'PERMANENT_FAILURE';
+
 interface UserRateLimitState {
   consecutiveRet2: number;
   suppressIntermediateUntil: number;
   blockAllSendsUntil: number;
+}
+
+export interface ILinkClientOptions {
+  outbox?: OutboxStore;
+  quota?: QuotaManager;
+  accountId?: string;
 }
 
 export type MessageHandler = (
@@ -46,11 +62,16 @@ export class ILinkClient {
   private credentials: Credentials;
   private pollCursor: string;
   private running = false;
-  private contextTokens = new Map<string, string>();
+  private contextTokens = loadContextTokens();
   private typingTickets = new Map<string, { ticket: string; ts: number }>();
   private handlers: MessageHandler[] = [];
-  private sendQueues = new Map<string, Promise<void>>();
+  private sendQueues = new Map<string, Promise<unknown>>();
   private rateLimitStates = new Map<string, UserRateLimitState>();
+  private waitingForInbound = new Set<string>();
+  private deliveryStates = new Map<string, DeliveryState>();
+  private readonly accountId: string;
+  private readonly outbox: OutboxStore;
+  private readonly quota: QuotaManager;
   private backoffMs = 1000;
   private abortController: AbortController | null = null;
   private consecutiveFailures = 0;
@@ -63,9 +84,12 @@ export class ILinkClient {
   private seenMsgIds = new Set<string>();
   private seenMsgOrder: string[] = [];
 
-  constructor(credentials: Credentials) {
+  constructor(credentials: Credentials, options: ILinkClientOptions = {}) {
     this.credentials = credentials;
     this.pollCursor = loadPollCursor();
+    this.accountId = options.accountId || credentials.ilinkBotId;
+    this.outbox = options.outbox || new OutboxStore(join(DATA_DIR, 'outbox.json'));
+    this.quota = options.quota || new QuotaManager(join(DATA_DIR, 'quota.json'), this.accountId);
   }
 
   onMessage(handler: MessageHandler): void {
@@ -275,8 +299,21 @@ export class ILinkClient {
     }
 
     // Cache context_token for this user
+    const inbound = this.quota.recordInbound(
+      msg.from_user_id,
+      String(msg.message_id),
+      msg.context_token,
+    );
     this.contextTokens.set(msg.from_user_id, msg.context_token);
     saveContextTokens(this.contextTokens);
+
+    // A real, deduplicated inbound message is the explicit recovery signal. It
+    // clears only the local send backoff; quota counters and generations remain intact.
+    if (!inbound.duplicate) this.resetRateLimitOnInbound(msg.from_user_id);
+
+    // A new, deduplicated inbound message is the safe trigger for draining text
+    // that was waiting for a usable context token or an ambiguous ret=-2 response.
+    if (!inbound.duplicate) await this.drainOutbox(msg.from_user_id);
 
     log.debug(`[msg] item_list=${JSON.stringify(redactSecrets(msg.item_list))}`);
     const { text, refText, mediaItems } = await parseMessage(msg);
@@ -297,12 +334,28 @@ export class ILinkClient {
     return this.contextTokens.get(userId);
   }
 
+  getDeliveryState(userId: string): { state: DeliveryState; waitingForInbound: boolean; pendingTextCount: number } {
+    const pendingTextCount = this.outbox.list(userId, this.accountId).length;
+    const state = this.deliveryStates.get(userId) || (pendingTextCount > 0 ? 'WAITING_INBOUND' : 'READY');
+    return {
+      state,
+      // Derive from durable work as well, so a restarted process still gates
+      // "继续" when an earlier send is waiting for a new inbound message.
+      waitingForInbound: this.waitingForInbound.has(userId) || pendingTextCount > 0,
+      pendingTextCount,
+    };
+  }
+
+  resumePendingText(userId: string): Promise<SendResult[]> {
+    return this.drainOutbox(userId);
+  }
+
   // ─── Sending ───────────────────────────────────────────
 
-  private enqueueSend(userId: string, task: () => Promise<void>): Promise<void> {
+  private enqueueSend<T>(userId: string, task: () => Promise<T>): Promise<T> {
     const prev = this.sendQueues.get(userId) || Promise.resolve();
     const run = prev.then(task, task);
-    const tracked = run.catch(() => {});
+    const tracked = run.then(() => undefined, () => undefined);
     this.sendQueues.set(userId, tracked);
     return run.finally(() => {
       if (this.sendQueues.get(userId) === tracked) {
@@ -321,9 +374,12 @@ export class ILinkClient {
     return state;
   }
 
-  private isRateLimitedError(err: unknown): boolean {
-    const msg = err instanceof Error ? err.message : String(err);
-    return msg.includes('ret=-2');
+  private resetRateLimitOnInbound(userId: string): void {
+    const state = this.rateLimitStates.get(userId);
+    if (!state) return;
+    state.consecutiveRet2 = 0;
+    state.suppressIntermediateUntil = 0;
+    state.blockAllSendsUntil = 0;
   }
 
   private nextCooldownMs(consecutiveRet2: number): number {
@@ -332,7 +388,7 @@ export class ILinkClient {
     return Math.min(MAX_RATE_LIMIT_COOLDOWN_MS, BASE_RATE_LIMIT_COOLDOWN_MS + steps * 60_000);
   }
 
-  private async gateSendWindow(userId: string, streamType: SendStreamType): Promise<boolean> {
+  private gateSendWindow(userId: string, streamType: SendStreamType): boolean {
     const state = this.getRateLimitState(userId);
     const now = Date.now();
 
@@ -346,34 +402,176 @@ export class ILinkClient {
         log.debug('[send] 中间消息命中全局发送冷却，直接跳过');
         return false;
       }
-      const waitMs = state.blockAllSendsUntil - now;
-      log.warn(`[send] 命中限流冷却窗口，延迟发送 ${Math.ceil(waitMs / 1000)}s`);
-      await sleep(waitMs);
+      log.debug(`[send] 命中限流冷却窗口，等待新的入站消息: ${userId.substring(0, 12)}...`);
+      return false;
     }
 
     return true;
   }
 
-  async sendText(userId: string, text: string, options?: { streamType?: SendStreamType }): Promise<void> {
+  async sendText(
+    userId: string,
+    text: string,
+    options?: { streamType?: SendStreamType; priority?: OutboxPriority },
+  ): Promise<SendResult[]> {
+    const streamType = options?.streamType || 'regular';
+    const priority = options?.priority || (streamType === 'intermediate' ? 'intermediate' : 'control');
+    const snapshot = this.quota.snapshot(userId);
+    const capacityFailures: SendResult[] = [];
+
+    if (priority === 'final') {
+      this.outbox.supersedeIntermediate(this.accountId, userId, snapshot.inboundGeneration);
+    }
+
+    for (const chunk of chunkUtf8Text(text, 2_000)) {
+      try {
+        this.outbox.enqueueText({
+          accountId: this.accountId,
+          userId,
+          generation: snapshot.inboundGeneration,
+          tokenVersion: snapshot.tokenVersion,
+          priority,
+          text: chunk,
+        });
+      } catch (err) {
+        log.error(`[send] 文本进入 outbox 失败: ${userId}`, err);
+        capacityFailures.push({
+          status: priority === 'activity' || priority === 'intermediate' ? 'suppressed' : 'permanent-failure',
+          itemId: 'outbox-capacity',
+          userId,
+          generation: snapshot.inboundGeneration,
+          tokenVersion: snapshot.tokenVersion,
+          attemptedBytes: Buffer.byteLength(chunk, 'utf8'),
+          error: { errmsg: err instanceof Error ? err.message : String(err) },
+        });
+      }
+    }
+
+    return [...capacityFailures, ...(await this.drainOutbox(userId, streamType))];
+  }
+
+  private drainOutbox(userId: string, streamType: SendStreamType = 'regular'): Promise<SendResult[]> {
+    return this.enqueueSend(userId, () => this.drainOutboxNow(userId, streamType));
+  }
+
+  private async drainOutboxNow(userId: string, streamType: SendStreamType): Promise<SendResult[]> {
+    const items = this.outbox.list(userId, this.accountId);
     const token = this.contextTokens.get(userId);
     if (!token) {
-      log.error(`无法发送给 ${userId}: 缺少 context_token (用户必须先发一条消息)`);
-      return;
-    }
-    const streamType = options?.streamType || 'regular';
-    if (!(await this.gateSendWindow(userId, streamType))) {
-      return;
-    }    
-
-    await this.enqueueSend(userId, async () => {
-      const chunks = chunkText(text, 2000);
-      log.debug(`发送给 [${userId.substring(0, 12)}...] (${chunks.length} 块): ${text.substring(0, 100)}${text.length > 100 ? '…' : ''}`);
-      for (let i = 0; i < chunks.length; i++) {
-        await this.sendRawMessageWithRetry(userId, token, [
-          { type: 1 as const, text_item: { text: chunks[i] } },
-        ], streamType);
+      if (items.length > 0) {
+        this.waitingForInbound.add(userId);
+        this.deliveryStates.set(userId, 'WAITING_INBOUND');
       }
-    });
+      return items.map((item) => this.resultForItem(item, 'waiting-for-token'));
+    }
+    if (items.length === 0) {
+      this.waitingForInbound.delete(userId);
+      this.deliveryStates.set(userId, 'READY');
+      return [];
+    }
+
+    this.deliveryStates.set(userId, 'SENDING');
+    const results: SendResult[] = [];
+    for (const item of items) {
+      const reservation = this.quota.reserve(userId, item.bytes, item.priority);
+      if (!reservation.allowed) {
+        results.push(this.resultForItem(item,
+          reservation.reason === 'final-reserved' ? 'suppressed' : 'permanent-failure',
+          { errmsg: `本地发送预算不足: ${reservation.reason}` }));
+        continue;
+      }
+
+      if (!this.gateSendWindow(userId, item.priority === 'intermediate' || item.priority === 'activity'
+        ? 'intermediate'
+        : streamType)) {
+        this.quota.release(reservation.reservation.reservationId);
+        this.deliveryStates.set(userId, 'RATE_BACKOFF');
+        results.push(this.resultForItem(item, 'rate-limited', { ret: -2, errmsg: '发送冷却中，等待新的入站消息' }));
+        break;
+      }
+
+      try {
+        await this.sendRawMessageWithRetry(
+          userId,
+          token,
+          [{ type: 1 as const, text_item: { text: item.text } }],
+          item.priority === 'intermediate' || item.priority === 'activity' ? 'intermediate' : streamType,
+          item.clientId,
+        );
+        this.quota.commit(reservation.reservation.reservationId);
+        this.outbox.ack(item.itemId);
+        results.push(this.resultForItem(item, 'sent'));
+      } catch (err) {
+        this.quota.release(reservation.reservation.reservationId);
+        const details = this.errorDetails(err);
+        const failure = classifyApiFailure(details);
+        if (failure?.ambiguous) {
+          this.noteRateLimit(userId);
+          if (item.priority !== 'control') {
+            try {
+              this.outbox.enqueueText({
+                itemId: `delivery-notice:${item.itemId}`,
+                accountId: this.accountId,
+                userId,
+                generation: item.generation,
+                tokenVersion: item.tokenVersion,
+                priority: 'control',
+                text: `消息发送暂时受限，收到新的消息后自动续发。原始错误: ${details.errmsg || `ret=${details.ret ?? 'unknown'}`}`,
+              });
+            } catch (noticeError) {
+              log.error(`[send] 无法写入恢复提示: ${userId}`, noticeError);
+            }
+          }
+          this.deliveryStates.set(userId, 'RATE_BACKOFF');
+        } else {
+          this.deliveryStates.set(userId, 'PERMANENT_FAILURE');
+        }
+        results.push(this.resultForItem(item, failure?.status || 'permanent-failure', details));
+        // Keep the item durable and wait for a fresh inbound message before trying again.
+        break;
+      }
+    }
+    if (this.outbox.list(userId, this.accountId).length > 0) {
+      this.waitingForInbound.add(userId);
+      if (this.deliveryStates.get(userId) === 'SENDING') {
+        this.deliveryStates.set(userId, 'WAITING_INBOUND');
+      }
+    } else {
+      this.waitingForInbound.delete(userId);
+      this.deliveryStates.set(userId, 'READY');
+    }
+    return results;
+  }
+
+  private resultForItem(
+    item: { itemId: string; userId: string; generation: number; tokenVersion: number; bytes: number },
+    status: SendResult['status'],
+    error?: ApiErrorDetails,
+  ): SendResult {
+    return {
+      status,
+      itemId: item.itemId,
+      userId: item.userId,
+      generation: item.generation,
+      tokenVersion: item.tokenVersion,
+      attemptedBytes: item.bytes,
+      ...(error ? { error } : {}),
+    };
+  }
+
+  private errorDetails(err: unknown): ApiErrorDetails {
+    if (err instanceof ILinkApiError) return err.details;
+    return { errmsg: err instanceof Error ? err.message : String(err) };
+  }
+
+  private noteRateLimit(userId: string): void {
+    const state = this.getRateLimitState(userId);
+    state.consecutiveRet2 += 1;
+    const until = Date.now() + this.nextCooldownMs(state.consecutiveRet2);
+    state.blockAllSendsUntil = Math.max(state.blockAllSendsUntil, until);
+    state.suppressIntermediateUntil = Math.max(state.suppressIntermediateUntil, until);
+    this.deliveryStates.set(userId, 'RATE_BACKOFF');
+    log.warn(`[send] ret=-2 歧义响应，暂停高频重试 ${Math.round((until - Date.now()) / 1000)}s`);
   }
 
   private async sendRawMessageWithRetry(
@@ -381,52 +579,23 @@ export class ILinkClient {
     contextToken: string,
     itemList: MessageItem[],
     streamType: SendStreamType = 'regular',
+    clientId: string = randomUUID(),
   ): Promise<void> {
     const state = this.getRateLimitState(userId);
-    let lastErr: unknown = null;
-    const retryDelays = streamType === 'regular'
-      ? REGULAR_RETRY_DELAYS_MS
-      : INTERMEDIATE_RETRY_DELAYS_MS;
-
-    for (let attempt = 0; attempt < retryDelays.length; attempt++) {
-      const delay = retryDelays[attempt];
-      if (delay > 0) await sleep(delay);
-
-      if (!(await this.gateSendWindow(userId, streamType))) {
-        return;
-      }
-
-      try {
-        await this.sendRawMessage(userId, contextToken, itemList);
-        state.consecutiveRet2 = 0;
-        state.blockAllSendsUntil = 0;
-        return;
-      } catch (err) {
-        lastErr = err;
-        const isRateLimited = this.isRateLimitedError(err);
-
-        if (isRateLimited) {
-          state.consecutiveRet2 += 1;
-          const cooldownMs = this.nextCooldownMs(state.consecutiveRet2);
-          const until = Date.now() + cooldownMs;
-          state.blockAllSendsUntil = Math.max(state.blockAllSendsUntil, until);
-          state.suppressIntermediateUntil = Math.max(state.suppressIntermediateUntil, until);
-          log.warn(`[send] 命中限流 ret=-2，进入冷却 ${Math.round(cooldownMs / 1000)}s (连续${state.consecutiveRet2}次)`);
-        }
-
-        if (!isRateLimited || attempt === retryDelays.length - 1) {
-          throw err;
-        }
-        log.warn(`[send] ret=-2 延迟重试 (${attempt + 1}/${retryDelays.length - 1})`);
-      }
+    if (!this.gateSendWindow(userId, streamType)) {
+      throw new ILinkApiError({ ret: -2, errmsg: '发送冷却中，等待新的入站消息' });
     }
-    throw lastErr instanceof Error ? lastErr : new Error('发送消息失败');
+
+    await this.sendRawMessage(userId, contextToken, itemList, clientId);
+    state.consecutiveRet2 = 0;
+    state.blockAllSendsUntil = 0;
   }
 
   private async sendRawMessage(
     userId: string,
     contextToken: string,
     itemList: MessageItem[],
+    clientId: string = randomUUID(),
   ): Promise<void> {
     const res = await fetchWithRetry(
       `${this.credentials.baseUrl}/ilink/bot/sendmessage`,
@@ -437,7 +606,7 @@ export class ILinkClient {
           msg: {
             from_user_id: '',
             to_user_id: userId,
-            client_id: randomUUID(),
+            client_id: clientId,
             message_type: 2,
             message_state: 2,
             context_token: contextToken,
@@ -453,117 +622,179 @@ export class ILinkClient {
 
     if (!res.ok) {
       const body = await res.text().catch(() => '');
-      throw new Error(`发送消息失败: HTTP ${res.status} ${body}`);
+      throw new ILinkApiError({ httpStatus: res.status, errmsg: `发送消息失败: HTTP ${res.status} ${body}` });
     }
 
-    const data = (await res.json()) as { ret?: number; errmsg?: string };
+    const data = (await res.json()) as Partial<SendMessageResponse>;
     if (data.ret !== undefined && data.ret !== 0) {
-      throw new Error(`发送消息失败: ${data.errmsg || `ret=${data.ret}`}`);
+      throw new ILinkApiError({ ret: data.ret, errcode: data.errcode, errmsg: data.errmsg });
     }
   }
 
   // ─── File/Image/Video Upload & Send ──────────────────────
 
-  async sendFile(userId: string, filePath: string, title?: string): Promise<void> {
+  async sendFile(userId: string, filePath: string, title?: string): Promise<SendResult[]> {
     const token = this.contextTokens.get(userId);
     if (!token) {
       log.error(`无法发送文件给 ${userId}: 缺少 context_token`);
-      return;
+      return [this.mediaResult(userId, 'waiting-for-token', { errmsg: '缺少 context_token' })];
     }
 
     if (!existsSync(filePath)) {
-      throw new Error(`文件不存在: ${filePath}`);
+      return [this.mediaResult(userId, 'permanent-failure', { errmsg: `文件不存在: ${filePath}` })];
     }
 
-    const upload = await this.uploadToCdn(userId, filePath, UPLOAD_MEDIA_TYPE_FILE);
-    const fileName = title || basename(filePath);
-
-    await this.enqueueSend(userId, async () => {
-      await this.sendRawMessageWithRetry(userId, token, [
-        {
-          type: 4,
-          file_item: {
-            file_name: fileName,
-            len: String(upload.rawsize),
-            media: {
-              encrypt_query_param: upload.downloadParam,
-              aes_key: encodeMessageAesKey(upload.aeskey),
-              encrypt_type: 1,
-            },
+    try {
+      const upload = await this.uploadToCdn(userId, filePath, UPLOAD_MEDIA_TYPE_FILE);
+      const fileName = title || basename(filePath);
+      const itemList: MessageItem[] = [{
+        type: 4,
+        file_item: {
+          file_name: fileName,
+          len: String(upload.rawsize),
+          media: {
+            encrypt_query_param: upload.downloadParam,
+            aes_key: encodeMessageAesKey(upload.aeskey),
+            encrypt_type: 1,
           },
         },
-      ]);
-    });
-
-    log.info(`[sendFile] 已发送: ${fileName}`);
+      }];
+      const result = await this.sendMediaMessage(userId, token, itemList, upload.rawsize);
+      if (result[0]?.status === 'sent') log.info(`[sendFile] 已发送: ${fileName}`);
+      return result;
+    } catch (err) {
+      log.error(`[sendFile] 发送失败: ${filePath}`, err);
+      return [this.mediaFailureResult(userId, err)];
+    }
   }
 
-  async sendImage(userId: string, imagePath: string, caption?: string): Promise<void> {
+  async sendImage(userId: string, imagePath: string, caption?: string): Promise<SendResult[]> {
     const token = this.contextTokens.get(userId);
     if (!token) {
       log.error(`无法发送图片给 ${userId}: 缺少 context_token`);
-      return;
+      return [this.mediaResult(userId, 'waiting-for-token', { errmsg: '缺少 context_token' })];
     }
 
     if (!existsSync(imagePath)) {
-      throw new Error(`图片不存在: ${imagePath}`);
+      return [this.mediaResult(userId, 'permanent-failure', { errmsg: `图片不存在: ${imagePath}` })];
     }
 
-    if (caption) {
-      await this.sendText(userId, caption);
-    }
-
-    const upload = await this.uploadToCdn(userId, imagePath, UPLOAD_MEDIA_TYPE_IMAGE);
-
-    await this.enqueueSend(userId, async () => {
-      await this.sendRawMessageWithRetry(userId, token, [
-        {
-          type: 2,
-          image_item: {
-            media: {
-              encrypt_query_param: upload.downloadParam,
-              aes_key: encodeMessageAesKey(upload.aeskey),
-              encrypt_type: 1,
-            },
-            mid_size: upload.filesize,
+    try {
+      const upload = await this.uploadToCdn(userId, imagePath, UPLOAD_MEDIA_TYPE_IMAGE);
+      const itemList: MessageItem[] = [];
+      if (caption) itemList.push({ type: 1, text_item: { text: caption } });
+      itemList.push({
+        type: 2,
+        image_item: {
+          media: {
+            encrypt_query_param: upload.downloadParam,
+            aes_key: encodeMessageAesKey(upload.aeskey),
+            encrypt_type: 1,
           },
+          mid_size: upload.filesize,
         },
-      ]);
-    });
-
-    log.info(`[sendImage] 已发送图片: ${basename(imagePath)}`);
+      });
+      const result = await this.sendMediaMessage(
+        userId,
+        token,
+        itemList,
+        upload.rawsize + (caption ? Buffer.byteLength(caption, 'utf8') : 0),
+      );
+      if (result[0]?.status === 'sent') log.info(`[sendImage] 已发送图片: ${basename(imagePath)}`);
+      return result;
+    } catch (err) {
+      log.error(`[sendImage] 发送失败: ${imagePath}`, err);
+      return [this.mediaFailureResult(userId, err)];
+    }
   }
 
-  async sendVideo(userId: string, videoPath: string): Promise<void> {
+  async sendVideo(userId: string, videoPath: string): Promise<SendResult[]> {
     const token = this.contextTokens.get(userId);
     if (!token) {
       log.error(`无法发送视频给 ${userId}: 缺少 context_token`);
-      return;
+      return [this.mediaResult(userId, 'waiting-for-token', { errmsg: '缺少 context_token' })];
     }
 
     if (!existsSync(videoPath)) {
-      throw new Error(`视频不存在: ${videoPath}`);
+      return [this.mediaResult(userId, 'permanent-failure', { errmsg: `视频不存在: ${videoPath}` })];
     }
 
-    const upload = await this.uploadToCdn(userId, videoPath, UPLOAD_MEDIA_TYPE_VIDEO);
-
-    await this.enqueueSend(userId, async () => {
-      await this.sendRawMessageWithRetry(userId, token, [
-        {
-          type: 5,
-          video_item: {
-            media: {
-              encrypt_query_param: upload.downloadParam,
-              aes_key: encodeMessageAesKey(upload.aeskey),
-              encrypt_type: 1,
-            },
-            video_size: upload.filesize,
+    try {
+      const upload = await this.uploadToCdn(userId, videoPath, UPLOAD_MEDIA_TYPE_VIDEO);
+      const itemList: MessageItem[] = [{
+        type: 5,
+        video_item: {
+          media: {
+            encrypt_query_param: upload.downloadParam,
+            aes_key: encodeMessageAesKey(upload.aeskey),
+            encrypt_type: 1,
           },
+          video_size: upload.filesize,
         },
-      ]);
-    });
+      }];
+      const result = await this.sendMediaMessage(userId, token, itemList, upload.rawsize);
+      if (result[0]?.status === 'sent') log.info(`[sendVideo] 已发送视频: ${basename(videoPath)}`);
+      return result;
+    } catch (err) {
+      log.error(`[sendVideo] 发送失败: ${videoPath}`, err);
+      return [this.mediaFailureResult(userId, err)];
+    }
+  }
 
-    log.info(`[sendVideo] 已发送视频: ${basename(videoPath)}`);
+  private mediaResult(userId: string, status: SendResult['status'], error?: ApiErrorDetails): SendResult {
+    const snapshot = this.quota.snapshot(userId);
+    return {
+      status,
+      itemId: `media-${randomUUID()}`,
+      userId,
+      generation: snapshot.inboundGeneration,
+      tokenVersion: snapshot.tokenVersion,
+      attemptedBytes: 0,
+      ...(error ? { error } : {}),
+    };
+  }
+
+  private mediaFailureResult(userId: string, err: unknown): SendResult {
+    const details = this.errorDetails(err);
+    const failure = classifyApiFailure(details);
+    if (failure?.ambiguous) this.noteRateLimit(userId);
+    return this.mediaResult(userId, failure?.status || 'permanent-failure', details);
+  }
+
+  private async sendMediaMessage(
+    userId: string,
+    contextToken: string,
+    itemList: MessageItem[],
+    bytes: number,
+  ): Promise<SendResult[]> {
+    return this.enqueueSend(userId, async () => {
+      const snapshot = this.quota.snapshot(userId);
+      const reservation = this.quota.reserve(userId, bytes, 'media');
+      if (!reservation.allowed) {
+        return [this.mediaResult(userId,
+          reservation.reason === 'final-reserved' ? 'suppressed' : 'permanent-failure',
+          { errmsg: `媒体发送预算不足: ${reservation.reason}` })];
+      }
+
+      const item = {
+        itemId: `media-${randomUUID()}`,
+        userId,
+        generation: snapshot.inboundGeneration,
+        tokenVersion: snapshot.tokenVersion,
+        bytes,
+      };
+      try {
+        await this.sendRawMessageWithRetry(userId, contextToken, itemList, 'regular');
+        this.quota.commit(reservation.reservation.reservationId);
+        return [this.resultForItem(item, 'sent')];
+      } catch (err) {
+        this.quota.release(reservation.reservation.reservationId);
+        const details = this.errorDetails(err);
+        const failure = classifyApiFailure(details);
+        if (failure?.ambiguous) this.noteRateLimit(userId);
+        return [this.resultForItem(item, failure?.status || 'permanent-failure', details)];
+      }
+    });
   }
 
   private async uploadToCdn(
@@ -604,13 +835,21 @@ export class ILinkClient {
 
     if (!uploadResp.ok) {
       const body = await uploadResp.text().catch(() => '');
-      throw new Error(`获取上传URL失败: HTTP ${uploadResp.status} ${body}`);
+      throw new ILinkApiError({ httpStatus: uploadResp.status, errmsg: `获取上传URL失败: HTTP ${uploadResp.status} ${body}` });
     }
 
-    const uploadData = (await uploadResp.json()) as { upload_param?: string };
+    const uploadData = (await uploadResp.json()) as {
+      upload_param?: string;
+      ret?: number;
+      errcode?: number;
+      errmsg?: string;
+    };
+    if (uploadData.ret !== undefined && uploadData.ret !== 0) {
+      throw new ILinkApiError({ ret: uploadData.ret, errcode: uploadData.errcode, errmsg: uploadData.errmsg });
+    }
     const uploadParam = uploadData.upload_param;
     if (!uploadParam) {
-      throw new Error('获取上传URL失败: 无 upload_param');
+      throw new ILinkApiError({ errmsg: '获取上传URL失败: 无 upload_param' });
     }
 
     // Encrypt and upload to CDN
@@ -630,12 +869,12 @@ export class ILinkClient {
 
     if (!cdnResp.ok) {
       const body = await cdnResp.text().catch(() => '');
-      throw new Error(`CDN 上传失败: HTTP ${cdnResp.status} ${body}`);
+      throw new ILinkApiError({ httpStatus: cdnResp.status, errmsg: `CDN 上传失败: HTTP ${cdnResp.status} ${body}` });
     }
 
     const downloadParam = cdnResp.headers.get('x-encrypted-param');
     if (!downloadParam) {
-      throw new Error('CDN 上传失败: 无 x-encrypted-param');
+      throw new ILinkApiError({ errmsg: 'CDN 上传失败: 无 x-encrypted-param' });
     }
 
     log.debug(`[upload] CDN upload success, downloadParam: ${downloadParam.substring(0, 30)}...`);

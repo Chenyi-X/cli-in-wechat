@@ -29,6 +29,13 @@ export interface ClassifiedApiFailure {
   error: ApiErrorDetails;
 }
 
+export class ILinkApiError extends Error {
+  constructor(public readonly details: ApiErrorDetails) {
+    super(details.errmsg || (details.ret !== undefined ? `ret=${details.ret}` : 'iLink API error'));
+    this.name = 'ILinkApiError';
+  }
+}
+
 /** Classify an application response without inferring meaning from errmsg text. */
 export function classifyApiFailure(error: ApiErrorDetails): ClassifiedApiFailure | null {
   if (error.ret === undefined || error.ret === 0) return null;

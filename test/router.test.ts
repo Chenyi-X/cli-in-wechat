@@ -9,6 +9,8 @@ import type { WeixinMessage } from '../src/ilink/types.js';
 function createRouter() {
   const messages: Array<{ uid: string; text: string }> = [];
   const starts: string[] = [];
+  const delivery = { waitingForInbound: false, pendingTextCount: 0 };
+  const resumed: string[] = [];
 
   const ilink = {
     sendText: async (uid: string, text: string) => {
@@ -17,6 +19,11 @@ function createRouter() {
     startTyping: async (uid: string) => {
       starts.push(uid);
       return () => {};
+    },
+    getDeliveryState: () => delivery,
+    resumePendingText: async (uid: string) => {
+      resumed.push(uid);
+      return [];
     },
     onMessage: () => {},
   };
@@ -54,7 +61,7 @@ function createRouter() {
   };
 
   const router = new Router(ilink as any, registry as any, sessions as any, config);
-  return { router: router as any, messages, starts, sessions };
+  return { router: router as any, messages, starts, sessions, delivery, resumed };
 }
 
 function makeMessage(uid: string): WeixinMessage {
@@ -156,6 +163,33 @@ test('handle() omits refText in combined prompt if refText is empty', async () =
   await router.handle(makeMessage('u1'), 'explain', '');
 
   assert.equal(capturedPrompt, 'explain');
+});
+
+test('plain 继续 is intercepted only for waiting durable text', async () => {
+  const { router, delivery, resumed } = createRouter();
+  delivery.waitingForInbound = true;
+  delivery.pendingTextCount = 1;
+  let execCalled = false;
+  router.exec = async () => {
+    execCalled = true;
+  };
+
+  await router.handle(makeMessage('u1'), '继续', '');
+
+  assert.deepEqual(resumed, ['u1']);
+  assert.equal(execCalled, false);
+});
+
+test('plain 继续 reaches the Agent when no durable delivery is waiting', async () => {
+  const { router } = createRouter();
+  let capturedPrompt = '';
+  router.exec = async (uid: string, tool: string, prompt: string) => {
+    capturedPrompt = prompt;
+  };
+
+  await router.handle(makeMessage('u1'), '继续', '');
+
+  assert.equal(capturedPrompt, '继续');
 });
 
 test('handleSlash /model strips accidental /. suffix from model name', async () => {

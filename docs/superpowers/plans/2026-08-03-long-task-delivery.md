@@ -19,7 +19,7 @@
 - [x] Record current branch, dirty files, remotes, stash commits, and the absence of a merge base.
 - [x] Create dated backup refs for old `main`, the current feature branch, and all three stash commits.
 - [x] Fetch `upstream` and create `codex/rebuild-main` from `upstream/main` in an isolated worktree.
-- [ ] Apply the `.wx-media/` ignore rule to the rebuilt tree and commit it separately.
+- [x] Apply the `.wx-media/` ignore rule to the rebuilt tree and commit it separately.
 - [ ] Keep the old refs until at least two stable validation cycles have completed.
 
 ### Task 2: Migrate local behavior that upstream has not absorbed
@@ -29,10 +29,10 @@
 - Modify: `src/bridge/router.ts`
 - Test: `test/router.test.ts`
 
-- [ ] Add failing tests proving a fresh session defaults to `maxTurns: 100` and `/reset` restores 100.
-- [ ] Run `npm test` and verify those assertions fail against upstream's 30-turn defaults.
-- [ ] Change only the default and reset values to 100; retain upstream's adapter, network, media, and model handling.
-- [ ] Run the focused test, typecheck, build, and complete test suite.
+- [x] Add failing tests proving a fresh session defaults to `maxTurns: 100` and `/reset` restores 100.
+- [x] Run `npm test` and verify those assertions fail against upstream's 30-turn defaults.
+- [x] Change only the default and reset values to 100; retain upstream's adapter, network, media, and model handling.
+- [x] Run the focused test, typecheck, build, and complete test suite.
 
 ### Task 3: Define durable send outcomes and UTF-8 text chunks
 
@@ -60,9 +60,9 @@ export interface SendResult {
 }
 ```
 
-- [ ] Test UTF-8 byte limits for Chinese, emoji, Markdown, and code blocks without splitting surrogate pairs or emitting empty chunks.
-- [ ] Test stable item IDs and preservation of `ret`, `errcode`, and `errmsg`.
-- [ ] Implement the smallest pure helpers first, then reuse them from the client/outbox.
+- [x] Test UTF-8 byte limits for Chinese, emoji, Markdown, and code blocks without splitting surrogate pairs or emitting empty chunks.
+- [x] Test stable item IDs and preservation of `ret`, `errcode`, and `errmsg`.
+- [x] Implement the smallest pure helpers first, then reuse them from the client/outbox.
 
 ### Task 4: Implement quota generations and final-result reservations
 
@@ -73,10 +73,10 @@ export interface SendResult {
 
 The quota key is `(accountId, userId)`; each inbound message increments `inboundGeneration` after deduplication, while a token change increments `tokenVersion`. Repeated polls, restarts, and re-reading the same token do not reset a budget. Every text and media request reserves budget before sending, but only a confirmed `sendmessage ret=0` increments the local sent counter. Final-result capacity is reserved before intermediate activity is accepted.
 
-- [ ] Add failing tests for generation stability, token-version changes, final reservation, and media counting.
-- [ ] Implement `QuotaManager` with explicit configurable limits and no claims that 10 messages, 24 hours, or 4000 bytes are protocol constants.
-- [ ] Classify `ret=-2` as ambiguous, preserve the complete structured error, stop high-frequency retries, and default to queue/wait for a new inbound message.
-- [ ] Keep transport retries in `fetchWithRetry`; application-level `ret=-2` handling lives only in the quota/send coordinator.
+- [x] Add failing tests for generation stability, token-version changes, final reservation, and media counting.
+- [x] Implement `QuotaManager` with explicit configurable limits and no claims that 10 messages, 24 hours, or 4000 bytes are protocol constants.
+- [x] Classify `ret=-2` as ambiguous, preserve the complete structured error, stop high-frequency retries, and default to queue/wait for a new inbound message.
+- [x] Keep transport retries in `fetchWithRetry`; application-level `ret=-2` handling lives only in the quota/send coordinator.
 
 ### Task 5: Implement the durable text outbox
 
@@ -87,10 +87,10 @@ The quota key is `(accountId, userId)`; each inbound message increments `inbound
 
 The outbox is an atomically written, schema-versioned JSON store under the existing data directory. Items have stable IDs, priority, creation time, TTL, UTF-8 byte accounting, user/generation/token metadata, and a terminal state. Priority is final result, control/error, media, intermediate text, then tool activity. Successful delivery deletes the item; restart reloads it; expired or superseded intermediate items are discarded before final results.
 
-- [ ] Test atomic enqueue/dequeue/ack, deterministic ordering, duplicate acknowledgement, TTL, per-user item/byte caps, and recovery after a truncated temp write.
-- [ ] Test that a final result reserves space and that a media caption is not acknowledged independently from its media item.
-- [ ] Implement `OutboxStore` with atomic writes through `atomicWrite`, schema validation, and bounded sensitive-content retention.
-- [ ] Wire text sends through the outbox while preserving existing media upload behavior and making media failures visible.
+- [x] Test atomic enqueue/dequeue/ack, deterministic ordering, duplicate acknowledgement, TTL, per-user item/byte caps, and recovery after a truncated temp write.
+- [x] Test that a final result reserves space and that a media caption is not acknowledged independently from its media item.
+- [x] Implement `OutboxStore` with atomic writes through `atomicWrite`, schema validation, and bounded sensitive-content retention.
+- [x] Wire text sends through the outbox while preserving existing media upload behavior and making media failures visible.
 
 ### Task 6: Gate continuation and route recovery through the router
 
@@ -98,9 +98,9 @@ The outbox is an atomically written, schema-versioned JSON store under the exist
 - Modify: `src/bridge/router.ts`, `src/ilink/client.ts`
 - Tests: `test/router.test.ts`, `test/outbox.test.ts`
 
-- [ ] Add failing tests showing that plain `继续` is intercepted only when the user is waiting and has queued work; otherwise it reaches the normal Agent path. Preserve `/continue` as the existing session-recovery alias.
-- [ ] Track `READY`, `SENDING`, `WAITING_INBOUND`, `RATE_BACKOFF`, and `PERMANENT_FAILURE` per user/task.
-- [ ] On a new deduplicated inbound message, update the generation, refresh the usable context token, and drain queued text in priority order without re-sending acknowledged items.
+- [x] Add failing tests showing that plain `继续` is intercepted only when the user is waiting and has queued work; otherwise it reaches the normal Agent path. Preserve `/continue` as the existing session-recovery alias.
+- [x] Track `READY`, `SENDING`, `WAITING_INBOUND`, `RATE_BACKOFF`, and `PERMANENT_FAILURE` per user/task.
+- [x] On a new deduplicated inbound message, update the generation, refresh the usable context token, and drain queued text in priority order without re-sending acknowledged items.
 - [ ] Append a continuation notice only when queue content remains or the task is still running, reserving its UTF-8 bytes.
 
 ### Task 7: Verify and prepare the dual-remote workflow
