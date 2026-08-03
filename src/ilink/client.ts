@@ -1,4 +1,4 @@
-import { randomUUID, randomBytes } from 'node:crypto';
+import { createHash, randomUUID, randomBytes } from 'node:crypto';
 import { readFileSync, existsSync, statSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { generateWechatUin, encryptAesEcb, aesEcbPaddedSize, encodeMessageAesKey, md5 } from '../utils/crypto.js';
@@ -319,6 +319,7 @@ export class ILinkClient {
     }
 
     // Cache context_token for this user
+    const previousTokenVersion = this.quota.snapshot(msg.from_user_id).tokenVersion;
     const inbound = this.quota.recordInbound(
       msg.from_user_id,
       String(msg.message_id),
@@ -328,6 +329,12 @@ export class ILinkClient {
       log.debug(`[msg] 持久化判重命中，跳过重放 message_id=${msg.message_id}`);
       return;
     }
+
+    log.debug(
+      `[msg] inbound message_id=${msg.message_id} user=${msg.from_user_id.substring(0, 12)}... `
+      + `generation=${inbound.inboundGeneration} tokenVersion=${inbound.tokenVersion} `
+      + `tokenChanged=${inbound.tokenVersion !== previousTokenVersion} tokenHash=${tokenHash(msg.context_token)}`,
+    );
 
     this.contextTokens.set(msg.from_user_id, msg.context_token);
     saveContextTokens(this.contextTokens, this.accountId);
@@ -812,6 +819,16 @@ export class ILinkClient {
     itemList: MessageItem[],
     clientId: string = randomUUID(),
   ): Promise<void> {
+    const serializedItems = JSON.stringify(itemList);
+    const textItems = itemList
+      .map((item) => item.text_item?.text || '')
+      .join('');
+    log.debug(
+      `[send] request client=${clientId} user=${userId.substring(0, 12)}... `
+      + `tokenHash=${tokenHash(contextToken)} items=${itemList.length} `
+      + `jsLength=${textItems.length} utf8Bytes=${Buffer.byteLength(textItems, 'utf8')} `
+      + `itemListBytes=${Buffer.byteLength(serializedItems, 'utf8')}`,
+    );
     const res = await fetchWithRetry(
       `${this.credentials.baseUrl}/ilink/bot/sendmessage`,
       {
@@ -1246,6 +1263,10 @@ export function redactSecrets(value: unknown): unknown {
     return out;
   }
   return value;
+}
+
+function tokenHash(token: string): string {
+  return token ? createHash('sha256').update(token).digest('hex').slice(0, 12) : 'none';
 }
 
 async function parseMessage(msg: WeixinMessage): Promise<{ text: string; refText: string; mediaItems: DownloadedMedia[] }> {
