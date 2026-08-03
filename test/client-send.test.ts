@@ -155,6 +155,51 @@ test('a fresh context token requeues legacy local quota failures', async () => {
   });
 });
 
+test('a fresh inbound requeues legacy temporary local quota failures', async () => {
+  await withStores(async (outbox, quota) => {
+    const client = new ILinkClient(credentials, { outbox, quota });
+    quota.recordInbound('user-a', 'message-1', 'context-a');
+    (client as any).contextTokens.set('user-a', 'context-a');
+    const item = outbox.enqueueText({
+      accountId: 'account-a',
+      userId: 'user-a',
+      generation: 1,
+      tokenVersion: 1,
+      priority: 'final',
+      text: '旧版本暂时预算失败后仍要恢复的最终结果',
+    });
+    outbox.markPermanentFailure(item.itemId, { errmsg: '本地发送预算暂时不足: final-reserved' });
+
+    const originalFetch = globalThis.fetch;
+    const payloads: Array<Record<string, any>> = [];
+    globalThis.fetch = async (_input, init) => {
+      payloads.push(JSON.parse(String(init?.body)));
+      return new Response(JSON.stringify({ ret: 0 }), { status: 200 });
+    };
+    try {
+      await (client as any).processMessage({
+        message_id: 2,
+        from_user_id: 'user-a',
+        to_user_id: 'bot-user',
+        client_id: 'inbound-client-2',
+        create_time_ms: Date.now(),
+        message_type: 1,
+        message_state: 0,
+        context_token: 'context-b',
+        item_list: [{ type: 1, text_item: { text: '0' } }],
+      });
+
+      assert.deepEqual(
+        payloads.map((payload) => payload.msg.item_list[0].text_item.text),
+        ['旧版本暂时预算失败后仍要恢复的最终结果'],
+      );
+      assert.deepEqual(outbox.list('user-a'), []);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
 test('a new inbound requeues legacy local quota failures even when the token is unchanged', async () => {
   await withStores(async (outbox, quota) => {
     const client = new ILinkClient(credentials, { outbox, quota });
@@ -198,6 +243,53 @@ test('a new inbound requeues legacy local quota failures even when the token is 
       globalThis.fetch = originalFetch;
     }
   });
+});
+
+test('a restarted client recovers local quota failures after an inbound already arrived', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wxclient-restart-recovery-'));
+  const outboxPath = join(dir, 'outbox.json');
+  const quotaPath = join(dir, 'quota.json');
+  const originalFetch = globalThis.fetch;
+  try {
+    const firstOutbox = new OutboxStore(outboxPath);
+    const firstQuota = new QuotaManager(quotaPath, 'account-a');
+    firstQuota.recordInbound('user-a', 'message-1', 'context-a');
+    const item = firstOutbox.enqueueText({
+      accountId: 'account-a',
+      userId: 'user-a',
+      generation: 1,
+      tokenVersion: 1,
+      priority: 'final',
+      text: '进程重启后仍要恢复的最终结果',
+    });
+    firstOutbox.markPermanentFailure(item.itemId, { errmsg: '本地发送预算不足: budget-exhausted' });
+
+    // Simulate the old process receiving the recovery message and persisting its
+    // newer inbound context before it exits.
+    firstQuota.recordInbound('user-a', 'message-2', 'context-b');
+
+    const restartedOutbox = new OutboxStore(outboxPath);
+    const restartedQuota = new QuotaManager(quotaPath, 'account-a');
+    const restarted = new ILinkClient(credentials, { outbox: restartedOutbox, quota: restartedQuota });
+    (restarted as any).contextTokens.set('user-a', 'context-b');
+
+    const payloads: Array<Record<string, any>> = [];
+    globalThis.fetch = async (_input, init) => {
+      payloads.push(JSON.parse(String(init?.body)));
+      return new Response(JSON.stringify({ ret: 0 }), { status: 200 });
+    };
+
+    await (restarted as any).drainStartupRecovery();
+
+    assert.deepEqual(
+      payloads.map((payload) => payload.msg.item_list[0].text_item.text),
+      ['进程重启后仍要恢复的最终结果'],
+    );
+    assert.deepEqual(restartedOutbox.list('user-a'), []);
+  } finally {
+    globalThis.fetch = originalFetch;
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('sendmessage diagnostics survive process log rotation and preserve response metadata', async () => {

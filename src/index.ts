@@ -9,9 +9,14 @@ import {
   loadCredentials,
   saveCredentials,
   ensureDataDir,
+  DATA_DIR,
 } from './config.js';
 import { log, setLogLevel, LogLevel } from './utils/logger.js';
 import { initProxyFromEnv } from './utils/http.js';
+import { acquireSingleInstance } from './utils/single-instance.js';
+import { join } from 'node:path';
+
+let releaseInstance: (() => void) | null = null;
 
 async function main() {
   const subcommand = process.argv[2];
@@ -31,6 +36,8 @@ async function main() {
   );
 
   ensureDataDir();
+  const instance = acquireSingleInstance(join(DATA_DIR, 'bridge.lock'));
+  releaseInstance = instance.release;
   const config = loadConfig();
 
   if (process.argv.includes('--debug') || process.argv.includes('-d')) {
@@ -119,6 +126,8 @@ async function main() {
     log.info(`收到 ${signal}，正在关闭...`);
     try { router.stop(); } catch { /* ignore */ }
     try { ilink.stop(); } catch { /* ignore */ }
+    releaseInstance?.();
+    releaseInstance = null;
     // Give in-flight aborts (child SIGTERM/taskkill) a brief moment, then exit.
     setTimeout(() => process.exit(0), 300);
   };
@@ -138,12 +147,16 @@ async function main() {
       shuttingDown = true;
       try { router.stop(); } catch { /* ignore */ }
       try { ilink.stop(); } catch { /* ignore */ }
+      releaseInstance?.();
+      releaseInstance = null;
     }
     setTimeout(() => process.exit(1), 200);
   });
 }
 
 main().catch(async (err) => {
+  releaseInstance?.();
+  releaseInstance = null;
   const { isRetryableNetworkError, describeNetworkError } = await import('./utils/http.js');
   if (isRetryableNetworkError(err) || /ECONNRESET|fetch failed|网络请求/.test(String(err?.message))) {
     log.error('启动失败 (网络问题):');

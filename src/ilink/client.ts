@@ -96,6 +96,7 @@ export class ILinkClient {
   private readonly outbox: OutboxStore;
   private readonly quota: QuotaManager;
   private readonly diagnostics?: DeliveryDiagnostics;
+  private readonly startupRecoveryUsers = new Set<string>();
   private backoffMs = 1000;
   private abortController: AbortController | null = null;
   private consecutiveFailures = 0;
@@ -126,6 +127,18 @@ export class ILinkClient {
       && item.terminalError?.errmsg === LEGACY_MISSING_RET_ERROR);
     if (recovered > 0) {
       log.warn(`[send] 已恢复 ${recovered} 个旧版误判的未确认发送项，将使用原 client_id 续发`);
+    }
+    const localBudgetRecoveryCandidates = this.outbox.list().filter((item) => {
+      if (item.accountId !== this.accountId || !this.isLocalBudgetFailure(item)) return false;
+      const snapshot = this.quota.snapshot(item.userId);
+      if (snapshot.inboundGeneration <= item.generation) return false;
+      this.startupRecoveryUsers.add(item.userId);
+      return true;
+    });
+    const recoveredLocalBudget = this.outbox.requeuePermanentFailures((item) =>
+      localBudgetRecoveryCandidates.some((candidate) => candidate.itemId === item.itemId));
+    if (recoveredLocalBudget > 0) {
+      log.warn(`[send] 重启恢复 ${recoveredLocalBudget} 个已在新入站后被旧进程误标失败的本地预算项`);
     }
   }
 
@@ -176,7 +189,25 @@ export class ILinkClient {
   start(): void {
     this.running = true;
     log.info('iLink 消息轮询已启动');
+    void this.drainStartupRecovery();
     this.pollLoop();
+  }
+
+  private async drainStartupRecovery(): Promise<void> {
+    for (const userId of this.startupRecoveryUsers) {
+      if (!this.contextTokens.get(userId)) {
+        log.warn(`[send] 重启恢复等待 context_token: ${userId.substring(0, 12)}...`);
+        continue;
+      }
+      try {
+        const results = await this.drainOutbox(userId);
+        const sent = results.filter((result) => result.status === 'sent').length;
+        log.info(`[send] 重启恢复完成: ${userId.substring(0, 12)}... sent=${sent} pending=${this.outbox.listPending(userId, this.accountId).length}`);
+      } catch (err) {
+        log.error(`[send] 重启恢复失败: ${userId.substring(0, 12)}...`, err);
+      }
+    }
+    this.startupRecoveryUsers.clear();
   }
 
   stop(): void {
@@ -376,7 +407,7 @@ export class ILinkClient {
       // The token may remain byte-identical, so this must not depend on a token
       // version change. The current token budget is still enforced by reserve().
       if (item.tokenVersion > inbound.tokenVersion) return false;
-      return item.terminalError?.errmsg?.startsWith('本地发送预算不足: ') === true;
+      return this.isLocalBudgetFailure(item);
     });
     if (requeued > 0) {
       log.warn(`[msg] 新入站已重新排队 ${requeued} 个本地预算阻塞项`);
@@ -920,6 +951,12 @@ export class ILinkClient {
   private errorDetails(err: unknown): ApiErrorDetails {
     if (err instanceof ILinkApiError) return err.details;
     return { errmsg: err instanceof Error ? err.message : String(err) };
+  }
+
+  private isLocalBudgetFailure(item: Pick<OutboxTextItem, 'terminalError'>): boolean {
+    const errmsg = item.terminalError?.errmsg;
+    return errmsg?.startsWith('本地发送预算不足: ') === true
+      || errmsg?.startsWith('本地发送预算暂时不足: ') === true;
   }
 
   private recordDiagnostic(input: DeliveryDiagnosticInput): void {

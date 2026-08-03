@@ -123,3 +123,14 @@ The outbox is an atomically written, schema-versioned JSON store under the exist
 - [ ] Test 1800/2000/2048/3000/3500/4000/4500 UTF-8 bytes with Chinese, English, emoji, Markdown, and code blocks.
 - [ ] Record timestamp, redacted user ID, token hash, inbound generation, token version, client ID, request/item/bubble sequence, JS length, UTF-8 bytes, full response, and actual WeChat visibility.
 - [ ] Accept only when at least 20 long tasks run, each mode has at least 5, final delivery is 100%, duplicates are 0, restart recovery works, and all media failures are visible.
+
+### Task 9: Prevent multiple bridge instances
+
+**Files:**
+- Create: `src/utils/single-instance.ts`
+- Modify: `src/index.ts`
+- Test: `test/single-instance.test.ts`
+
+- [x] Reject a second bridge process while the recorded owner PID is alive.
+- [x] Reclaim a lock left by a dead process and release it during every shutdown path.
+- [x] Keep the lock scoped to bridge mode so the one-shot `send` subcommand is unaffected.
