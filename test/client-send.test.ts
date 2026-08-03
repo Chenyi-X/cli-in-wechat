@@ -332,7 +332,9 @@ test('sendmessage diagnostics survive process log rotation and preserve response
 
 test('keeps a message durable when HTTP 200 does not confirm delivery', async () => {
   await withStores(async (outbox, quota) => {
-    const client = new ILinkClient(credentials, { outbox, quota });
+    const dir = mkdtempSync(join(tmpdir(), 'wxclient-unconfirmed-diagnostics-'));
+    const diagnostics = new DeliveryDiagnostics(join(dir, 'delivery.jsonl'));
+    const client = new ILinkClient(credentials, { outbox, quota, diagnostics });
     quota.recordInbound('user-a', 'message-1', 'context-a');
     (client as any).contextTokens.set('user-a', 'context-a');
 
@@ -346,6 +348,12 @@ test('keeps a message durable when HTTP 200 does not confirm delivery', async ()
       assert.equal(quota.snapshot('user-a').sentItems, 0);
     } finally {
       globalThis.fetch = originalFetch;
+      const records = readFileSync(join(dir, 'delivery.jsonl'), 'utf8')
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line) as Record<string, any>);
+      assert.equal(records[1]?.response?.errmsg, 'sendmessage response did not confirm delivery');
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 });
@@ -386,6 +394,54 @@ test('a new inbound drains an unconfirmed message with its original client_id', 
       assert.equal(requestCount, 2);
       assert.equal(clientIds[0], clientIds[1]);
       assert.deepEqual(outbox.list('user-a'), []);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+test('does not consume an inbound message when only an orphaned recovery notice remains', async () => {
+  await withStores(async (outbox, quota) => {
+    const client = new ILinkClient(credentials, { outbox, quota });
+    const notice = outbox.enqueueText({
+      itemId: 'token-budget-notice:orphaned',
+      accountId: 'account-a',
+      userId: 'user-a',
+      generation: 1,
+      tokenVersion: 1,
+      priority: 'control',
+      text: '请回复任意消息后继续',
+    });
+    assert.equal(notice.itemId, 'token-budget-notice:orphaned');
+
+    let routedText: string | undefined;
+    let recoveryContext: unknown;
+    client.onMessage((_msg, text, _refText, _media, recovery) => {
+      routedText = text;
+      recoveryContext = recovery;
+    });
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response(
+      JSON.stringify({ message_id: 123 }),
+      { status: 200 },
+    );
+    try {
+      await (client as any).processMessage({
+        message_id: 2,
+        from_user_id: 'user-a',
+        to_user_id: 'bot-user',
+        client_id: 'inbound-client-2',
+        create_time_ms: Date.now(),
+        message_type: 1,
+        message_state: 0,
+        context_token: 'context-b',
+        item_list: [{ type: 1, text_item: { text: '0' } }],
+      });
+
+      assert.equal(routedText, '0');
+      assert.equal(recoveryContext, undefined);
+      assert.deepEqual(outbox.listPending('user-a'), []);
     } finally {
       globalThis.fetch = originalFetch;
     }

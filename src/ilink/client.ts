@@ -432,7 +432,7 @@ export class ILinkClient {
     const pendingTextCountBeforeDrain = this.outbox.listPending(
       msg.from_user_id,
       this.accountId,
-    ).length;
+    ).filter((item) => !this.isRecoveryNotice(item)).length;
 
     // A new, deduplicated inbound message is the safe trigger for draining text
     // that was waiting for a usable context token or an ambiguous ret=-2 response.
@@ -471,15 +471,21 @@ export class ILinkClient {
 
   getDeliveryState(userId: string): { state: DeliveryState; waitingForInbound: boolean; pendingTextCount: number } {
     const allItems = this.outbox.list(userId, this.accountId);
-    const pendingTextCount = allItems.filter((item) => item.state === 'pending').length;
+    const pendingTextCount = allItems.filter((item) => (
+      item.state === 'pending' && !this.isRecoveryNotice(item)
+    )).length;
     const hasPermanentFailure = allItems.some((item) => item.state === 'permanent-failure');
-    const state = this.deliveryStates.get(userId)
-      || (hasPermanentFailure ? 'PERMANENT_FAILURE' : pendingTextCount > 0 ? 'WAITING_INBOUND' : 'READY');
+    const state = hasPermanentFailure
+      ? 'PERMANENT_FAILURE'
+      : pendingTextCount > 0
+        ? (this.deliveryStates.get(userId) || 'WAITING_INBOUND')
+        : 'READY';
     return {
       state,
       // Derive from durable work as well, so a restarted process still gates
       // "继续" when an earlier send is waiting for a new inbound message.
-      waitingForInbound: this.waitingForInbound.has(userId) || pendingTextCount > 0,
+      waitingForInbound: (this.waitingForInbound.has(userId) || pendingTextCount > 0)
+        && pendingTextCount > 0,
       pendingTextCount,
     };
   }
@@ -628,7 +634,9 @@ export class ILinkClient {
   }
 
   private async drainOutboxNow(userId: string, streamType: SendStreamType): Promise<SendResult[]> {
-    const items = this.outbox.listPending(userId, this.accountId);
+    let items = this.outbox.listPending(userId, this.accountId);
+    this.cleanupOrphanedRecoveryNotices(items);
+    items = this.outbox.listPending(userId, this.accountId);
     const token = this.contextTokens.get(userId);
     if (!token) {
       if (items.length > 0) {
@@ -842,6 +850,29 @@ export class ILinkClient {
       if (!hasPermanentFailure) this.deliveryStates.set(userId, 'READY');
     }
     return results;
+  }
+
+  private isRecoveryNotice(item: OutboxTextItem): boolean {
+    return item.priority === 'control'
+      && (item.itemId.startsWith('token-budget-notice:')
+        || item.itemId.startsWith('delivery-notice:'));
+  }
+
+  private cleanupOrphanedRecoveryNotices(items: OutboxTextItem[]): void {
+    const payloadItems = items.filter((item) => !this.isRecoveryNotice(item));
+    for (const item of items) {
+      if (!this.isRecoveryNotice(item)) continue;
+
+      if (item.itemId.startsWith('delivery-notice:')) {
+        const targetId = item.itemId.slice('delivery-notice:'.length);
+        if (!this.outbox.get(targetId)) this.outbox.ack(item.itemId);
+        continue;
+      }
+
+      // A token-budget notice has no single target. It is valid only while
+      // there is durable non-notice output waiting behind it.
+      if (payloadItems.length === 0) this.outbox.ack(item.itemId);
+    }
   }
 
   private async sendRecoveryNotice(userId: string, triggerItem: OutboxTextItem): Promise<SendResult | undefined> {
@@ -1112,7 +1143,10 @@ export class ILinkClient {
       const response = {
         ret: data.ret,
         errcode: data.errcode,
-        errmsg: data.errmsg,
+        errmsg: data.errmsg
+          ?? (data.ret === undefined && data.message_id === undefined
+            ? UNCONFIRMED_SEND_RESPONSE
+            : undefined),
         messageId: data.message_id,
         httpStatus: res.status,
       };
