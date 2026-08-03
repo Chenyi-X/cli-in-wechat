@@ -2,7 +2,7 @@ import { appendFileSync, mkdirSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { dirname } from 'node:path';
 
-export type DeliveryDiagnosticEvent = 'inbound' | 'request' | 'response' | 'error' | 'skipped';
+export type DeliveryDiagnosticEvent = 'inbound' | 'request' | 'response' | 'error' | 'skipped' | 'queued';
 
 export interface DeliveryDiagnosticResponse {
   ret?: number;

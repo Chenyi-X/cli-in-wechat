@@ -648,6 +648,9 @@ export class ILinkClient {
         this.waitingForInbound.add(userId);
         this.deliveryStates.set(userId, 'WAITING_INBOUND');
       }
+      for (const item of items) {
+        this.recordQueuedDiagnostic(item, { errmsg: '缺少 context_token' });
+      }
       return items.map((item) => this.resultForItem(item, 'waiting-for-token'));
     }
     if (items.length === 0) {
@@ -695,9 +698,11 @@ export class ILinkClient {
       if (needsRecovery) {
         const noticeResult = await this.sendRecoveryNotice(userId, item);
         if (noticeResult) results.push(noticeResult);
-        results.push(this.resultForItem(item, 'queued', {
+        const queueError = {
           errmsg: '最终结果已排队，等待新的 context_token',
-        }));
+        };
+        this.recordQueuedDiagnostic(item, queueError);
+        results.push(this.resultForItem(item, 'queued', queueError));
         this.quota.noteRateBackoff(userId, Date.now() + BASE_RATE_LIMIT_COOLDOWN_MS);
         this.deliveryStates.set(userId, 'WAITING_INBOUND');
         break;
@@ -708,9 +713,11 @@ export class ILinkClient {
         if (reservation.reason === 'intermediate-budget') {
           const noticeResult = await this.sendRecoveryNotice(userId, item);
           if (noticeResult) results.push(noticeResult);
-          results.push(this.resultForItem(item, 'queued', {
+          const queueError = {
             errmsg: '已达到本地中间消息预算，等待新的 context_token 后自动续发',
-          }));
+          };
+          this.recordQueuedDiagnostic(item, queueError);
+          results.push(this.resultForItem(item, 'queued', queueError));
           this.quota.noteRateBackoff(userId, Date.now() + BASE_RATE_LIMIT_COOLDOWN_MS);
           this.deliveryStates.set(userId, 'WAITING_INBOUND');
           break;
@@ -733,17 +740,21 @@ export class ILinkClient {
           } catch (noticeError) {
             log.error(`[send] 无法写入最终结果恢复提示: ${userId}`, noticeError);
           }
-          results.push(this.resultForItem(item, 'queued', {
+          const queueError = {
             errmsg: '当前 token 的最终发送预算已用尽，等待新的 context_token',
-          }));
+          };
+          this.recordQueuedDiagnostic(item, queueError);
+          results.push(this.resultForItem(item, 'queued', queueError));
           break;
         }
         if (reservation.reason === 'final-reserved' || reservation.reason === 'budget-exhausted') {
           const noticeResult = await this.sendRecoveryNotice(userId, item);
           if (noticeResult) results.push(noticeResult);
-          results.push(this.resultForItem(item, 'queued', {
+          const queueError = {
             errmsg: `本地发送预算暂时不足: ${reservation.reason}，等待新的 context_token 后自动续发`,
-          }));
+          };
+          this.recordQueuedDiagnostic(item, queueError);
+          results.push(this.resultForItem(item, 'queued', queueError));
           this.quota.noteRateBackoff(userId, Date.now() + BASE_RATE_LIMIT_COOLDOWN_MS);
           this.deliveryStates.set(userId, 'WAITING_INBOUND');
           break;
@@ -763,7 +774,9 @@ export class ILinkClient {
         : streamType)) {
         this.quota.release(reservation.reservation.reservationId);
         this.deliveryStates.set(userId, 'RATE_BACKOFF');
-        results.push(this.resultForItem(item, 'rate-limited', { ret: -2, errmsg: '发送冷却中，等待新的入站消息' }));
+        const queueError = { ret: -2, errmsg: '发送冷却中，等待新的入站消息' };
+        this.recordQueuedDiagnostic(item, queueError);
+        results.push(this.resultForItem(item, 'rate-limited', queueError));
         break;
       }
 
@@ -833,6 +846,9 @@ export class ILinkClient {
           this.outbox.markPermanentFailure(item.itemId, details);
           this.enqueueVisibleFailureNotice(item, details);
           this.deliveryStates.set(userId, 'PERMANENT_FAILURE');
+        }
+        if (failure?.ambiguous || this.isUnconfirmedResponse(details)) {
+          this.recordQueuedDiagnostic(item, details);
         }
         results.push(this.resultForItem(
           item,
@@ -1024,6 +1040,27 @@ export class ILinkClient {
     } catch (err) {
       log.warn('[send] 持久化发送诊断失败:', err);
     }
+  }
+
+  private recordQueuedDiagnostic(
+    item: Pick<OutboxTextItem, 'itemId' | 'clientId' | 'sequence' | 'userId' | 'generation' | 'tokenVersion' | 'priority' | 'bytes'>,
+    error: ApiErrorDetails,
+  ): void {
+    this.recordDiagnostic({
+      event: 'queued',
+      accountId: this.accountId,
+      userId: item.userId,
+      contextToken: this.contextTokens.get(item.userId),
+      clientId: item.clientId,
+      itemId: item.itemId,
+      itemSequence: item.sequence,
+      bubbleSequence: item.sequence,
+      generation: item.generation,
+      tokenVersion: item.tokenVersion,
+      priority: item.priority,
+      utf8Bytes: item.bytes,
+      response: error,
+    });
   }
 
   private noteRateLimit(userId: string): void {

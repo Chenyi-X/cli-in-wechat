@@ -312,9 +312,10 @@ test('sendmessage diagnostics survive process log rotation and preserve response
         .trim()
         .split('\n')
         .map((line) => JSON.parse(line) as Record<string, unknown>);
-      assert.equal(records.length, 2);
+      assert.equal(records.length, 3);
       assert.equal(records[0]?.event, 'request');
       assert.equal(records[1]?.event, 'response');
+      assert.equal(records[2]?.event, 'queued');
       assert.deepEqual(records[1]?.response, {
         ret: -2,
         errcode: 17,
@@ -919,6 +920,43 @@ test('a new inbound drains a guarded final result when the token string is uncha
       globalThis.fetch = originalFetch;
     }
   });
+});
+
+test('durable queue decisions persist structured diagnostics', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wxclient-queued-diagnostics-'));
+  const outbox = new OutboxStore(join(dir, 'outbox.json'));
+  const quota = new QuotaManager(join(dir, 'quota.json'), 'account-a');
+  const diagnosticsPath = join(dir, 'delivery.jsonl');
+  const diagnostics = new DeliveryDiagnostics(diagnosticsPath, () => 1_700_000_000_000);
+  const client = new ILinkClient(credentials, { outbox, quota, diagnostics });
+  quota.recordInbound('user-a', 'message-1', 'context-a');
+  (client as any).contextTokens.set('user-a', 'context-a');
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({ ret: 0, message_id: 1 }), { status: 200 });
+  try {
+    for (let i = 0; i < 9; i++) {
+      await client.sendText('user-a', `中间块 ${i + 1}`, {
+        streamType: 'intermediate',
+        priority: 'intermediate',
+      });
+    }
+    await client.sendText('user-a', '需要记录排队原因的最终结果', { priority: 'final' });
+
+    const records = readFileSync(diagnosticsPath, 'utf8')
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line) as Record<string, any>);
+    const queued = records.find((record) => record.event === 'queued' && record.priority === 'final');
+    assert.ok(queued, 'the durable queue decision must be observable');
+    assert.equal(queued.generation, 1);
+    assert.equal(queued.tokenVersion, 1);
+    assert.equal(typeof queued.itemId, 'string');
+    assert.match(queued.response.errmsg, /排队|预算/);
+  } finally {
+    globalThis.fetch = originalFetch;
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('ret=-2 keeps intermediate backlog and the final result durable', async () => {
