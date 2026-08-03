@@ -302,7 +302,7 @@ test('sendmessage diagnostics survive process log rotation and preserve response
 
     const originalFetch = globalThis.fetch;
     globalThis.fetch = async () => new Response(
-      JSON.stringify({ ret: -2, errcode: 17, errmsg: 'prepare failed' }),
+      JSON.stringify({ ret: -2, errcode: 17, errmsg: 'prepare failed', message_id: 12345 }),
       { status: 200 },
     );
     try {
@@ -315,7 +315,13 @@ test('sendmessage diagnostics survive process log rotation and preserve response
       assert.equal(records.length, 2);
       assert.equal(records[0]?.event, 'request');
       assert.equal(records[1]?.event, 'response');
-      assert.deepEqual(records[1]?.response, { ret: -2, errcode: 17, errmsg: 'prepare failed', httpStatus: 200 });
+      assert.deepEqual(records[1]?.response, {
+        ret: -2,
+        errcode: 17,
+        errmsg: 'prepare failed',
+        messageId: 12345,
+        httpStatus: 200,
+      });
       assert.equal(JSON.stringify(records).includes('诊断正文不应落盘'), false);
     } finally {
       globalThis.fetch = originalFetch;
@@ -437,6 +443,58 @@ test('protects the final queue with a visible recovery notice before the token b
     assert.match(payloads[2].msg.item_list[0].text_item.text, /回复任意消息刷新 context_token/);
     assert.deepEqual(outbox.listPending('user-a').map((item) => item.text), ['第三块']);
     assert.equal(client.getDeliveryState('user-a').state, 'WAITING_INBOUND');
+  } finally {
+    globalThis.fetch = originalFetch;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('recovery notice reports the remaining durable backlog after an inbound drain', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wxclient-recovery-count-'));
+  const outbox = new OutboxStore(join(dir, 'outbox.json'));
+  const quota = new QuotaManager(join(dir, 'quota.json'), 'account-a', {
+    maxItemsPerToken: 3,
+    maxIntermediateItemsPerToken: 3,
+    finalReserveItemsPerToken: 1,
+  });
+  const client = new ILinkClient(credentials, { outbox, quota });
+  quota.recordInbound('user-a', 'message-1', 'context-a');
+  (client as any).contextTokens.set('user-a', 'context-a');
+  for (let i = 0; i < 5; i++) {
+    outbox.enqueueText({
+      accountId: 'account-a',
+      userId: 'user-a',
+      generation: 1,
+      tokenVersion: 1,
+      priority: 'intermediate',
+      text: `积压中间块 ${i + 1}`,
+    });
+  }
+
+  const originalFetch = globalThis.fetch;
+  const payloads: Array<Record<string, any>> = [];
+  globalThis.fetch = async (_input, init) => {
+    payloads.push(JSON.parse(String(init?.body)));
+    return new Response(JSON.stringify({ message_id: payloads.length }), { status: 200 });
+  };
+  try {
+    await (client as any).processMessage({
+      message_id: 2,
+      from_user_id: 'user-a',
+      to_user_id: 'bot-user',
+      client_id: 'inbound-client-2',
+      create_time_ms: Date.now(),
+      message_type: 1,
+      message_state: 0,
+      context_token: 'context-b',
+      item_list: [{ type: 1, text_item: { text: '0' } }],
+    });
+
+    const notice = payloads.find((payload) =>
+      String(payload.msg.item_list[0].text_item.text).includes('回复任意消息'));
+    assert.ok(notice, JSON.stringify(payloads));
+    assert.match(String(notice.msg.item_list[0].text_item.text), /仍有 3 条积压消息/);
+    assert.equal(outbox.listPending('user-a').length, 3);
   } finally {
     globalThis.fetch = originalFetch;
     rmSync(dir, { recursive: true, force: true });

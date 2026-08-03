@@ -8,6 +8,7 @@ export interface DeliveryDiagnosticResponse {
   ret?: number;
   errcode?: number;
   errmsg?: string;
+  messageId?: number;
   httpStatus?: number;
 }
 

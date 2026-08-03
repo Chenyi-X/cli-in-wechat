@@ -26,7 +26,8 @@ const CDN_BASE_URL = 'https://novac2c.cdn.weixin.qq.com/c2c';
 const BASE_RATE_LIMIT_COOLDOWN_MS = 150_000; // ~2.5 minutes
 const MAX_RATE_LIMIT_COOLDOWN_MS = 420_000; // ~7 minutes
 const LEGACY_MISSING_RET_ERROR = 'sendmessage response did not confirm ret=0';
-const RECOVERY_NOTICE_TEXT = '发送预算保护：已达到当前 context_token 的安全发送边界，后续消息已排队。请回复任意消息刷新 context_token，系统会自动续发。';
+const RECOVERY_NOTICE_TEXT = (pendingCount: number): string =>
+  `发送预算保护：已达到当前 context_token 的安全发送边界，本轮仍有 ${pendingCount} 条积压消息，请回复任意消息刷新 context_token，系统会自动续发。`;
 
 // Upload media types
 const UPLOAD_MEDIA_TYPE_IMAGE = 1;
@@ -835,6 +836,9 @@ export class ILinkClient {
     let notice = this.outbox.get(noticeId);
     if (!notice) {
       if (!this.quota.claimTokenBudgetNotice(userId)) return undefined;
+      const pendingCount = this.outbox.listPending(userId, this.accountId)
+        .filter((item) => item.itemId !== noticeId)
+        .length;
       try {
         notice = this.outbox.enqueueText({
           itemId: noticeId,
@@ -843,7 +847,7 @@ export class ILinkClient {
           generation: triggerItem.generation,
           tokenVersion: triggerItem.tokenVersion,
           priority: 'control',
-          text: RECOVERY_NOTICE_TEXT,
+          text: RECOVERY_NOTICE_TEXT(pendingCount),
         });
       } catch (err) {
         log.error(`[send] 无法写入恢复提示: ${userId}`, err);
@@ -1091,6 +1095,7 @@ export class ILinkClient {
         ret: data.ret,
         errcode: data.errcode,
         errmsg: data.errmsg,
+        messageId: data.message_id,
         httpStatus: res.status,
       };
       this.recordDiagnostic({ ...diagnosticBase, event: 'response', response });

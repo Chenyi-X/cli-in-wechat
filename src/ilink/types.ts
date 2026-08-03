@@ -113,6 +113,7 @@ export interface SendMessageResponse {
   ret: number;
   errcode: number;
   errmsg: string;
+  message_id?: number;
 }
 
 export interface GetConfigResponse {
