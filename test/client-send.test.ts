@@ -1124,6 +1124,30 @@ test('a restarted client requeues legacy missing-ret send failures', async () =>
   });
 });
 
+test('a restarted client requeues legacy ret=-2 send failures for inbound recovery', async () => {
+  await withStores(async (outbox, quota) => {
+    const item = outbox.enqueueText({
+      accountId: 'account-a',
+      userId: 'user-a',
+      generation: 1,
+      tokenVersion: 1,
+      priority: 'final',
+      text: '旧版本 ret=-2 后仍要恢复的最终结果',
+    });
+    outbox.markPermanentFailure(item.itemId, {
+      ret: -2,
+      errcode: 17,
+      errmsg: 'prepare failed',
+    });
+
+    const restarted = new ILinkClient(credentials, { outbox, quota });
+
+    assert.equal(outbox.get(item.itemId)?.state, 'pending');
+    assert.equal(outbox.get(item.itemId)?.clientId, item.clientId);
+    assert.equal(restarted.getDeliveryState('user-a').pendingTextCount, 1);
+  });
+});
+
 test('sendImage reserves caption and image as one media request', async () => {
   await withStores(async (outbox, quota) => {
     const dir = mkdtempSync(join(tmpdir(), 'wxmedia-'));

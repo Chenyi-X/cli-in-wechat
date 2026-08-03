@@ -131,6 +131,12 @@ export class ILinkClient {
     if (recovered > 0) {
       log.warn(`[send] 已恢复 ${recovered} 个旧版误判的未确认发送项，将使用原 client_id 续发`);
     }
+    const recoveredAmbiguous = this.outbox.requeuePermanentFailures((item) =>
+      item.accountId === this.accountId
+      && item.terminalError?.ret === -2);
+    if (recoveredAmbiguous > 0) {
+      log.warn(`[send] 已恢复 ${recoveredAmbiguous} 个旧版 ret=-2 发送项，等待入站后使用原 client_id 续发`);
+    }
     const localBudgetRecoveryCandidates = this.outbox.list().filter((item) => {
       if (item.accountId !== this.accountId || !this.isLocalBudgetFailure(item)) return false;
       const snapshot = this.quota.snapshot(item.userId);
