@@ -120,6 +120,16 @@ function emptyState(accountId: string, userId: string): UserQuotaState {
   };
 }
 
+function normalizeMaxItemsPerWindow(limits: Partial<QuotaLimits>): number {
+  const configured = limits.maxItemsPerWindow
+    ?? limits.maxItemsPerToken
+    ?? limits.maxItems
+    ?? DEFAULT_QUOTA_LIMITS.maxItemsPerWindow;
+  return typeof configured === 'number' && Number.isFinite(configured)
+    ? Math.max(1, Math.floor(configured))
+    : DEFAULT_QUOTA_LIMITS.maxItemsPerWindow;
+}
+
 export class QuotaManager {
   private readonly users = new Map<string, UserQuotaState>();
   private readonly foreignUsers = new Map<string, UserQuotaState>();
@@ -133,12 +143,7 @@ export class QuotaManager {
     this.limits = {
       ...DEFAULT_QUOTA_LIMITS,
       ...limits,
-      maxItemsPerWindow: Math.max(1, Math.floor(
-        limits.maxItemsPerWindow
-          ?? limits.maxItemsPerToken
-          ?? limits.maxItems
-          ?? DEFAULT_QUOTA_LIMITS.maxItemsPerWindow,
-      )),
+      maxItemsPerWindow: normalizeMaxItemsPerWindow(limits),
       maxBytes: Math.max(1, Math.floor(limits.maxBytes ?? DEFAULT_QUOTA_LIMITS.maxBytes!)),
       finalReserveItems: Math.max(0, Math.floor(limits.finalReserveItems ?? DEFAULT_QUOTA_LIMITS.finalReserveItems!)),
       finalReserveBytes: Math.max(0, Math.floor(limits.finalReserveBytes ?? DEFAULT_QUOTA_LIMITS.finalReserveBytes!)),
@@ -148,6 +153,10 @@ export class QuotaManager {
     };
     mkdirSync(dirname(filePath), { recursive: true });
     this.load();
+  }
+
+  getMaxItemsPerWindow(): number {
+    return this.limits.maxItemsPerWindow;
   }
 
   recordInbound(userId: string, messageId: string | number, contextToken: string): InboundResult {

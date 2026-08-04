@@ -28,6 +28,29 @@ test('opens a ten-item window only for a fresh inbound and counts confirmed send
   assert.equal(quota.remaining('user-a'), 8);
 });
 
+test('normalizes finite delivery window limits by flooring and clamping to one', () => {
+  for (const [configured, expected] of [[3.5, 3], [0, 1], [-1, 1]] as const) {
+    const quota = new QuotaManager(tempPath(), 'account-a', { maxItemsPerWindow: configured });
+    assert.equal(quota.snapshot('user-a').maxItemsPerWindow, expected);
+  }
+});
+
+test('falls back to the default delivery window for non-finite limits', () => {
+  for (const configured of [Number.NaN, Number.POSITIVE_INFINITY]) {
+    const quota = new QuotaManager(tempPath(), 'account-a', { maxItemsPerWindow: configured });
+    assert.equal(quota.snapshot('user-a').maxItemsPerWindow, 10);
+  }
+});
+
+test('exposes the effective delivery window without creating user state', () => {
+  const quota = new QuotaManager(tempPath(), 'account-a', { maxItemsPerWindow: 3.5 });
+
+  assert.equal((quota as any).users.size, 0);
+  assert.equal(quota.getMaxItemsPerWindow(), 3);
+  assert.equal((quota as any).users.size, 0);
+  assert.equal(quota.snapshot('user-a').maxItemsPerWindow, quota.getMaxItemsPerWindow());
+});
+
 test('a real inbound opens the next window while a poll replay does not', () => {
   const quota = new QuotaManager(tempPath(), 'account-a');
   quota.recordInbound('user-a', 1, 'token-1');

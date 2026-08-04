@@ -16,7 +16,7 @@ import type {
 import { chunkUtf8Text } from './text-chunk.js';
 import { planDeliveryWindow, type DeliveryItem } from './delivery-planner.js';
 import { OutboxStore, type OutboxItem } from './outbox.js';
-import { DEFAULT_QUOTA_LIMITS, QuotaManager } from './quota.js';
+import { QuotaManager } from './quota.js';
 import { classifyApiFailure, type ApiErrorDetails, type SendResult } from './send-result.js';
 import { DeliveryDiagnostics } from './diagnostics.js';
 
@@ -126,13 +126,13 @@ export class ILinkClient {
     this.pollCursor = loadPollCursor();
     this.contextTokensPath = options.contextTokensPath || join(DATA_DIR, 'context_tokens.json');
     this.contextTokens = loadContextTokensAt(this.contextTokensPath);
-    const maxItemsPerWindow = options.maxItemsPerWindow ?? DEFAULT_QUOTA_LIMITS.maxItemsPerWindow;
+    this.quota = options.quota || new QuotaManager(options.quotaPath || join(DATA_DIR, 'quota.json'), this.accountId, {
+      maxItemsPerWindow: options.maxItemsPerWindow,
+    });
+    const maxItemsPerWindow = this.quota.getMaxItemsPerWindow();
     this.outbox = options.outbox || new OutboxStore(options.outboxPath || join(DATA_DIR, 'outbox.json'), {
       bodyChunkBytes: BODY_CHUNK_BYTES,
       inboundItemLimit: maxItemsPerWindow,
-    });
-    this.quota = options.quota || new QuotaManager(options.quotaPath || join(DATA_DIR, 'quota.json'), this.accountId, {
-      maxItemsPerWindow,
     });
     this.diagnostics = options.diagnostics || new DeliveryDiagnostics(options.diagnosticsPath || join(DATA_DIR, 'delivery-diagnostics.jsonl'));
   }

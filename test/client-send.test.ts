@@ -7,8 +7,13 @@ import { join } from 'node:path';
 import { ILinkClient } from '../src/ilink/client.js';
 import { OutboxStore } from '../src/ilink/outbox.js';
 import { QuotaManager } from '../src/ilink/quota.js';
+import { chunkUtf8Text } from '../src/ilink/text-chunk.js';
 import type { Credentials, WeixinMessage } from '../src/ilink/types.js';
-import { schemaTwoFailureFixture } from './fixtures/legacy-full-chunk.js';
+import {
+  legacyFullChunkText,
+  MIGRATED_BODY_BYTES,
+  schemaTwoFailureFixture,
+} from './fixtures/legacy-full-chunk.js';
 
 const CREDS: Credentials = {
   botToken: 'token',
@@ -100,6 +105,9 @@ test('migrates the live schema-two failure shape before the first recovery windo
 
     assert.equal(requests.length, 10);
     const bodies = requests.map((request) => request.body.msg.item_list[0].text_item.text as string);
+    const expectedBodies = chunkUtf8Text(legacyFullChunkText, MIGRATED_BODY_BYTES).slice(0, 10);
+    expectedBodies[9] += '\n\n后续内容已排队，请回复“继续”续发。';
+    assert.deepEqual(bodies, expectedBodies);
     assert.ok(bodies.every((body) => Buffer.byteLength(body, 'utf8') <= 2_000));
     assert.ok(bodies[9].endsWith('\n\n后续内容已排队，请回复“继续”续发。'));
     assert.ok(!bodies.includes('后续内容已排队，请回复“继续”续发。'));
@@ -112,6 +120,25 @@ test('migrates the live schema-two failure shape before the first recovery windo
       'new-confirmation',
     ]);
     assert.equal(pending.at(-1)?.text, '新会话');
+  });
+});
+
+test('uses an injected quota window when migrating the default outbox', async () => {
+  const options = paths();
+  const snapshot = schemaTwoFailureFixture();
+  snapshot.items = snapshot.items.slice(0, 8);
+  snapshot.nextSequence = 9;
+  writeFileSync(options.outboxPath, JSON.stringify(snapshot), 'utf8');
+  const quota = new QuotaManager(options.quotaPath, 'account-a', { maxItemsPerWindow: 5 });
+  const client = new ILinkClient(CREDS, { ...options, quota });
+
+  await withFetchResponses(Array.from({ length: 5 }, () => ({ ret: 0 })), async (requests) => {
+    await (client as any).processMessage(message(51, 'user-a', 'fresh-token', '继续'));
+
+    assert.equal(requests.length, 5);
+    const bodies = requests.map((request) => request.body.msg.item_list[0].text_item.text as string);
+    assert.ok(bodies.every((body) => Buffer.byteLength(body, 'utf8') <= 2_000));
+    assert.ok(bodies[4].endsWith('\n\n后续内容已排队，请回复“继续”续发。'));
   });
 });
 
