@@ -29,8 +29,8 @@ Latest automated run at `f276b4c7850bc610e093197293e6f6be4270f90d`:
 
 ## Real-Device Gate
 
-Status: fixed V2 poller PID 18628 active; preserved backlog migrated; exact
-`继续` recovery and real-device UI runs remain 0/20.
+Status: fixed V2 poller PID 18628 active; preserved-backlog recovery passed on
+the real device; the separate 20-run UI matrix remains 0/20.
 
 Preflight candidate: `174c37e02bc701a7366125c2dbe63cf1e418b764`.
 Evidence directory: `C:\tmp\cli-in-wechat-v2-device-20260804-142952`.
@@ -86,10 +86,13 @@ Inbound message `7490380332727047000` (`你好`, generation 53) then reached the
 Claude adapter normally and produced one intermediate and one final confirmed
 delivery. The two exact `继续` messages did not invoke the adapter, and no old
 `/new` prompt was replayed. Post-recovery state, diagnostics, PID, cursor, quota,
-and logs are preserved under `wx-ai-bridge-post-preserved-recovery`. API and
-durable-state recovery are verified; visible bubble count, attached suffix,
-duplicates, and standalone-notice absence still require device observation and
-are not yet counted toward the 20-run UI gate.
+and logs are preserved under `wx-ai-bridge-post-preserved-recovery`. The user
+confirmed 10 old body bubbles in the first window, the attached continuation at
+the end of the tenth, the remaining 3 old body bubbles in the second window,
+zero duplicate bubbles, zero standalone continuation bubbles, and a normally
+visible `你好` response. Preserved-backlog recovery therefore passes API,
+durability, and real-device UI observation. It remains separate from the 20-run
+matrix.
 
 The initial `old-process.txt` capture serialized PowerShell formatting records
 instead of process fields. The runbook now writes structured JSON, the still-live
@@ -114,6 +117,7 @@ the recovery protocol, not the visible WeChat bubble.
 
 | Run | Planned mode/profile | Actual chunks | Restart point | Complete | Duplicates | Continuation attached | Separate notice | Byte range | Device evidence | Notes |
 | --- | --- | ---: | --- | --- | ---: | --- | ---: | --- | --- | --- |
+| Preserved recovery | historical / >10 | 13 final (`10 + 3`) | fixed cutover before first `继续` | yes | 0 | yes, first window item 10 | 0 | 817-2000 | user-confirmed; `wx-ai-bridge-post-preserved-recovery` | Recovery gate passed; not counted in runs 1-20. |
 | Canary | isolated API | 1 | ambiguity then retry | API only | 0 known | n/a | not observed | not UI measured | none | UI not independently observed. |
 | 1 | compact / L | pending | none | pending | pending | pending | pending | pending | pending | |
 | 2 | compact / L | pending | none | pending | pending | pending | pending | pending | pending | |
