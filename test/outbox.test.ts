@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -262,6 +262,165 @@ test('normalizes an already-wrapped schema-two failure snapshot once', () => {
   const reloaded = new OutboxStore(filePath, migrationOptions());
   assert.equal(readFileSync(filePath, 'utf8'), primaryBeforeReload);
   assert.deepEqual(reloaded.listPending('user-a', 'account-a'), pending);
+});
+
+test('rejects incomplete or invalid migration configuration', () => {
+  assert.throws(
+    () => new OutboxStore(tempPath(), { bodyChunkBytes: 0, inboundItemLimit: 10 }),
+    OutboxMigrationError,
+  );
+  assert.throws(
+    () => new OutboxStore(tempPath(), { bodyChunkBytes: MIGRATED_BODY_BYTES }),
+    OutboxMigrationError,
+  );
+});
+
+test('does not publish an unrepresentable UTF-8 rechunk migration', () => {
+  const filePath = tempPath();
+  const fixture = schemaTwoFailureFixture();
+  fixture.items = fixture.items.slice(0, 11);
+  fixture.nextSequence = 12;
+  fixture.items[0].text = '汉';
+  fixture.items[0].bytes = Buffer.byteLength('汉', 'utf8');
+  for (let index = 1; index < fixture.items.length; index += 1) {
+    fixture.items[index].text = String.fromCharCode(65 + index);
+    fixture.items[index].bytes = 1;
+  }
+  const before = JSON.stringify(fixture, null, 2);
+  writeFileSync(filePath, before);
+
+  assert.throws(
+    () => new OutboxStore(filePath, { bodyChunkBytes: 1, inboundItemLimit: 10 }),
+    (error: unknown) => {
+      assert.ok(error instanceof OutboxMigrationError);
+      assert.match(error.message, /UTF-8 rechunk invariant failed|normalization could not preserve text/i);
+      return true;
+    },
+  );
+  assert.equal(readFileSync(filePath, 'utf8'), before);
+  assert.equal(existsSync(`${filePath}.bak`), false);
+});
+
+test('does not migrate schema-two batches outside the strict eligibility boundary', async (t) => {
+  for (const { name, pretty, mutate } of [
+  {
+    name: 'all compliant bodies',
+    pretty: true,
+    mutate: (fixture: ReturnType<typeof schemaTwoFailureFixture>) => {
+      fixture.items.slice(0, 13).forEach((item, index) => {
+        const text = String.fromCharCode(65 + index).repeat(MIGRATED_BODY_BYTES);
+        item.text = text;
+        item.bytes = Buffer.byteLength(text, 'utf8');
+      });
+    },
+  },
+  {
+    name: 'multiple inbound-sized generations',
+    pretty: false,
+    mutate: (fixture: ReturnType<typeof schemaTwoFailureFixture>) => {
+      fixture.items.slice(6, 13).forEach((item) => { item.generation = 43; });
+    },
+  },
+  {
+    name: 'an intermediate-priority member',
+    pretty: true,
+    mutate: (fixture: ReturnType<typeof schemaTwoFailureFixture>) => {
+      fixture.items[6].priority = 'intermediate';
+    },
+  },
+  {
+    name: 'a permanent-failure member',
+    pretty: false,
+    mutate: (fixture: ReturnType<typeof schemaTwoFailureFixture>) => {
+      fixture.items[6].state = 'permanent-failure';
+    },
+  },
+  {
+    name: 'a member with a delivery receipt',
+    pretty: true,
+    mutate: (fixture: ReturnType<typeof schemaTwoFailureFixture>) => {
+      fixture.items[6].deliveryReceipt = { reservationId: 'reservation-1', quotaGeneration: 42 };
+    },
+  },
+  {
+    name: 'a recovery-required member',
+    pretty: false,
+    mutate: (fixture: ReturnType<typeof schemaTwoFailureFixture>) => {
+      fixture.items[6].recoveryRequired = true;
+    },
+  },
+  {
+    name: 'a continuation-notice member',
+    pretty: true,
+    mutate: (fixture: ReturnType<typeof schemaTwoFailureFixture>) => {
+      fixture.items[6].continuationNoticeAttached = true;
+    },
+  },
+  ]) {
+    await t.test(name, () => {
+      const filePath = tempPath();
+      const fixture = schemaTwoFailureFixture();
+      mutate(fixture);
+      const before = pretty ? JSON.stringify(fixture, null, 2) : JSON.stringify(fixture);
+      writeFileSync(filePath, before);
+
+      new OutboxStore(filePath, migrationOptions());
+
+      assert.equal(readFileSync(filePath, 'utf8'), before);
+      assert.equal(existsSync(`${filePath}.bak`), false);
+    });
+  }
+});
+
+test('preserves positional item identities while expanding and contracting a migration batch', async (t) => {
+  await t.test('expansion retains existing identities and persists the appended identity', () => {
+    const filePath = tempPath();
+    const fixture = schemaTwoFailureFixture();
+    fixture.items = fixture.items.slice(0, 11);
+    fixture.nextSequence = 12;
+    const originalIds = fixture.items.map((item) => String(item.itemId));
+    assert.equal(
+      fixture.items.reduce((total, item) => total + Number(item.bytes), 0),
+      22_000,
+    );
+    writeFileSync(filePath, JSON.stringify(fixture));
+
+    const migrated = new OutboxStore(filePath, migrationOptions())
+      .listPending('user-a', 'account-a');
+    assert.equal(migrated.length, 12);
+    assert.deepEqual(migrated.slice(0, 11).map((item) => item.itemId), originalIds);
+    const appendedId = migrated[11].itemId;
+    assert.equal(originalIds.includes(appendedId), false);
+
+    const reloaded = new OutboxStore(filePath, migrationOptions())
+      .listPending('user-a', 'account-a');
+    assert.equal(reloaded[11].itemId, appendedId);
+  });
+
+  await t.test('contraction retains only used identities and preserves the following batch', () => {
+    const filePath = tempPath();
+    const fixture = schemaTwoFailureFixture();
+    fixture.items = [...fixture.items.slice(0, 11), fixture.items[13]];
+    fixture.items[0].text = 'A'.repeat(2_000);
+    fixture.items[0].bytes = 2_000;
+    for (let index = 1; index < 11; index += 1) {
+      const text = String(index);
+      fixture.items[index].text = text;
+      fixture.items[index].bytes = Buffer.byteLength(text, 'utf8');
+    }
+    const originalText = fixture.items.slice(0, 11).map((item) => String(item.text)).join('');
+    writeFileSync(filePath, JSON.stringify(fixture));
+
+    const migrated = new OutboxStore(filePath, migrationOptions())
+      .listPending('user-a', 'account-a');
+    assert.deepEqual(migrated.map((item) => item.itemId), [
+      'legacy-1',
+      'legacy-2',
+      'new-confirmation',
+    ]);
+    assert.equal(migrated.slice(0, 2).map((item) => item.text).join(''), originalText);
+    assertSafePersistedSequences(filePath);
+  });
 });
 
 test('sanitizes unsafe migration sequences without losing snapshot FIFO order', () => {
