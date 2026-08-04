@@ -69,6 +69,28 @@ PID 18628 is the only poller, and the startup logs contain no migration,
 planner, corruption, or routing error. No recovery UI result has been counted
 yet.
 
+The preserved backlog was drained through two real inbound windows on PID
+18628. Inbound message `7490380087112850000` (`继续`, generation 51) planned 10
+items with 6 remaining. It made 10 unique generation-42 requests at
+`1944 x 9, 2000` bytes; all 10 returned `ret=0` and were acknowledged. The
+2000-byte tenth body is the 1944-byte frozen body plus the 56-byte attached
+continuation suffix. No standalone notice request was emitted. Inbound message
+`7490380207900346000` (`继续`, generation 52) planned the remaining 6 items and
+made 6 unique requests at `1944, 1943, 817, 9, 445, 9` bytes: three old finals
+and one item each from generations 49, 50, and 46. All returned `ret=0` and were
+acknowledged. Across both windows there were 16 requests, 16 unique item IDs,
+zero duplicate requests, and zero standalone notices; outbox primary and backup
+are now identical empty snapshots at revision 43.
+
+Inbound message `7490380332727047000` (`你好`, generation 53) then reached the
+Claude adapter normally and produced one intermediate and one final confirmed
+delivery. The two exact `继续` messages did not invoke the adapter, and no old
+`/new` prompt was replayed. Post-recovery state, diagnostics, PID, cursor, quota,
+and logs are preserved under `wx-ai-bridge-post-preserved-recovery`. API and
+durable-state recovery are verified; visible bubble count, attached suffix,
+duplicates, and standalone-notice absence still require device observation and
+are not yet counted toward the 20-run UI gate.
+
 The initial `old-process.txt` capture serialized PowerShell formatting records
 instead of process fields. The runbook now writes structured JSON, the still-live
 PID 2176 metadata was recaptured and matched all five selected fields, and the
