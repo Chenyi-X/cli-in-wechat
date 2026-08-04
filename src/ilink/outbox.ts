@@ -30,6 +30,7 @@ export interface OutboxItem {
   createdAt: number;
   expiresAt: number;
   state: OutboxState;
+  continuationNoticeAttached?: boolean;
   recoveryRequired?: boolean;
   terminalError?: OutboxError;
 }
@@ -190,6 +191,23 @@ export class OutboxStore {
     return true;
   }
 
+  freezeText(itemId: string, text: string, continuationNoticeAttached = false): OutboxItem | undefined {
+    const item = this.items.get(itemId);
+    if (!item || item.state !== 'pending') return undefined;
+    if (item.text === text && Boolean(item.continuationNoticeAttached) === continuationNoticeAttached) return item;
+    const nextItems = new Map(this.items);
+    const frozen = {
+      ...item,
+      text,
+      bytes: Buffer.byteLength(text, 'utf8'),
+      continuationNoticeAttached,
+    };
+    nextItems.set(itemId, frozen);
+    this.persistState(nextItems, this.nextSequence);
+    this.publish(nextItems, this.nextSequence);
+    return frozen;
+  }
+
   markPermanentFailure(itemId: string, error: OutboxError): boolean {
     const item = this.items.get(itemId);
     if (!item || item.state === 'permanent-failure') return false;
@@ -332,6 +350,7 @@ export class OutboxStore {
         createdAt,
         expiresAt: asFiniteNumber(value.expiresAt, createdAt + this.defaultTtlMs),
         state: value.state === 'permanent-failure' ? 'permanent-failure' : 'pending',
+        ...(value.continuationNoticeAttached ? { continuationNoticeAttached: true } : {}),
         ...(value.recoveryRequired ? { recoveryRequired: true } : {}),
         ...(value.terminalError ? { terminalError: value.terminalError } : {}),
       };

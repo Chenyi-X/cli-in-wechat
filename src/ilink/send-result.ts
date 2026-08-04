@@ -4,6 +4,7 @@ export type SendStatus =
   | 'waiting-for-token'
   | 'suppressed'
   | 'rate-limited'
+  | 'ambiguous'
   | 'permanent-failure';
 
 export interface ApiErrorDetails {
@@ -24,7 +25,7 @@ export interface SendResult {
 }
 
 export interface ClassifiedApiFailure {
-  status: 'rate-limited' | 'permanent-failure';
+  status: 'rate-limited' | 'ambiguous' | 'permanent-failure';
   ambiguous: boolean;
   error: ApiErrorDetails;
 }
@@ -32,9 +33,17 @@ export interface ClassifiedApiFailure {
 /** Classify an application response without inferring meaning from errmsg text. */
 export function classifyApiFailure(error: ApiErrorDetails): ClassifiedApiFailure | null {
   if (error.ret === undefined || error.ret === 0) return null;
+  if (error.ret === -2) {
+    const rateLimited = /rate\s*limited/i.test(error.errmsg || '');
+    return {
+      status: rateLimited ? 'rate-limited' : 'ambiguous',
+      ambiguous: true,
+      error,
+    };
+  }
   return {
-    status: error.ret === -2 ? 'rate-limited' : 'permanent-failure',
-    ambiguous: error.ret === -2,
+    status: 'permanent-failure',
+    ambiguous: false,
     error,
   };
 }

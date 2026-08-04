@@ -5,6 +5,7 @@ export interface DeliveryItem {
   text: string;
   priority: DeliveryPriority;
   bytes: number;
+  continuationNoticeAttached?: boolean;
 }
 
 export interface DeliveryWindow<T extends DeliveryItem = DeliveryItem> {
@@ -50,13 +51,14 @@ export function planDeliveryWindow<T extends DeliveryItem>(
 
   if (needsContinuation && selected.length > 0) {
     const last = selected[selected.length - 1];
+    if (last.continuationNoticeAttached) return { items: selected, remainingItems, needsContinuation };
     const suffix = `\n\n${options.continuationNotice}`;
     const text = `${last.text}${suffix}`;
     const bytes = Buffer.byteLength(text, 'utf8');
     if (options.maxBytes !== undefined && bytes > options.maxBytes) {
       throw new RangeError(`continuation notice exceeds maxBytes for ${last.itemId}`);
     }
-    selected[selected.length - 1] = { ...last, text, bytes };
+    selected[selected.length - 1] = { ...last, text, bytes, continuationNoticeAttached: true };
   }
 
   return { items: selected, remainingItems, needsContinuation };

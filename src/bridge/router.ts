@@ -1209,7 +1209,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
     let intermediateSendFailed = false;
 
     // Serialize intermediate sends in-order to avoid burst/concurrency.
-    let sendQueue: Promise<void> = Promise.resolve();
+    let sendQueue: Promise<unknown> = Promise.resolve();
     const enqueueIntermediateSend = (text: string): void => {
       if (!text.trim()) return;
       sendQueue = sendQueue
