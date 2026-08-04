@@ -45,7 +45,26 @@ the recovery protocol, not the visible WeChat bubble.
 - [ ] No independent continuation-notice `sendmessage` call.
 - [ ] Measured chunk sizes recorded; keep the 2000-byte threshold until 1800-4500-byte behavior is observed.
 
-| Run | Mode | Chunks | Restart point | Complete | Duplicates | Notes |
-| --- | --- | ---: | ---: | --- | ---: | --- |
-| Canary | isolated API | 1 | ambiguity then retry | API confirmed | 0 known | UI not independently observed. |
-| 1-20 | pending | - | - | - | - | Fill from the real-device log. |
+| Run | Planned mode/profile | Actual chunks | Restart point | Complete | Duplicates | Continuation attached | Separate notice | Byte range | Device evidence | Notes |
+| --- | --- | ---: | --- | --- | ---: | --- | ---: | --- | --- | --- |
+| Canary | isolated API | 1 | ambiguity then retry | API only | 0 known | n/a | not observed | not UI measured | none | UI not independently observed. |
+| 1 | compact / L | pending | none | pending | pending | pending | pending | pending | pending | |
+| 2 | compact / L | pending | none | pending | pending | pending | pending | pending | pending | |
+| 3 | compact / L | pending | none | pending | pending | pending | pending | pending | pending | |
+| 4 | compact / L | pending | none | pending | pending | pending | pending | pending | pending | |
+| 5 | compact / L | pending | none | pending | pending | pending | pending | pending | pending | |
+| 6 | compact / X (>10) | pending | none | pending | pending | pending | pending | pending | pending | |
+| 7 | compact / XX (>20) | pending | after first 10 | pending | pending | pending | pending | pending | pending | Controlled V2 restart before first `继续`. |
+| 8 | normal / L | pending | none | pending | pending | pending | pending | pending | pending | |
+| 9 | normal / L | pending | none | pending | pending | pending | pending | pending | pending | |
+| 10 | normal / L | pending | none | pending | pending | pending | pending | pending | pending | |
+| 11 | normal / L | pending | none | pending | pending | pending | pending | pending | pending | |
+| 12 | normal / L | pending | none | pending | pending | pending | pending | pending | pending | |
+| 13 | normal / X (>10) | pending | none | pending | pending | pending | pending | pending | pending | |
+| 14 | normal / X (>10) | pending | none | pending | pending | pending | pending | pending | pending | |
+| 15 | verbose / L | pending | none | pending | pending | pending | pending | pending | pending | |
+| 16 | verbose / L | pending | none | pending | pending | pending | pending | pending | pending | |
+| 17 | verbose / L | pending | none | pending | pending | pending | pending | pending | pending | |
+| 18 | verbose / L | pending | none | pending | pending | pending | pending | pending | pending | |
+| 19 | verbose / X (>10) | pending | none | pending | pending | pending | pending | pending | pending | |
+| 20 | verbose / XX (>20) | pending | none | pending | pending | pending | pending | pending | pending | |

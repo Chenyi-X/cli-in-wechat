@@ -210,15 +210,212 @@ git commit -m "test: cover durable delivery recovery and diagnostics"
 **Files:**
 - Modify: `docs/superpowers/experiments/2026-08-03-long-task-acceptance.md`
 
-- [ ] **Step 1: Run at least twenty long tasks**
+- [ ] **Step 1: Verify the committed V2 candidate without touching the live process**
 
-Run compact, normal, and verbose modes at least five times each, including responses over ten and twenty chunks and a process restart after the seventh or tenth confirmed send.
+Run from `C:\tmp\cli-in-wechat-quota-v2`:
 
-- [ ] **Step 2: Record the gate criteria**
+```powershell
+git status --short --branch
+git rev-parse HEAD
+npm run typecheck
+npm test
+npm run build
+```
 
-Record complete final visibility at 100%, zero duplicate bubbles, continuation text attached to the last body bubble of each window, zero independent notice sends, and measured 1800-4500 byte chunks before considering a threshold increase.
+Expected: branch `codex/quota-management-v2`, clean status, expected commit recorded in the acceptance log, 0 failed tests, and successful typecheck/build. Do not proceed if any command fails.
 
-- [ ] **Step 3: Run final verification**
+- [ ] **Step 2: Create an acceptance evidence directory and pre-stop snapshot**
 
-Run: `npm run typecheck`; `npm test`; `npm run build`; inspect `git diff --check` and the acceptance log before any completion claim.
+```powershell
+$acceptanceRoot = "C:\tmp\cli-in-wechat-v2-device-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+$liveData = 'C:\Users\35952\.wx-ai-bridge'
+New-Item -ItemType Directory -Path $acceptanceRoot | Out-Null
+Copy-Item -LiteralPath $liveData -Destination (Join-Path $acceptanceRoot 'wx-ai-bridge-pre-stop') -Recurse
+$acceptanceRoot | Set-Content -LiteralPath 'C:\tmp\cli-in-wechat-v2-active-acceptance.txt'
+git rev-parse HEAD | Set-Content -LiteralPath (Join-Path $acceptanceRoot 'candidate-commit.txt')
+Get-CimInstance Win32_Process -Filter "ProcessId = 2176" |
+  Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,CommandLine |
+  Format-List | Set-Content -LiteralPath (Join-Path $acceptanceRoot 'old-process.txt')
+$acceptanceRoot
+```
 
+Expected: a new uniquely named evidence directory containing the complete pre-stop runtime snapshot, candidate SHA, and PID 2176 metadata.
+
+- [ ] **Step 3: Obtain explicit approval, then stop the single old poller**
+
+Do not execute this step until the user explicitly authorizes stopping PID 2176.
+
+```powershell
+$acceptanceRoot = Get-Content -Raw -LiteralPath 'C:\tmp\cli-in-wechat-v2-active-acceptance.txt'
+$acceptanceRoot = $acceptanceRoot.Trim()
+$liveData = 'C:\Users\35952\.wx-ai-bridge'
+Stop-Process -Id 2176
+Wait-Process -Id 2176 -Timeout 15 -ErrorAction SilentlyContinue
+if (Get-Process -Id 2176 -ErrorAction SilentlyContinue) {
+  throw 'PID 2176 is still running; do not start V2'
+}
+Copy-Item -LiteralPath $liveData -Destination (Join-Path $acceptanceRoot 'wx-ai-bridge-post-stop') -Recurse
+```
+
+Expected: PID 2176 is absent and the authoritative post-stop runtime snapshot exists. Never run the next step while PID 2176 remains alive.
+
+- [ ] **Step 4: Start exactly one V2 poller and capture its PID and logs**
+
+```powershell
+$acceptanceRoot = Get-Content -Raw -LiteralPath 'C:\tmp\cli-in-wechat-v2-active-acceptance.txt'
+$acceptanceRoot = $acceptanceRoot.Trim()
+$stdoutPath = Join-Path $acceptanceRoot 'v2.stdout.log'
+$stderrPath = Join-Path $acceptanceRoot 'v2.stderr.log'
+$v2 = Start-Process -FilePath 'C:\Program Files\nodejs\node.exe' `
+  -ArgumentList 'dist/index.js','--debug' `
+  -WorkingDirectory 'C:\tmp\cli-in-wechat-quota-v2' `
+  -RedirectStandardOutput $stdoutPath `
+  -RedirectStandardError $stderrPath `
+  -WindowStyle Hidden `
+  -PassThru
+$v2.Id | Set-Content -LiteralPath (Join-Path $acceptanceRoot 'v2.pid')
+Start-Sleep -Seconds 3
+Get-Process -Id $v2.Id
+Get-Content -LiteralPath $stdoutPath,$stderrPath -Tail 80
+$pollers = @(Get-CimInstance Win32_Process | Where-Object {
+  $_.Name -eq 'node.exe' -and $_.CommandLine -match 'dist[/\\]index\.js.*--debug'
+})
+if ($pollers.Count -ne 1 -or $pollers[0].ProcessId -ne $v2.Id) {
+  throw "Expected only V2 PID $($v2.Id), found: $($pollers.ProcessId -join ', ')"
+}
+```
+
+Expected: one live Node process whose working build is `C:\tmp\cli-in-wechat-quota-v2\dist\index.js`, with no second bridge poller and no startup/migration error in either log.
+
+If V2 exits or reports a startup/migration error, stop the acceptance run and execute:
+
+```powershell
+$acceptanceRoot = Get-Content -Raw -LiteralPath 'C:\tmp\cli-in-wechat-v2-active-acceptance.txt'
+$acceptanceRoot = $acceptanceRoot.Trim()
+$v2PidPath = Join-Path $acceptanceRoot 'v2.pid'
+if (Test-Path -LiteralPath $v2PidPath) {
+  $failedV2Pid = [int](Get-Content -LiteralPath $v2PidPath)
+  if (Get-Process -Id $failedV2Pid -ErrorAction SilentlyContinue) {
+    Stop-Process -Id $failedV2Pid
+    Wait-Process -Id $failedV2Pid -Timeout 15 -ErrorAction SilentlyContinue
+  }
+}
+$failureSnapshot = Join-Path $acceptanceRoot 'wx-ai-bridge-v2-failure'
+Copy-Item -LiteralPath 'C:\Users\35952\.wx-ai-bridge' -Destination $failureSnapshot -Recurse
+$failureSnapshot
+```
+
+Then request user direction. Do not automatically restore either snapshot or restart the old dirty build: restoring an older cursor/outbox can replay or lose messages.
+
+- [ ] **Step 5: Use three deterministic long-output profiles**
+
+Send the following safe prompts from the real WeChat device. Do not allow tool use or file changes.
+
+`L` (target 4-9 chunks):
+
+```text
+@codex 不调用任何工具，不修改文件。只输出 6 个编号章节，每章约 500 个中文字符，主题是“可靠消息队列的设计检查项”。章节内容不得省略，不要使用表格，不要总结。
+```
+
+`X` (target >10 chunks):
+
+```text
+@codex 不调用任何工具，不修改文件。只输出 12 个编号章节，每章约 700 个中文字符，主题是“长消息交付系统的故障场景与验证方法”。章节内容不得省略，不要使用表格，不要总结。
+```
+
+`XX` (target >20 chunks):
+
+```text
+@codex 不调用任何工具，不修改文件。只输出 22 个编号章节，每章约 700 个中文字符，主题是“持久化消息系统从入站到确认的完整验收案例”。章节内容不得省略，不要使用表格，不要总结。
+```
+
+If the measured request count misses a target, repeat that run with more chapters; record the actual count rather than the requested count.
+
+- [ ] **Step 6: Execute the fixed 20-run distribution**
+
+Before each group, send `/msgmode <mode>` and verify the confirmation bubble names the requested mode. Use this matrix:
+
+| Runs | Mode | Profile | Required observation |
+| --- | --- | --- | --- |
+| 1-5 | compact | L | Complete final content; no duplicate bubbles |
+| 6 | compact | X | More than 10 chunks; attached continuation at the first boundary |
+| 7 | compact | XX | More than 20 chunks; controlled restart after the first 10 confirmed chunks |
+| 8-12 | normal | L | Complete streamed/final content; no post-final old activity |
+| 13-14 | normal | X | More than 10 chunks; attached continuation at every boundary |
+| 15-18 | verbose | L | Complete content; final result remains higher priority than activity |
+| 19 | verbose | X | More than 10 chunks; no duplicate visible bubbles |
+| 20 | verbose | XX | More than 20 chunks; attached continuation at every boundary |
+
+This gives compact 7, normal 7, and verbose 6 runs, satisfying the minimum of five per mode.
+
+- [ ] **Step 7: Perform the required in-delivery restart during run 7**
+
+For run 7, wait until the device visibly shows the first 10 body chunks and the attached continuation text. Before sending `继续`, stop only the V2 PID recorded in `v2.pid`, confirm it is absent, restart the same committed build with the command below, and then send the exact text `继续`.
+
+```powershell
+$acceptanceRoot = Get-Content -Raw -LiteralPath 'C:\tmp\cli-in-wechat-v2-active-acceptance.txt'
+$acceptanceRoot = $acceptanceRoot.Trim()
+$v2Pid = [int](Get-Content -LiteralPath (Join-Path $acceptanceRoot 'v2.pid'))
+Stop-Process -Id $v2Pid
+Wait-Process -Id $v2Pid -Timeout 15 -ErrorAction SilentlyContinue
+if (Get-Process -Id $v2Pid -ErrorAction SilentlyContinue) {
+  throw "V2 PID $v2Pid is still running"
+}
+$stdoutPath = Join-Path $acceptanceRoot 'v2-restart.stdout.log'
+$stderrPath = Join-Path $acceptanceRoot 'v2-restart.stderr.log'
+$v2 = Start-Process -FilePath 'C:\Program Files\nodejs\node.exe' `
+  -ArgumentList 'dist/index.js','--debug' `
+  -WorkingDirectory 'C:\tmp\cli-in-wechat-quota-v2' `
+  -RedirectStandardOutput $stdoutPath `
+  -RedirectStandardError $stderrPath `
+  -WindowStyle Hidden `
+  -PassThru
+$v2.Id | Set-Content -LiteralPath (Join-Path $acceptanceRoot 'v2.pid')
+Start-Sleep -Seconds 3
+Get-Process -Id $v2.Id
+Get-Content -LiteralPath $stdoutPath,$stderrPath -Tail 80
+$pollers = @(Get-CimInstance Win32_Process | Where-Object {
+  $_.Name -eq 'node.exe' -and $_.CommandLine -match 'dist[/\\]index\.js.*--debug'
+})
+if ($pollers.Count -ne 1 -or $pollers[0].ProcessId -ne $v2.Id) {
+  throw "Expected only restarted V2 PID $($v2.Id), found: $($pollers.ProcessId -join ', ')"
+}
+```
+
+Expected: the remaining suffix resumes from durable state after `继续`; the first 10 visible chunks do not reappear; the frozen retry identity remains stable in diagnostics.
+
+- [ ] **Step 8: Capture evidence after every run**
+
+For each row in `docs/superpowers/experiments/2026-08-03-long-task-acceptance.md`, record mode, actual chunk count, restart point, complete visibility, duplicate count, continuation placement, observed UTF-8 byte range from diagnostics, and the phone screenshot/video filename. After each run, copy the current diagnostics tail without exposing credentials:
+
+```powershell
+$acceptanceRoot = Get-Content -Raw -LiteralPath 'C:\tmp\cli-in-wechat-v2-active-acceptance.txt'
+$acceptanceRoot = $acceptanceRoot.Trim()
+$runNumberText = Read-Host 'Completed run number (1-20)'
+$runNumber = 0
+if (-not [int]::TryParse($runNumberText, [ref]$runNumber) -or $runNumber -lt 1 -or $runNumber -gt 20) {
+  throw 'Run number must be an integer from 1 through 20'
+}
+$diagnosticsCopy = Join-Path $acceptanceRoot ("run-{0:D2}-diagnostics-tail.jsonl" -f $runNumber)
+Get-Content -LiteralPath 'C:\Users\35952\.wx-ai-bridge\delivery-diagnostics.jsonl' -Tail 300 |
+  Set-Content -LiteralPath $diagnosticsCopy
+$diagnosticsCopy
+```
+
+Do not treat `ret=0`, API confirmation, or diagnostics alone as proof of visible completeness; the device observation is mandatory.
+
+- [ ] **Step 9: Evaluate the gate without weakening any criterion**
+
+The gate passes only when all 20 rows show complete visible results, total duplicates equal zero, every partial window has the continuation notice attached to its last body bubble, no notice appears as an independent bubble, compact/normal/verbose each have at least five runs, at least one run exceeds 10 chunks, at least one exceeds 20 chunks, and run 7 resumes correctly after restart. Keep the chunk threshold at 2000 until real request sizes spanning 1800-4500 bytes have been recorded and reviewed.
+
+- [ ] **Step 10: Run final verification and commit the observed acceptance record**
+
+```powershell
+npm run typecheck
+npm test
+npm run build
+git diff --check
+git diff -- docs/superpowers/experiments/2026-08-03-long-task-acceptance.md
+```
+
+Expected: all automated checks pass and every device-gate row contains observed evidence. Only then commit the acceptance record. Do not create `codex/main-candidate`, push, or modify `origin/main` until this gate is proven and the user separately authorizes the Git transition.
