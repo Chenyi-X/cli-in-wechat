@@ -23,11 +23,14 @@ seeing the complete response in WeChat.
 | Exact `继续` routing and ordinary prompt preservation | `test/router.test.ts` |
 | Redacted diagnostics and `/status` | `test/diagnostics.test.ts`, `test/router.test.ts` |
 
-Latest automated run: 151 tests, 149 passed, 2 expected platform skips; typecheck and build passed.
+Latest automated run at `f276b4c7850bc610e093197293e6f6be4270f90d`:
+212 tests, 210 passed, 2 expected platform skips, 0 failed; isolated
+`USERPROFILE` live-state guards, typecheck, build, and diff checks passed.
 
 ## Real-Device Gate
 
-Status: partial API evidence; UI observation and the 20-run gate remain pending.
+Status: fixed V2 poller PID 18628 active; preserved backlog migrated; exact
+`继续` recovery and real-device UI runs remain 0/20.
 
 Preflight candidate: `174c37e02bc701a7366125c2dbe63cf1e418b764`.
 Evidence directory: `C:\tmp\cli-in-wechat-v2-device-20260804-142952`.
@@ -36,8 +39,35 @@ subsequent branch commits modify acceptance documentation only. Before stopping
 the old poller, Step 3 proves there is no non-documentation diff and records the
 exact branch HEAD in `cutover-head.txt`.
 The pre-stop snapshot contains 131 files and all guarded-file SHA-256 hashes
-match the live directory. PID 2176 remained alive after capture; V2 cutover has
-not been authorized or started.
+match the live directory. The user authorized cutover on 2026-08-04; PID 2176
+was stopped and confirmed absent, and the post-stop snapshot contains 131 files.
+V2 PID 12868 started from the isolated worktree at
+`2026-08-04T14:45:55+08:00`. It is the only bridge poller, loaded the saved
+credentials, and reported no startup or migration error. The user then sent
+`new` and observed no response. PID 12868 was stopped, and the failure state is
+preserved under `wx-ai-bridge-v2-failure`.
+
+The first full-chunk fixed candidate `d122ce99e38a87bb0227a5718b844950962ee553`
+started as PID 34356 at `2026-08-04T18:19:17+08:00`. It immediately reproduced
+`continuation notice exceeds maxBytes`: the real 43-item snapshot placed 9
+intermediate and 19 activity records before the 13 finals in the same generation,
+so the legacy migration grouped all 41 records and rejected the non-final batch.
+PID 34356 was stopped; `wx-ai-bridge-pre-fixed-start` and
+`wx-ai-bridge-v2-fixed-attempt1-failure` preserve the before/after states and
+`v2-fixed.stdout.log`, `v2-fixed.stderr.log`, and `v2-fixed.pid` preserve the
+runtime evidence.
+
+Candidate `f276b4c7850bc610e093197293e6f6be4270f90d` fixes the mixed-priority
+boundary and transactionally applies the existing final supersession rule. Its
+pre-start state is preserved under `wx-ai-bridge-pre-f276b4c-start`. PID 18628
+started at `2026-08-04T18:50:10+08:00`; evidence is in `v2-f276b4c.stdout.log`,
+`v2-f276b4c.stderr.log`, and `v2-f276b4c.pid`. Startup persisted schema 2
+revision 4 with 16 total records: 13 generation-42 finals at
+`1944 x 11, 1943, 817` UTF-8 bytes, zero old activity/intermediate, and one
+record each for generations 46, 49, and 50. Primary and backup are identical,
+PID 18628 is the only poller, and the startup logs contain no migration,
+planner, corruption, or routing error. No recovery UI result has been counted
+yet.
 
 The initial `old-process.txt` capture serialized PowerShell formatting records
 instead of process fields. The runbook now writes structured JSON, the still-live
