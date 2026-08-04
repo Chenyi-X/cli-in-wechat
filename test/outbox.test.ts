@@ -6,6 +6,7 @@ import { join } from 'node:path';
 
 import {
   OutboxCapacityError,
+  OutboxMigrationError,
   OutboxStore,
   type OutboxItem,
 } from '../src/ilink/outbox.js';
@@ -39,6 +40,17 @@ function migrationOptions() {
     bodyChunkBytes: MIGRATED_BODY_BYTES,
     inboundItemLimit: INBOUND_WINDOW_ITEMS,
   };
+}
+
+function assertSafePersistedSequences(filePath: string): void {
+  const persisted = JSON.parse(readFileSync(filePath, 'utf8'));
+  const sequences = persisted.items.map((item: OutboxItem) => item.sequence) as number[];
+  assert.ok(sequences.every((sequence) => Number.isSafeInteger(sequence) && sequence > 0));
+  for (let index = 1; index < sequences.length; index += 1) {
+    assert.ok(sequences[index] > sequences[index - 1]);
+  }
+  assert.ok(Number.isSafeInteger(persisted.nextSequence));
+  assert.ok(persisted.nextSequence > Math.max(...sequences));
 }
 
 test('freezes text and client id before send and reloads them after restart', () => {
@@ -250,6 +262,74 @@ test('normalizes an already-wrapped schema-two failure snapshot once', () => {
   const reloaded = new OutboxStore(filePath, migrationOptions());
   assert.equal(readFileSync(filePath, 'utf8'), primaryBeforeReload);
   assert.deepEqual(reloaded.listPending('user-a', 'account-a'), pending);
+});
+
+test('sanitizes unsafe migration sequences without losing snapshot FIFO order', () => {
+  const filePath = tempPath();
+  const fixture = schemaTwoFailureFixture();
+  fixture.nextSequence = 1e20;
+  fixture.items.forEach((item) => { item.sequence = 1e20; });
+  writeFileSync(filePath, JSON.stringify(fixture));
+
+  const store = new OutboxStore(filePath, migrationOptions());
+  const pending = store.listPending('user-a', 'account-a');
+
+  assert.deepEqual(pending.map((item) => item.itemId), [
+    ...Array.from({ length: 13 }, (_, index) => `legacy-${index + 1}`),
+    'new-confirmation',
+  ]);
+  assert.equal(
+    pending.filter((item) => item.generation === 42).map((item) => item.text).join(''),
+    legacyFullChunkText,
+  );
+  assertSafePersistedSequences(filePath);
+});
+
+for (const { name, value } of [
+  { name: 'fractional', value: 1.5 },
+  { name: 'negative', value: -1 },
+]) {
+  test(`sanitizes ${name} migration sequences in deterministic snapshot order`, () => {
+    const filePath = tempPath();
+    const fixture = schemaTwoFailureFixture();
+    fixture.nextSequence = value;
+    fixture.items.forEach((item) => { item.sequence = value; });
+    writeFileSync(filePath, JSON.stringify(fixture));
+
+    const store = new OutboxStore(filePath, migrationOptions());
+    const pending = store.listPending('user-a', 'account-a');
+
+    assert.deepEqual(pending.map((item) => item.itemId), [
+      ...Array.from({ length: 13 }, (_, index) => `legacy-${index + 1}`),
+      'new-confirmation',
+    ]);
+    assert.equal(
+      pending.filter((item) => item.generation === 42).map((item) => item.text).join(''),
+      legacyFullChunkText,
+    );
+    assertSafePersistedSequences(filePath);
+  });
+}
+
+test('rejects migration when no safe next sequence remains', () => {
+  const filePath = tempPath();
+  const fixture = schemaTwoFailureFixture();
+  const firstSequence = Number.MAX_SAFE_INTEGER - fixture.items.length;
+  fixture.items.forEach((item, index) => { item.sequence = firstSequence + index; });
+  fixture.nextSequence = Number.MAX_SAFE_INTEGER;
+  fixture.items[12].text = `${fixture.items[12].text}${'Z'.repeat(MIGRATED_BODY_BYTES)}`;
+  const encoded = JSON.stringify(fixture);
+  writeFileSync(filePath, encoded);
+
+  assert.throws(
+    () => new OutboxStore(filePath, migrationOptions()),
+    (error: unknown) => {
+      assert.ok(error instanceof OutboxMigrationError);
+      assert.match(error.message, /^outbox migration failed: .*sequence/i);
+      return true;
+    },
+  );
+  assert.equal(readFileSync(filePath, 'utf8'), encoded);
 });
 
 test('recovers the primary file from a valid backup snapshot', () => {

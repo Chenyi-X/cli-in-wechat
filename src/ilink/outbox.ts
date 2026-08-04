@@ -477,7 +477,7 @@ export class OutboxStore {
       const priority = value.priority && PRIORITY_RANK[value.priority] !== undefined
         ? value.priority
         : 'final';
-      const sequence = asFiniteNumber(value.sequence, maxSequence + 1);
+      const sequence = asPositiveSafeInteger(value.sequence) ?? nextSafeSequence(maxSequence);
       const createdAt = asFiniteNumber(value.createdAt, this.now());
       const item: OutboxItem = {
         schemaVersion: 2,
@@ -509,9 +509,12 @@ export class OutboxStore {
       items.set(item.itemId, item);
       maxSequence = Math.max(maxSequence, sequence);
     }
+    const persistedNextSequence = asPositiveSafeInteger(snapshot.nextSequence);
     return {
       revision: asFiniteNumber(snapshot.revision, 0),
-      nextSequence: Math.max(Number.isInteger(snapshot.nextSequence) ? snapshot.nextSequence! : 1, maxSequence + 1),
+      nextSequence: persistedNextSequence !== undefined && persistedNextSequence > maxSequence
+        ? persistedNextSequence
+        : nextSafeSequence(maxSequence),
       items,
     };
   }
@@ -575,14 +578,20 @@ export class OutboxStore {
     }
 
     const firstSequence = ordered[0]?.sequence ?? 1;
+    const lastSequence = firstSequence + normalized.length - 1;
+    if (!Number.isSafeInteger(firstSequence)
+      || firstSequence <= 0
+      || !Number.isSafeInteger(lastSequence)
+      || lastSequence >= Number.MAX_SAFE_INTEGER) {
+      throw sequenceCapacityError();
+    }
     const items = new Map<string, OutboxItem>();
     normalized.forEach((item, index) => {
       const resequenced = { ...item, sequence: firstSequence + index };
       items.set(resequenced.itemId, resequenced);
     });
-    const maxSequence = firstSequence + normalized.length - 1;
     return {
-      nextSequence: Math.max(state.nextSequence, maxSequence + 1),
+      nextSequence: Math.max(state.nextSequence, nextSafeSequence(lastSequence)),
       items,
       changed: true,
     };
@@ -613,4 +622,22 @@ function sameMigrationBatch(left: OutboxItem, right: OutboxItem): boolean {
 
 function asFiniteNumber(value: unknown, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+}
+
+function asPositiveSafeInteger(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0
+    ? value
+    : undefined;
+}
+
+function nextSafeSequence(sequence: number): number {
+  const next = sequence + 1;
+  if (!Number.isSafeInteger(sequence) || sequence < 0 || !Number.isSafeInteger(next) || next <= 0) {
+    throw sequenceCapacityError();
+  }
+  return next;
+}
+
+function sequenceCapacityError(): OutboxMigrationError {
+  return new OutboxMigrationError('sequence capacity exhausted; no safe nextSequence remains');
 }
