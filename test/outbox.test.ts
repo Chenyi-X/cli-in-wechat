@@ -521,17 +521,101 @@ test('preserves explicit false schema-two delivery flags through migration and r
   assert.equal(reloaded.continuationNoticeAttached, false);
 });
 
-test('keeps permissive priority and state defaults for schema-one snapshots', () => {
+test('keeps permissive delivery-state defaults for schema-one snapshots', () => {
   const filePath = tempPath();
   const fixture = schemaOneLegacyFullChunkFixture();
   fixture.items[6].priority = 'unknown-priority';
   fixture.items[6].state = 'unknown-state';
+  fixture.items[6].deliveryReceipt = { reservationId: 'legacy-invalid', quotaGeneration: -1 };
   writeFileSync(filePath, JSON.stringify(fixture));
 
   const store = new OutboxStore(filePath, migrationOptions());
 
   assert.equal(store.get('legacy-7')?.priority, 'final');
   assert.equal(store.get('legacy-7')?.state, 'pending');
+  assert.equal(store.get('legacy-7')?.deliveryReceipt, undefined);
+  assert.doesNotThrow(() => new OutboxStore(filePath, migrationOptions()));
+});
+
+test('rejects empty public enqueue identities before changing snapshots', async (t) => {
+  for (const { name, invalidItemId, enqueueInput } of [
+    {
+      name: 'empty item id',
+      invalidItemId: '',
+      enqueueInput: input({ itemId: '', clientId: 'new-client', generation: 2 }),
+    },
+    {
+      name: 'empty client id',
+      invalidItemId: 'empty-client-id',
+      enqueueInput: input({ itemId: 'empty-client-id', clientId: '', generation: 2 }),
+    },
+  ]) {
+    await t.test(name, () => {
+      const filePath = tempPath();
+      let now = 0;
+      const store = new OutboxStore(filePath, { now: () => now });
+      store.enqueue(input({
+        itemId: 'baseline',
+        clientId: 'baseline-client',
+        createdAt: now,
+        ttlMs: 1,
+      }));
+      const primaryBefore = readFileSync(filePath, 'utf8');
+      const backupBefore = readFileSync(`${filePath}.bak`, 'utf8');
+
+      now = 2;
+      assert.throws(() => store.enqueue(enqueueInput), OutboxMigrationError);
+
+      now = 0;
+      assert.equal(store.get(invalidItemId), undefined);
+      assert.equal(store.get('baseline')?.state, 'pending');
+      assert.equal(readFileSync(filePath, 'utf8'), primaryBefore);
+      assert.equal(readFileSync(`${filePath}.bak`, 'utf8'), backupBefore);
+      const reloaded = new OutboxStore(filePath, { now: () => now });
+      assert.equal(reloaded.get('baseline')?.clientId, 'baseline-client');
+    });
+  }
+});
+
+test('rejects invalid public delivery receipts before changing snapshots', async (t) => {
+  for (const { name, reservationId, quotaGeneration } of [
+    { name: 'empty reservation id', reservationId: '', quotaGeneration: 1 },
+    { name: 'fractional quota generation', reservationId: 'reservation-1', quotaGeneration: 1.5 },
+    { name: 'negative quota generation', reservationId: 'reservation-1', quotaGeneration: -1 },
+    { name: 'unsafe quota generation', reservationId: 'reservation-1', quotaGeneration: 1e20 },
+  ]) {
+    await t.test(name, () => {
+      const filePath = tempPath();
+      const store = new OutboxStore(filePath);
+      store.enqueue(input({ itemId: 'baseline', clientId: 'baseline-client' }));
+      const primaryBefore = readFileSync(filePath, 'utf8');
+      const backupBefore = readFileSync(`${filePath}.bak`, 'utf8');
+
+      assert.throws(
+        () => store.recordDeliveryReceipt('baseline', reservationId, quotaGeneration),
+        OutboxMigrationError,
+      );
+
+      assert.equal(store.get('baseline')?.deliveryReceipt, undefined);
+      assert.equal(readFileSync(filePath, 'utf8'), primaryBefore);
+      assert.equal(readFileSync(`${filePath}.bak`, 'utf8'), backupBefore);
+      assert.equal(new OutboxStore(filePath).get('baseline')?.clientId, 'baseline-client');
+    });
+  }
+});
+
+test('public writers always leave snapshots accepted by strict reload', () => {
+  const filePath = tempPath();
+  const store = new OutboxStore(filePath);
+  const item = store.enqueue(input({ itemId: 'writer-item', clientId: 'writer-client' }));
+  assert.doesNotThrow(() => new OutboxStore(filePath));
+
+  assert.equal(store.recordDeliveryReceipt(item.itemId, 'reservation-1', 0), true);
+  assert.doesNotThrow(() => new OutboxStore(filePath));
+
+  assert.equal(store.markPermanentFailure(item.itemId, { errmsg: 'terminal' }), true);
+  assert.doesNotThrow(() => new OutboxStore(filePath));
+  assertSafePersistedSequences(filePath);
 });
 
 test('rejects incomplete or invalid migration configuration', () => {

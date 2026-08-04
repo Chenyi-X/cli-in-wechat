@@ -179,10 +179,9 @@ export class OutboxStore {
 
   enqueueTextBatch(inputs: OutboxInput[]): OutboxItem[] {
     if (inputs.length === 0) return [];
-    this.pruneExpired();
     const nextItems = new Map(this.items);
+    let changed = this.markExpired(nextItems);
     let nextSequence = this.nextSequence;
-    let changed = false;
     const result: OutboxItem[] = [];
 
     for (const input of inputs) {
@@ -324,7 +323,9 @@ export class OutboxStore {
     const item = this.items.get(itemId);
     if (!item?.recoveryRequired) return false;
     const nextItems = new Map(this.items);
-    nextItems.set(itemId, { ...item, recoveryRequired: undefined });
+    const cleared = { ...item };
+    delete cleared.recoveryRequired;
+    nextItems.set(itemId, cleared);
     this.persistState(nextItems, this.nextSequence);
     this.publish(nextItems, this.nextSequence);
     return true;
@@ -335,7 +336,10 @@ export class OutboxStore {
     let changed = 0;
     for (const [itemId, item] of nextItems) {
       if (item.accountId !== accountId || item.userId !== userId || !item.recoveryRequired) continue;
-      nextItems.set(itemId, { ...item, recoveryRequired: undefined, terminalError: undefined });
+      const cleared = { ...item };
+      delete cleared.recoveryRequired;
+      delete cleared.terminalError;
+      nextItems.set(itemId, cleared);
       changed += 1;
     }
     if (changed > 0) {
@@ -350,13 +354,14 @@ export class OutboxStore {
     let changed = 0;
     for (const [itemId, item] of nextItems) {
       if (item.state !== 'permanent-failure' || !matches(item)) continue;
-      nextItems.set(itemId, {
+      const requeued = {
         ...item,
         state: 'pending',
         expiresAt: item.expiresAt <= this.now() ? this.now() + this.defaultTtlMs : item.expiresAt,
-        recoveryRequired: undefined,
-        terminalError: undefined,
-      });
+      } satisfies OutboxItem;
+      delete requeued.recoveryRequired;
+      delete requeued.terminalError;
+      nextItems.set(itemId, requeued);
       changed += 1;
     }
     if (changed > 0) {
@@ -423,10 +428,16 @@ export class OutboxStore {
 
   private pruneExpired(): void {
     const nextItems = new Map(this.items);
+    if (!this.markExpired(nextItems)) return;
+    this.persistState(nextItems, this.nextSequence);
+    this.publish(nextItems, this.nextSequence);
+  }
+
+  private markExpired(target: Map<string, OutboxItem>): boolean {
     let changed = false;
-    for (const [itemId, item] of nextItems) {
+    for (const [itemId, item] of target) {
       if (item.state === 'pending' && !item.deliveryReceipt && item.expiresAt <= this.now()) {
-        nextItems.set(itemId, {
+        target.set(itemId, {
           ...item,
           state: 'permanent-failure',
           terminalError: { errmsg: 'outbox item expired before delivery' },
@@ -434,10 +445,7 @@ export class OutboxStore {
         changed = true;
       }
     }
-    if (changed) {
-      this.persistState(nextItems, this.nextSequence);
-      this.publish(nextItems, this.nextSequence);
-    }
+    return changed;
   }
 
   private load(): void {
@@ -630,6 +638,7 @@ export class OutboxStore {
   }
 
   private persistState(items: Map<string, OutboxItem>, nextSequence: number): void {
+    assertPersistableItems(items);
     assertPersistableSequences(items, nextSequence);
     const revision = this.revision + 1;
     const payload: PersistedOutbox = { schemaVersion: 2, revision, nextSequence, items: [...items.values()] };
@@ -662,7 +671,7 @@ function decodeDeliveryState(
     return {
       priority: isOutboxPriority(value.priority) ? value.priority : 'final',
       state: value.state === 'permanent-failure' ? 'permanent-failure' : 'pending',
-      ...(value.deliveryReceipt?.reservationId && Number.isInteger(value.deliveryReceipt.quotaGeneration)
+      ...(isValidDeliveryReceipt(value.deliveryReceipt)
         ? { deliveryReceipt: {
             reservationId: value.deliveryReceipt.reservationId,
             quotaGeneration: value.deliveryReceipt.quotaGeneration,
@@ -684,18 +693,12 @@ function decodeDeliveryState(
   const deliveryReceipt = raw.deliveryReceipt;
   let decodedReceipt: OutboxItem['deliveryReceipt'];
   if (deliveryReceipt !== undefined) {
-    if (!deliveryReceipt || typeof deliveryReceipt !== 'object' || Array.isArray(deliveryReceipt)) {
-      throw new OutboxMigrationError(`invalid schema-two item at index ${index}: malformed deliveryReceipt`);
-    }
-    const receipt = deliveryReceipt as Record<string, unknown>;
-    if (typeof receipt.reservationId !== 'string' || receipt.reservationId.length === 0
-      || !Number.isSafeInteger(receipt.quotaGeneration)
-      || (receipt.quotaGeneration as number) < 0) {
+    if (!isValidDeliveryReceipt(deliveryReceipt)) {
       throw new OutboxMigrationError(`invalid schema-two item at index ${index}: malformed deliveryReceipt`);
     }
     decodedReceipt = {
-      reservationId: receipt.reservationId,
-      quotaGeneration: receipt.quotaGeneration as number,
+      reservationId: deliveryReceipt.reservationId,
+      quotaGeneration: deliveryReceipt.quotaGeneration,
     };
   }
 
@@ -725,6 +728,15 @@ function isOutboxPriority(value: unknown): value is OutboxPriority {
   return typeof value === 'string' && Object.hasOwn(PRIORITY_RANK, value);
 }
 
+function isValidDeliveryReceipt(value: unknown): value is NonNullable<OutboxItem['deliveryReceipt']> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const receipt = value as Record<string, unknown>;
+  return typeof receipt.reservationId === 'string'
+    && receipt.reservationId.length > 0
+    && Number.isSafeInteger(receipt.quotaGeneration)
+    && (receipt.quotaGeneration as number) >= 0;
+}
+
 function asFiniteNumber(value: unknown, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
 }
@@ -745,6 +757,32 @@ function nextSafeSequence(sequence: number): number {
 
 function sequenceCapacityError(): OutboxMigrationError {
   return new OutboxMigrationError('sequence capacity exhausted; no safe nextSequence remains');
+}
+
+function assertPersistableItems(items: Map<string, OutboxItem>): void {
+  let index = 0;
+  for (const [itemId, item] of items) {
+    if (item.schemaVersion !== 2) {
+      throw new OutboxMigrationError(`invalid schema-two item at index ${index}: schemaVersion must be 2`);
+    }
+    if (typeof itemId !== 'string' || itemId.length === 0) {
+      throw new OutboxMigrationError(`invalid schema-two item at index ${index}: map key must be a nonempty string`);
+    }
+    if (typeof item.itemId !== 'string' || item.itemId.length === 0) {
+      throw new OutboxMigrationError(`invalid schema-two item at index ${index}: itemId must be a nonempty string`);
+    }
+    if (itemId !== item.itemId) {
+      throw new OutboxMigrationError(`invalid schema-two item at index ${index}: map key must equal itemId`);
+    }
+    if (typeof item.clientId !== 'string' || item.clientId.length === 0) {
+      throw new OutboxMigrationError(`invalid schema-two item at index ${index}: clientId must be a nonempty string`);
+    }
+    if (typeof item.text !== 'string') {
+      throw new OutboxMigrationError(`invalid schema-two item at index ${index}: text must be a string`);
+    }
+    decodeDeliveryState(item, index, true);
+    index += 1;
+  }
 }
 
 function assertPersistableSequences(items: Map<string, OutboxItem>, nextSequence: number): void {
