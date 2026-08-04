@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -13,6 +13,7 @@ import {
   legacyFullChunkText,
   MIGRATED_BODY_BYTES,
   schemaTwoFailureFixture,
+  schemaTwoMixedFailureFixture,
 } from './fixtures/legacy-full-chunk.js';
 
 const CREDS: Credentials = {
@@ -95,9 +96,10 @@ test('delivers thirteen queued final chunks as ten then three on the next inboun
   });
 });
 
-test('migrates the live schema-two failure shape before the first recovery window', async () => {
+test('migrates the incident-shaped schema-two queue before the first recovery window', async () => {
   const options = paths();
-  writeFileSync(options.outboxPath, JSON.stringify(schemaTwoFailureFixture()), 'utf8');
+  const snapshot = schemaTwoMixedFailureFixture();
+  writeFileSync(options.outboxPath, JSON.stringify(snapshot), 'utf8');
   const client = new ILinkClient(CREDS, options);
 
   await withFetchResponses(Array.from({ length: 10 }, () => ({ ret: 0 })), async (requests) => {
@@ -118,8 +120,51 @@ test('migrates the live schema-two failure shape before the first recovery windo
       'legacy-12',
       'legacy-13',
       'new-confirmation',
+      'incident-control',
     ]);
-    assert.equal(pending.at(-1)?.text, '新会话');
+    assert.ok(pending.every((item) => item.priority !== 'activity' && item.priority !== 'intermediate'));
+    const confirmation = pending.find((item) => item.itemId === 'new-confirmation');
+    assert.deepEqual(
+      confirmation && {
+        clientId: confirmation.clientId,
+        generation: confirmation.generation,
+        tokenVersion: confirmation.tokenVersion,
+        priority: confirmation.priority,
+        text: confirmation.text,
+      },
+      {
+        clientId: 'new-confirmation-client',
+        generation: 49,
+        tokenVersion: 8,
+        priority: 'final',
+        text: '新会话',
+      },
+    );
+    const control = pending.find((item) => item.itemId === 'incident-control');
+    assert.deepEqual(
+      control && {
+        clientId: control.clientId,
+        generation: control.generation,
+        tokenVersion: control.tokenVersion,
+        priority: control.priority,
+        text: control.text,
+      },
+      {
+        clientId: 'incident-control-client',
+        generation: 41,
+        tokenVersion: 6,
+        priority: 'control',
+        text: '保留控制消息',
+      },
+    );
+    const persisted = JSON.parse(readFileSync(options.outboxPath, 'utf8'));
+    assert.deepEqual(persisted.items.map((item: { itemId: string }) => item.itemId), [
+      'legacy-11',
+      'legacy-12',
+      'legacy-13',
+      'incident-control',
+      'new-confirmation',
+    ]);
   });
 });
 

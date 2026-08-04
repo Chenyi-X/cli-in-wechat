@@ -76,20 +76,23 @@ export function schemaTwoFailureFixture(): OutboxFixtureSnapshot {
   };
 }
 
-function mixedUnrelatedItem(position: 'before' | 'after', index: number, sequence: number): Record<string, unknown> {
-  const text = `${position}-${index + 1}`;
-  const priorities = ['activity', 'intermediate', 'control'] as const;
+function incidentLowPriorityItem(
+  priority: 'activity' | 'intermediate',
+  index: number,
+  sequence: number,
+): Record<string, unknown> {
+  const text = `legacy-${priority}-${index + 1}`;
   return {
     schemaVersion: 2,
-    itemId: `mixed-${position}-${index + 1}`,
-    clientId: `mixed-${position}-client-${index + 1}`,
+    itemId: `legacy-${priority}-${index + 1}`,
+    clientId: `legacy-${priority}-client-${index + 1}`,
     sequence,
     kind: 'text',
-    accountId: `account-${position}-${index % 3}`,
-    userId: `user-${position}-${index + 1}`,
-    generation: 100 + sequence,
-    tokenVersion: 20 + (index % 4),
-    priority: priorities[index % priorities.length],
+    accountId: 'account-a',
+    userId: 'user-a',
+    generation: 42,
+    tokenVersion: 7,
+    priority,
     text,
     bytes: Buffer.byteLength(text, 'utf8'),
     createdAt: CREATED_AT + 1_000 + sequence,
@@ -104,16 +107,34 @@ export function schemaTwoMixedFailureFixture(): OutboxFixtureSnapshot {
     revision: 2,
     nextSequence: 44,
     items: [
-      ...Array.from({ length: 15 }, (_, index) => mixedUnrelatedItem('before', index, index + 1)),
+      ...Array.from({ length: 9 }, (_, index) => incidentLowPriorityItem('intermediate', index, index + 1)),
+      ...Array.from({ length: 19 }, (_, index) => incidentLowPriorityItem('activity', index, index + 10)),
       ...LEGACY_TEXTS.map((text, index) => ({
         ...legacyItem(index, text, 2),
-        sequence: index + 16,
+        sequence: index + 29,
       })),
+      {
+        schemaVersion: 2,
+        itemId: 'incident-control',
+        clientId: 'incident-control-client',
+        sequence: 42,
+        kind: 'text',
+        accountId: 'account-a',
+        userId: 'user-a',
+        generation: 41,
+        tokenVersion: 6,
+        priority: 'control',
+        text: '保留控制消息',
+        bytes: Buffer.byteLength('保留控制消息', 'utf8'),
+        createdAt: CREATED_AT + 98,
+        expiresAt: EXPIRES_AT,
+        state: 'pending',
+      },
       {
         schemaVersion: 2,
         itemId: 'new-confirmation',
         clientId: 'new-confirmation-client',
-        sequence: 29,
+        sequence: 43,
         kind: 'text',
         accountId: 'account-a',
         userId: 'user-a',
@@ -126,7 +147,6 @@ export function schemaTwoMixedFailureFixture(): OutboxFixtureSnapshot {
         expiresAt: EXPIRES_AT,
         state: 'pending',
       },
-      ...Array.from({ length: 14 }, (_, index) => mixedUnrelatedItem('after', index, index + 30)),
     ],
   };
 }

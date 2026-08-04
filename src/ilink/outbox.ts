@@ -567,6 +567,7 @@ export class OutboxStore {
     const ordered = [...state.items.values()]
       .sort((a, b) => a.sequence - b.sequence || a.itemId.localeCompare(b.itemId));
     const normalized: OutboxItem[] = [];
+    const migratedFinalScopes: Array<Pick<OutboxItem, 'accountId' | 'userId' | 'generation'>> = [];
     let changed = false;
 
     for (let start = 0; start < ordered.length;) {
@@ -609,6 +610,7 @@ export class OutboxStore {
           bytes: Buffer.byteLength(chunk, 'utf8'),
         };
       }));
+      migratedFinalScopes.push(first);
       changed = true;
       start = end;
     }
@@ -630,6 +632,9 @@ export class OutboxStore {
       const resequenced = { ...item, sequence: firstSequence + index };
       items.set(resequenced.itemId, resequenced);
     });
+    for (const scope of migratedFinalScopes) {
+      this.removeSuperseded(items, scope.accountId, scope.userId, scope.generation);
+    }
     return {
       nextSequence: Math.max(state.nextSequence, nextSafeSequence(lastSequence)),
       items,
@@ -659,7 +664,8 @@ function sameMigrationBatch(left: OutboxItem, right: OutboxItem): boolean {
   return left.accountId === right.accountId
     && left.userId === right.userId
     && left.generation === right.generation
-    && left.tokenVersion === right.tokenVersion;
+    && left.tokenVersion === right.tokenVersion
+    && left.priority === right.priority;
 }
 
 function decodeDeliveryState(

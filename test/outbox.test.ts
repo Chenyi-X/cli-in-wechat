@@ -295,22 +295,29 @@ test('normalizes an already-wrapped schema-two failure snapshot once', () => {
   assert.deepEqual(reloaded.listPending('user-a', 'account-a'), pending);
 });
 
-test('normalizes only the eligible batch in a 43-item mixed queue', () => {
+test('normalizes the incident final run behind same-generation low-priority items', () => {
   const filePath = tempPath();
   const fixture = schemaTwoMixedFailureFixture();
-  const expectedIds = fixture.items.map((item) => String(item.itemId));
-  const unrelated = fixture.items.filter((item) => item.generation !== 42);
+  const expectedFinals = fixture.items.filter((item) => item.generation === 42 && item.priority === 'final');
+  const preserved = fixture.items.filter((item) => item.generation !== 42);
   writeFileSync(filePath, JSON.stringify(fixture));
 
   const store = new OutboxStore(filePath, migrationOptions());
-  const migratedGeneration = store.listPending('user-a', 'account-a')
-    .filter((item) => item.generation === 42);
+  const migratedFinals = store.listPending('user-a', 'account-a')
+    .filter((item) => item.generation === 42 && item.priority === 'final');
 
-  assert.equal(store.list().length, 43);
-  assert.equal(migratedGeneration.length, 13);
-  assert.equal(migratedGeneration.map((item) => item.text).join(''), legacyFullChunkText);
-  assert.ok(migratedGeneration.every((item) => item.bytes <= MIGRATED_BODY_BYTES));
-  for (const expected of unrelated) {
+  assert.equal(migratedFinals.length, 13);
+  assert.equal(migratedFinals.map((item) => item.text).join(''), legacyFullChunkText);
+  assert.ok(migratedFinals.every((item) => item.bytes <= MIGRATED_BODY_BYTES));
+  assert.deepEqual(
+    migratedFinals.map((item) => ({ itemId: item.itemId, clientId: item.clientId, sequence: item.sequence })),
+    expectedFinals.map((item) => ({
+      itemId: item.itemId,
+      clientId: item.clientId,
+      sequence: item.sequence,
+    })),
+  );
+  for (const expected of preserved) {
     const actual = store.get(String(expected.itemId));
     assert.ok(actual);
     assert.deepEqual(stableMigrationFields(actual), stableMigrationFields(expected));
@@ -321,14 +328,80 @@ test('normalizes only the eligible batch in a 43-item mixed queue', () => {
   assert.equal(primary.revision, 3);
   assert.equal(backup.revision, primary.revision);
   assert.deepEqual(primary, backup);
-  assert.deepEqual(primary.items.map((item: OutboxItem) => item.itemId), expectedIds);
-  assert.deepEqual(primary.items.map((item: OutboxItem) => item.sequence),
-    Array.from({ length: 43 }, (_, index) => index + 1));
+  assert.deepEqual(
+    primary.items
+      .filter((item: OutboxItem) => item.generation === 42 && item.priority === 'final')
+      .map((item: OutboxItem) => item.itemId),
+    expectedFinals.map((item) => item.itemId),
+  );
 
   const primaryBeforeReload = readFileSync(filePath, 'utf8');
   const reloaded = new OutboxStore(filePath, migrationOptions());
   assert.equal(readFileSync(filePath, 'utf8'), primaryBeforeReload);
-  assert.equal(reloaded.list().length, 43);
+  assert.deepEqual(
+    reloaded.listPending('user-a', 'account-a')
+      .filter((item) => item.generation === 42 && item.priority === 'final'),
+    migratedFinals,
+  );
+});
+
+test('supersedes legacy low-priority items only when their final run migrates', async (t) => {
+  await t.test('removes receiptless items and preserves confirmed and unrelated records', () => {
+    const filePath = tempPath();
+    const fixture = schemaTwoMixedFailureFixture();
+    const confirmed = fixture.items.find((item) => item.itemId === 'legacy-activity-19');
+    assert.ok(confirmed);
+    confirmed.deliveryReceipt = { reservationId: 'legacy-confirmed', quotaGeneration: 42 };
+    const removedIds = fixture.items
+      .filter((item) => item.generation === 42
+        && (item.priority === 'activity' || item.priority === 'intermediate')
+        && item.itemId !== confirmed.itemId)
+      .map((item) => String(item.itemId));
+    const expectedRetainedIds = fixture.items
+      .filter((item) => !removedIds.includes(String(item.itemId)))
+      .map((item) => String(item.itemId));
+    writeFileSync(filePath, JSON.stringify(fixture));
+
+    const store = new OutboxStore(filePath, migrationOptions());
+
+    for (const itemId of removedIds) assert.equal(store.get(itemId), undefined);
+    const retainedConfirmed = store.get(String(confirmed.itemId));
+    assert.ok(retainedConfirmed);
+    assert.deepEqual(stableMigrationFields(retainedConfirmed), stableMigrationFields(confirmed));
+    assert.deepEqual(retainedConfirmed.deliveryReceipt, confirmed.deliveryReceipt);
+    for (const itemId of ['incident-control', 'new-confirmation']) {
+      const expected = fixture.items.find((item) => item.itemId === itemId);
+      const actual = store.get(itemId);
+      assert.ok(expected);
+      assert.ok(actual);
+      assert.deepEqual(stableMigrationFields(actual), stableMigrationFields(expected));
+    }
+
+    const primary = JSON.parse(readFileSync(filePath, 'utf8'));
+    const backup = JSON.parse(readFileSync(`${filePath}.bak`, 'utf8'));
+    assert.deepEqual(primary, backup);
+    assert.deepEqual(primary.items.map((item: OutboxItem) => item.itemId), expectedRetainedIds);
+    assert.ok(primary.items.every((item: OutboxItem, index: number, items: OutboxItem[]) =>
+      index === 0 || item.sequence > items[index - 1].sequence));
+  });
+
+  await t.test('leaves low-priority items untouched when the final run is ineligible', () => {
+    const filePath = tempPath();
+    const fixture = schemaTwoMixedFailureFixture();
+    const ineligible = fixture.items.find((item) => item.itemId === 'legacy-7');
+    assert.ok(ineligible);
+    ineligible.state = 'permanent-failure';
+    const before = JSON.stringify(fixture);
+    writeFileSync(filePath, before);
+
+    const store = new OutboxStore(filePath, migrationOptions());
+
+    assert.equal(store.list().length, 43);
+    assert.ok(store.get('legacy-intermediate-1'));
+    assert.ok(store.get('legacy-activity-19'));
+    assert.equal(readFileSync(filePath, 'utf8'), before);
+    assert.equal(existsSync(`${filePath}.bak`), false);
+  });
 });
 
 test('rejects malformed schema-two records before migration persistence', async (t) => {
