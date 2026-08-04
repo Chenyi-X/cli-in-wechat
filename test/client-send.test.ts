@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -8,6 +8,7 @@ import { ILinkClient } from '../src/ilink/client.js';
 import { OutboxStore } from '../src/ilink/outbox.js';
 import { QuotaManager } from '../src/ilink/quota.js';
 import type { Credentials, WeixinMessage } from '../src/ilink/types.js';
+import { schemaTwoFailureFixture } from './fixtures/legacy-full-chunk.js';
 
 const CREDS: Credentials = {
   botToken: 'token',
@@ -26,7 +27,7 @@ function paths() {
   };
 }
 
-function message(id: number, uid = 'user-a', contextToken = 'context-token'): WeixinMessage {
+function message(id: number, uid = 'user-a', contextToken = 'context-token', text = 'hello'): WeixinMessage {
   return {
     message_id: id,
     from_user_id: uid,
@@ -36,7 +37,7 @@ function message(id: number, uid = 'user-a', contextToken = 'context-token'): We
     message_type: 1,
     message_state: 0,
     context_token: contextToken,
-    item_list: [{ type: 1, text_item: { text: 'hello' } }],
+    item_list: [{ type: 1, text_item: { text } }],
   };
 }
 
@@ -86,6 +87,31 @@ test('delivers thirteen queued final chunks as ten then three on the next inboun
     await (client as any).processMessage(message(2));
     assert.equal(requests.length, 13);
     assert.equal(outbox.listPending('user-a').length, 0);
+  });
+});
+
+test('migrates the live schema-two failure shape before the first recovery window', async () => {
+  const options = paths();
+  writeFileSync(options.outboxPath, JSON.stringify(schemaTwoFailureFixture()), 'utf8');
+  const client = new ILinkClient(CREDS, options);
+
+  await withFetchResponses(Array.from({ length: 10 }, () => ({ ret: 0 })), async (requests) => {
+    await (client as any).processMessage(message(50, 'user-a', 'fresh-token', '继续'));
+
+    assert.equal(requests.length, 10);
+    const bodies = requests.map((request) => request.body.msg.item_list[0].text_item.text as string);
+    assert.ok(bodies.every((body) => Buffer.byteLength(body, 'utf8') <= 2_000));
+    assert.ok(bodies[9].endsWith('\n\n后续内容已排队，请回复“继续”续发。'));
+    assert.ok(!bodies.includes('后续内容已排队，请回复“继续”续发。'));
+
+    const pending = client.getDeliveryStatus('user-a').pending;
+    assert.deepEqual(pending.map((item) => item.itemId), [
+      'legacy-11',
+      'legacy-12',
+      'legacy-13',
+      'new-confirmation',
+    ]);
+    assert.equal(pending.at(-1)?.text, '新会话');
   });
 });
 
