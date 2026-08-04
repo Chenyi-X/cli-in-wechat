@@ -174,6 +174,20 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
 
     const trimmed = text.trim();
 
+    // Any fresh inbound may be the user's request to resume durable output.
+    // The exact bare command is consumed; all other text continues normally.
+    const recoverPending = (this.ilink as ILinkClient & {
+      recoverPending?: (userId: string) => Promise<unknown>;
+    }).recoverPending;
+    if (recoverPending) {
+      try {
+        await recoverPending.call(this.ilink, uid);
+      } catch (err) {
+        log.error(`[delivery] 恢复 ${uid} 的排队消息失败:`, err);
+      }
+    }
+    if (trimmed === '继续') return;
+
     // Build media context for CLI
     let mediaContext = '';
     if (media && media.length > 0) {
