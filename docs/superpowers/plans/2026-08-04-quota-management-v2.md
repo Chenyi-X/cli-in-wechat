@@ -235,7 +235,8 @@ $acceptanceRoot | Set-Content -LiteralPath 'C:\tmp\cli-in-wechat-v2-active-accep
 git rev-parse HEAD | Set-Content -LiteralPath (Join-Path $acceptanceRoot 'candidate-commit.txt')
 Get-CimInstance Win32_Process -Filter "ProcessId = 2176" |
   Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,CommandLine |
-  Format-List | Set-Content -LiteralPath (Join-Path $acceptanceRoot 'old-process.txt')
+  ConvertTo-Json -Depth 3 |
+  Set-Content -LiteralPath (Join-Path $acceptanceRoot 'old-process.txt')
 $acceptanceRoot
 ```
 

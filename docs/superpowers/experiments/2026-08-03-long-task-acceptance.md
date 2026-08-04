@@ -35,6 +35,11 @@ The pre-stop snapshot contains 131 files and all guarded-file SHA-256 hashes
 match the live directory. PID 2176 remained alive after capture; V2 cutover has
 not been authorized or started.
 
+The initial `old-process.txt` capture serialized PowerShell formatting records
+instead of process fields. The runbook now writes structured JSON, the still-live
+PID 2176 metadata was recaptured and matched all five selected fields, and the
+original malformed output is preserved as `old-process-formatting-error.txt`.
+
 The isolated canary used the saved account/context without touching the live
 bridge data. Its first response was ambiguous, the retry reused the same
 persisted `client_id`, the second response confirmed delivery, and the final
