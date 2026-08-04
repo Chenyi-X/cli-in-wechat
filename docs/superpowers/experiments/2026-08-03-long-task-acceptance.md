@@ -29,6 +29,12 @@ Latest automated run: 151 tests, 149 passed, 2 expected platform skips; typechec
 
 Status: partial API evidence; UI observation and the 20-run gate remain pending.
 
+Preflight candidate: `174c37e02bc701a7366125c2dbe63cf1e418b764`.
+Evidence directory: `C:\tmp\cli-in-wechat-v2-device-20260804-142952`.
+The pre-stop snapshot contains 131 files and all guarded-file SHA-256 hashes
+match the live directory. PID 2176 remained alive after capture; V2 cutover has
+not been authorized or started.
+
 The isolated canary used the saved account/context without touching the live
 bridge data. Its first response was ambiguous, the retry reused the same
 persisted `client_id`, the second response confirmed delivery, and the final

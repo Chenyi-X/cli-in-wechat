@@ -210,7 +210,7 @@ git commit -m "test: cover durable delivery recovery and diagnostics"
 **Files:**
 - Modify: `docs/superpowers/experiments/2026-08-03-long-task-acceptance.md`
 
-- [ ] **Step 1: Verify the committed V2 candidate without touching the live process**
+- [x] **Step 1: Verify the committed V2 candidate without touching the live process**
 
 Run from `C:\tmp\cli-in-wechat-quota-v2`:
 
@@ -224,7 +224,7 @@ npm run build
 
 Expected: branch `codex/quota-management-v2`, clean status, expected commit recorded in the acceptance log, 0 failed tests, and successful typecheck/build. Do not proceed if any command fails.
 
-- [ ] **Step 2: Create an acceptance evidence directory and pre-stop snapshot**
+- [x] **Step 2: Create an acceptance evidence directory and pre-stop snapshot**
 
 ```powershell
 $acceptanceRoot = "C:\tmp\cli-in-wechat-v2-device-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
