@@ -364,7 +364,21 @@ test('does not migrate schema-two batches outside the strict eligibility boundar
       const before = pretty ? JSON.stringify(fixture, null, 2) : JSON.stringify(fixture);
       writeFileSync(filePath, before);
 
-      new OutboxStore(filePath, migrationOptions());
+      const store = new OutboxStore(filePath, migrationOptions());
+
+      for (const item of fixture.items) {
+        const loaded = store.get(String(item.itemId));
+        assert.ok(loaded);
+        assert.equal(loaded.text, item.text);
+        assert.equal(loaded.bytes, item.bytes);
+        assert.equal(loaded.priority, item.priority);
+        assert.equal(loaded.state, item.state);
+        assert.equal(loaded.generation, item.generation);
+        assert.equal(loaded.tokenVersion, item.tokenVersion);
+        assert.deepEqual(loaded.deliveryReceipt, item.deliveryReceipt);
+        assert.equal(loaded.recoveryRequired, item.recoveryRequired);
+        assert.equal(loaded.continuationNoticeAttached, item.continuationNoticeAttached);
+      }
 
       assert.equal(readFileSync(filePath, 'utf8'), before);
       assert.equal(existsSync(`${filePath}.bak`), false);
@@ -420,6 +434,17 @@ test('preserves positional item identities while expanding and contracting a mig
     ]);
     assert.equal(migrated.slice(0, 2).map((item) => item.text).join(''), originalText);
     assertSafePersistedSequences(filePath);
+
+    const reloaded = new OutboxStore(filePath, migrationOptions())
+      .listPending('user-a', 'account-a');
+    assert.deepEqual(reloaded.map((item) => item.itemId), [
+      'legacy-1',
+      'legacy-2',
+      'new-confirmation',
+    ]);
+    assert.equal(reloaded.slice(0, 2).map((item) => item.text).join(''), originalText);
+    assert.equal(reloaded.at(-1)?.text, '新会话');
+    assert.equal(reloaded.at(-1)?.state, 'pending');
   });
 });
 
