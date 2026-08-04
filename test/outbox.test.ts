@@ -205,12 +205,18 @@ test('normalizes an oversized schema-one final batch before delivery planning', 
     pending.map((item) => ({ createdAt: item.createdAt, expiresAt: item.expiresAt })),
     fixture.items.map((item) => ({ createdAt: item.createdAt, expiresAt: item.expiresAt })),
   );
-  assert.doesNotThrow(() => planDeliveryWindow(pending as DeliveryItem[], {
+  const plan = planDeliveryWindow(pending as DeliveryItem[], {
     sentItems: 0,
     maxItems: INBOUND_WINDOW_ITEMS,
     maxBytes: 2_000,
     continuationNotice: '后续内容已排队，请回复“继续”续发。',
-  }));
+  });
+  assert.equal(plan.needsContinuation, true);
+  const lastSelected = plan.items.at(-1);
+  assert.equal(lastSelected?.continuationNoticeAttached, true);
+  assert.ok(lastSelected);
+  assert.ok(Buffer.byteLength(lastSelected.text, 'utf8') <= 2_000);
+  assert.ok(lastSelected.bytes <= 2_000);
 
   const persisted = JSON.parse(readFileSync(filePath, 'utf8'));
   const backup = JSON.parse(readFileSync(`${filePath}.bak`, 'utf8'));
