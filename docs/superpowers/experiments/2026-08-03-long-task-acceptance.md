@@ -20,7 +20,13 @@ seeing the complete response in WeChat.
 
 ## Real-Device Gate
 
-Status: pending real WeChat run.
+Status: partial API evidence; UI observation and the 20-run gate remain pending.
+
+The isolated canary used the saved account/context without touching the live
+bridge data. Its first response was ambiguous, the retry reused the same
+persisted `client_id`, the second response confirmed delivery, and the final
+isolated status had zero pending and zero permanent-failure items. This proves
+the recovery protocol, not the visible WeChat bubble.
 
 - [ ] 20 long tasks total.
 - [ ] compact, normal, and verbose: at least 5 tasks each.
@@ -34,5 +40,5 @@ Status: pending real WeChat run.
 
 | Run | Mode | Chunks | Restart point | Complete | Duplicates | Notes |
 | --- | --- | ---: | ---: | --- | ---: | --- |
+| Canary | isolated API | 1 | ambiguity then retry | API confirmed | 0 known | UI not independently observed. |
 | 1-20 | pending | - | - | - | - | Fill from the real-device log. |
-

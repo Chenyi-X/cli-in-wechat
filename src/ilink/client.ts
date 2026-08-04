@@ -1,10 +1,10 @@
 import { randomUUID, randomBytes } from 'node:crypto';
-import { readFileSync, existsSync, statSync } from 'node:fs';
-import { basename, join } from 'node:path';
+import { readFileSync, existsSync, statSync, mkdirSync } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
 import { generateWechatUin, encryptAesEcb, aesEcbPaddedSize, encodeMessageAesKey, md5 } from '../utils/crypto.js';
 import { log } from '../utils/logger.js';
 import { fetchWithRetry, describeNetworkError, isRetryableNetworkError } from '../utils/http.js';
-import { DATA_DIR, savePollCursor, loadPollCursor, loadContextTokens, saveContextTokens } from '../config.js';
+import { DATA_DIR, atomicWrite, savePollCursor, loadPollCursor, loadContextTokens, saveContextTokens } from '../config.js';
 import { downloadImage, downloadFile, downloadVideo, type DownloadedMedia } from '../utils/media.js';
 import type {
   Credentials,
@@ -40,6 +40,7 @@ export interface ILinkClientOptions {
   outboxPath?: string;
   quotaPath?: string;
   diagnosticsPath?: string;
+  contextTokensPath?: string;
   maxItemsPerWindow?: number;
 }
 
@@ -73,6 +74,7 @@ export class ILinkClient {
   private readonly outbox: OutboxStore;
   private readonly quota: QuotaManager;
   private readonly diagnostics: DeliveryDiagnostics;
+  private readonly contextTokensPath: string;
   private pollCursor: string;
   private running = false;
   private contextTokens = new Map<string, string>();
@@ -96,7 +98,8 @@ export class ILinkClient {
     this.credentials = credentials;
     this.accountId = options.accountId || credentials.ilinkBotId || credentials.ilinkUserId || 'default-account';
     this.pollCursor = loadPollCursor();
-    this.contextTokens = loadContextTokens();
+    this.contextTokensPath = options.contextTokensPath || join(DATA_DIR, 'context_tokens.json');
+    this.contextTokens = loadContextTokensAt(this.contextTokensPath);
     this.outbox = new OutboxStore(options.outboxPath || join(DATA_DIR, 'outbox.json'));
     this.quota = new QuotaManager(options.quotaPath || join(DATA_DIR, 'quota.json'), this.accountId, {
       maxItemsPerWindow: options.maxItemsPerWindow,
@@ -328,7 +331,7 @@ export class ILinkClient {
 
     // Cache context_token for this user
     this.contextTokens.set(msg.from_user_id, msg.context_token);
-    saveContextTokens(this.contextTokens);
+    this.persistContextTokens();
 
     // Resume generated content before routing the new prompt. This is serialized
     // with normal sends so a new final cannot overtake the recovery window.
@@ -351,6 +354,17 @@ export class ILinkClient {
 
   getContextToken(userId: string): string | undefined {
     return this.contextTokens.get(userId);
+  }
+
+  private persistContextTokens(): void {
+    if (this.contextTokensPath === join(DATA_DIR, 'context_tokens.json')) {
+      saveContextTokens(this.contextTokens);
+      return;
+    }
+    mkdirSync(dirname(this.contextTokensPath), { recursive: true });
+    const values: Record<string, string> = {};
+    for (const [userId, token] of this.contextTokens) values[userId] = token;
+    atomicWrite(this.contextTokensPath, JSON.stringify(values, null, 2));
   }
 
   // ─── Sending ───────────────────────────────────────────
@@ -601,14 +615,17 @@ export class ILinkClient {
 
     const raw = await res.text().catch(() => '');
     if (!raw.trim()) throw new ILinkApiError({ httpStatus: res.status, errmsg: 'empty sendmessage response' });
-    let data: { ret?: number; errcode?: number; errmsg?: string };
+    let data: { ret?: number; errcode?: number; errmsg?: string; message_id?: number | string };
     try {
-      data = JSON.parse(raw) as { ret?: number; errcode?: number; errmsg?: string };
+      data = JSON.parse(raw) as { ret?: number; errcode?: number; errmsg?: string; message_id?: number | string };
     } catch {
       throw new ILinkApiError({ httpStatus: res.status, errmsg: 'sendmessage response was not valid JSON' });
     }
-    if (data.ret !== 0) {
+    if (data.ret !== undefined && data.ret !== 0) {
       throw new ILinkApiError({ ret: data.ret, errcode: data.errcode, errmsg: data.errmsg || `ret=${data.ret}` });
+    }
+    if (data.ret !== 0 && data.message_id === undefined) {
+      throw new ILinkApiError({ httpStatus: res.status, errmsg: 'sendmessage response did not confirm delivery' });
     }
   }
 
@@ -1075,6 +1092,17 @@ function errorDetails(error: unknown): ApiErrorDetails {
   const details = (error as { details?: ApiErrorDetails } | null)?.details;
   if (details) return details;
   return { errmsg: error instanceof Error ? error.message : String(error) };
+}
+
+function loadContextTokensAt(filePath: string): Map<string, string> {
+  if (filePath === join(DATA_DIR, 'context_tokens.json')) return loadContextTokens();
+  if (!existsSync(filePath)) return new Map();
+  try {
+    const parsed = JSON.parse(readFileSync(filePath, 'utf8')) as Record<string, string>;
+    return new Map(Object.entries(parsed).filter((entry): entry is [string, string] => typeof entry[1] === 'string'));
+  } catch {
+    return new Map();
+  }
 }
 
 function sleep(ms: number): Promise<void> {

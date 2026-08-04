@@ -1,5 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import { redactSecrets, ILinkClient } from '../src/ilink/client.js';
 import type { Credentials } from '../src/ilink/types.js';
@@ -49,22 +52,32 @@ const DUMMY_CREDS: Credentials = {
   botToken: 't', baseUrl: 'https://example.com', ilinkBotId: 'b', ilinkUserId: 'u',
 };
 
+function isolatedOptions() {
+  const dir = mkdtempSync(join(tmpdir(), 'quota-v2-client-internals-'));
+  return {
+    outboxPath: join(dir, 'outbox.json'),
+    quotaPath: join(dir, 'quota.json'),
+    diagnosticsPath: join(dir, 'delivery-diagnostics.jsonl'),
+    contextTokensPath: join(dir, 'context_tokens.json'),
+  };
+}
+
 test('isFreshMessage: first sighting true, replay false', () => {
-  const client = new ILinkClient(DUMMY_CREDS) as any;
+  const client = new ILinkClient(DUMMY_CREDS, isolatedOptions()) as any;
   assert.equal(client.isFreshMessage('userA', 1001), true);
   assert.equal(client.isFreshMessage('userA', 1001), false);
   assert.equal(client.isFreshMessage('userA', 1002), true);
 });
 
 test('isFreshMessage: same numeric id from different users does NOT collide', () => {
-  const client = new ILinkClient(DUMMY_CREDS) as any;
+  const client = new ILinkClient(DUMMY_CREDS, isolatedOptions()) as any;
   assert.equal(client.isFreshMessage('userA', 5), true);
   assert.equal(client.isFreshMessage('userB', 5), true, "userB's message 5 is not a dup of userA's");
   assert.equal(client.isFreshMessage('userA', 5), false);
 });
 
 test('isFreshMessage: evicts oldest beyond the 1000-entry cap but keeps recent ones', () => {
-  const client = new ILinkClient(DUMMY_CREDS) as any;
+  const client = new ILinkClient(DUMMY_CREDS, isolatedOptions()) as any;
   for (let i = 0; i < 1000; i++) assert.equal(client.isFreshMessage('u', i), true);
   // Insert one more → the oldest key (u:0) is evicted.
   assert.equal(client.isFreshMessage('u', 1000), true);

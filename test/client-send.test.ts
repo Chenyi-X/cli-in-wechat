@@ -16,7 +16,12 @@ const CREDS: Credentials = {
 
 function paths() {
   const dir = mkdtempSync(join(tmpdir(), 'quota-v2-client-'));
-  return { outboxPath: join(dir, 'outbox.json'), quotaPath: join(dir, 'quota.json') };
+  return {
+    outboxPath: join(dir, 'outbox.json'),
+    quotaPath: join(dir, 'quota.json'),
+    diagnosticsPath: join(dir, 'delivery-diagnostics.jsonl'),
+    contextTokensPath: join(dir, 'context_tokens.json'),
+  };
 }
 
 function message(id: number, uid = 'user-a', contextToken = 'context-token'): WeixinMessage {
@@ -124,6 +129,18 @@ test('ambiguous response keeps the frozen client id for the next recovery attemp
       assert.equal(retryRequests[0].body.msg.client_id, firstClientId);
       assert.equal(outbox.listPending('user-a').length, 0);
     });
+  });
+});
+
+test('HTTP success with an iLink message_id confirms delivery when ret is omitted', async () => {
+  const client = new ILinkClient(CREDS, paths());
+  await (client as any).processMessage(message(1));
+
+  await withFetchResponses([{ message_id: 12345 }], async (requests) => {
+    const result = await client.sendText('user-a', 'body');
+    assert.equal(result[0].status, 'sent');
+    assert.equal(requests.length, 1);
+    assert.equal((client as any).outbox.listPending('user-a').length, 0);
   });
 });
 
