@@ -30,6 +30,10 @@ export interface OutboxItem {
   createdAt: number;
   expiresAt: number;
   state: OutboxState;
+  deliveryReceipt?: {
+    reservationId: string;
+    quotaGeneration: number;
+  };
   continuationNoticeAttached?: boolean;
   recoveryRequired?: boolean;
   terminalError?: OutboxError;
@@ -52,6 +56,8 @@ export interface OutboxOptions {
   defaultTtlMs?: number;
   maxItemsPerUser?: number;
   maxBytesPerUser?: number;
+  finalReserveItems?: number;
+  finalReserveBytes?: number;
   now?: () => number;
 }
 
@@ -71,12 +77,14 @@ export class OutboxCorruptionError extends Error {
 
 interface PersistedOutbox {
   schemaVersion: 2;
+  revision: number;
   nextSequence: number;
   items: OutboxItem[];
 }
 
 interface LegacySnapshot {
   schemaVersion?: number;
+  revision?: number;
   nextSequence?: number;
   items?: unknown[];
 }
@@ -97,14 +105,19 @@ export class OutboxStore {
   private readonly defaultTtlMs: number;
   private readonly maxItemsPerUser: number;
   private readonly maxBytesPerUser: number;
+  private readonly finalReserveItems: number;
+  private readonly finalReserveBytes: number;
   private readonly now: () => number;
   private nextSequence = 1;
+  private revision = 0;
 
   constructor(private readonly filePath: string, options: OutboxOptions = {}) {
     this.backupPath = `${filePath}.bak`;
     this.defaultTtlMs = options.defaultTtlMs ?? DEFAULT_TTL_MS;
     this.maxItemsPerUser = options.maxItemsPerUser ?? 500;
     this.maxBytesPerUser = options.maxBytesPerUser ?? 1_000_000;
+    this.finalReserveItems = Math.max(0, Math.floor(options.finalReserveItems ?? 1));
+    this.finalReserveBytes = Math.max(0, Math.floor(options.finalReserveBytes ?? 2_000));
     this.now = options.now ?? Date.now;
     mkdirSync(dirname(filePath), { recursive: true });
     this.load();
@@ -112,45 +125,66 @@ export class OutboxStore {
   }
 
   enqueue(input: OutboxInput): OutboxItem {
+    return this.enqueueTextBatch([input])[0];
+  }
+
+  enqueueText(input: OutboxInput): OutboxItem {
+    return this.enqueue(input);
+  }
+
+  enqueueTextBatch(inputs: OutboxInput[]): OutboxItem[] {
+    if (inputs.length === 0) return [];
     this.pruneExpired();
-    if (input.itemId) {
-      const existing = this.items.get(input.itemId);
-      if (existing) return existing;
-    }
-
     const nextItems = new Map(this.items);
-    if (input.priority === 'final') {
-      this.removeSuperseded(nextItems, input.accountId, input.userId, input.generation);
+    let nextSequence = this.nextSequence;
+    let changed = false;
+    const result: OutboxItem[] = [];
+
+    for (const input of inputs) {
+      if (input.itemId) {
+        const existing = nextItems.get(input.itemId);
+        if (existing) {
+          result.push(existing);
+          continue;
+        }
+      }
+      if (input.priority === 'final') {
+        this.removeSuperseded(nextItems, input.accountId, input.userId, input.generation);
+      }
+      const bytes = Buffer.byteLength(input.text, 'utf8');
+      const userItems = [...nextItems.values()].filter((item) =>
+        item.accountId === input.accountId && item.userId === input.userId);
+      for (const eviction of this.ensureCapacity(userItems, input.priority, bytes)) {
+        nextItems.delete(eviction.itemId);
+      }
+      const createdAt = input.createdAt ?? this.now();
+      const item: OutboxItem = {
+        schemaVersion: 2,
+        itemId: input.itemId ?? randomUUID(),
+        clientId: input.clientId ?? randomUUID(),
+        sequence: nextSequence++,
+        kind: 'text',
+        accountId: input.accountId,
+        userId: input.userId,
+        generation: input.generation,
+        tokenVersion: input.tokenVersion,
+        priority: input.priority,
+        text: input.text,
+        bytes,
+        createdAt,
+        expiresAt: createdAt + (input.ttlMs ?? this.defaultTtlMs),
+        state: 'pending',
+      };
+      nextItems.set(item.itemId, item);
+      result.push(item);
+      changed = true;
     }
 
-    const bytes = Buffer.byteLength(input.text, 'utf8');
-    const userItems = [...nextItems.values()].filter((item) =>
-      item.accountId === input.accountId && item.userId === input.userId);
-    const evictions = this.ensureCapacity(userItems, input.priority, bytes);
-    for (const eviction of evictions) nextItems.delete(eviction.itemId);
-
-    const createdAt = input.createdAt ?? this.now();
-    const item: OutboxItem = {
-      schemaVersion: 2,
-      itemId: input.itemId ?? randomUUID(),
-      clientId: input.clientId ?? randomUUID(),
-      sequence: this.nextSequence++,
-      kind: 'text',
-      accountId: input.accountId,
-      userId: input.userId,
-      generation: input.generation,
-      tokenVersion: input.tokenVersion,
-      priority: input.priority,
-      text: input.text,
-      bytes,
-      createdAt,
-      expiresAt: createdAt + (input.ttlMs ?? this.defaultTtlMs),
-      state: 'pending',
-    };
-    nextItems.set(item.itemId, item);
-    this.persistState(nextItems, this.nextSequence);
-    this.publish(nextItems, this.nextSequence);
-    return item;
+    if (changed) {
+      this.persistState(nextItems, nextSequence);
+      this.publish(nextItems, nextSequence);
+    }
+    return result;
   }
 
   list(userId?: string, accountId?: string): OutboxItem[] {
@@ -176,6 +210,20 @@ export class OutboxStore {
     if (!this.items.has(itemId)) return false;
     const nextItems = new Map(this.items);
     nextItems.delete(itemId);
+    this.persistState(nextItems, this.nextSequence);
+    this.publish(nextItems, this.nextSequence);
+    return true;
+  }
+
+  recordDeliveryReceipt(itemId: string, reservationId: string, quotaGeneration: number): boolean {
+    const item = this.items.get(itemId);
+    if (!item || item.state !== 'pending') return false;
+    if (item.deliveryReceipt) {
+      return item.deliveryReceipt.reservationId === reservationId
+        && item.deliveryReceipt.quotaGeneration === quotaGeneration;
+    }
+    const nextItems = new Map(this.items);
+    nextItems.set(itemId, { ...item, deliveryReceipt: { reservationId, quotaGeneration } });
     this.persistState(nextItems, this.nextSequence);
     this.publish(nextItems, this.nextSequence);
     return true;
@@ -233,6 +281,42 @@ export class OutboxStore {
     return true;
   }
 
+  clearRecoveryRequiredForUser(accountId: string, userId: string): number {
+    const nextItems = new Map(this.items);
+    let changed = 0;
+    for (const [itemId, item] of nextItems) {
+      if (item.accountId !== accountId || item.userId !== userId || !item.recoveryRequired) continue;
+      nextItems.set(itemId, { ...item, recoveryRequired: undefined, terminalError: undefined });
+      changed += 1;
+    }
+    if (changed > 0) {
+      this.persistState(nextItems, this.nextSequence);
+      this.publish(nextItems, this.nextSequence);
+    }
+    return changed;
+  }
+
+  requeuePermanentFailures(matches: (item: OutboxItem) => boolean): number {
+    const nextItems = new Map(this.items);
+    let changed = 0;
+    for (const [itemId, item] of nextItems) {
+      if (item.state !== 'permanent-failure' || !matches(item)) continue;
+      nextItems.set(itemId, {
+        ...item,
+        state: 'pending',
+        expiresAt: item.expiresAt <= this.now() ? this.now() + this.defaultTtlMs : item.expiresAt,
+        recoveryRequired: undefined,
+        terminalError: undefined,
+      });
+      changed += 1;
+    }
+    if (changed > 0) {
+      this.persistState(nextItems, this.nextSequence);
+      this.publish(nextItems, this.nextSequence);
+    }
+    return changed;
+  }
+
   supersedeIntermediate(accountId: string, userId: string, generation: number): number {
     const nextItems = new Map(this.items);
     const removed = this.removeSuperseded(nextItems, accountId, userId, generation);
@@ -246,19 +330,30 @@ export class OutboxStore {
   private ensureCapacity(userItems: OutboxItem[], incomingPriority: OutboxPriority, incomingBytes: number): OutboxItem[] {
     let count = userItems.length + 1;
     let bytes = userItems.reduce((sum, item) => sum + item.bytes, 0) + incomingBytes;
-    if (count <= this.maxItemsPerUser && bytes <= this.maxBytesPerUser) return [];
+    const finalItems = userItems.filter((item) => item.state === 'pending' && item.priority === 'final');
+    const reservedItems = incomingPriority === 'final'
+      ? 0
+      : Math.max(0, this.finalReserveItems - finalItems.length);
+    const reservedBytes = incomingPriority === 'final'
+      ? 0
+      : Math.max(0, this.finalReserveBytes - finalItems.reduce((sum, item) => sum + item.bytes, 0));
+    const fits = () => count <= Math.max(0, this.maxItemsPerUser - reservedItems)
+      && bytes <= Math.max(0, this.maxBytesPerUser - reservedBytes);
+    if (fits()) return [];
 
     const candidates = userItems
-      .filter((item) => item.state === 'permanent-failure' || PRIORITY_RANK[item.priority] > PRIORITY_RANK[incomingPriority])
+      .filter((item) => item.state === 'pending'
+        && !item.deliveryReceipt
+        && PRIORITY_RANK[item.priority] > PRIORITY_RANK[incomingPriority])
       .sort((a, b) => PRIORITY_RANK[b.priority] - PRIORITY_RANK[a.priority] || b.sequence - a.sequence);
     const evictions: OutboxItem[] = [];
     for (const candidate of candidates) {
-      if (count <= this.maxItemsPerUser && bytes <= this.maxBytesPerUser) return evictions;
+      if (fits()) return evictions;
       evictions.push(candidate);
       count -= 1;
       bytes -= candidate.bytes;
     }
-    if (count > this.maxItemsPerUser || bytes > this.maxBytesPerUser) {
+    if (!fits()) {
       throw new OutboxCapacityError();
     }
     return evictions;
@@ -269,7 +364,9 @@ export class OutboxStore {
     for (const [itemId, item] of target) {
       if (item.accountId !== accountId || item.userId !== userId || item.generation !== generation) continue;
       if (item.priority !== 'activity' && item.priority !== 'intermediate') continue;
+      if (item.deliveryReceipt) continue;
       target.delete(itemId);
+      target.delete(`delivery-notice:${itemId}`);
       removed += 1;
     }
     return removed;
@@ -279,7 +376,7 @@ export class OutboxStore {
     const nextItems = new Map(this.items);
     let changed = false;
     for (const [itemId, item] of nextItems) {
-      if (item.state === 'pending' && item.expiresAt <= this.now()) {
+      if (item.state === 'pending' && !item.deliveryReceipt && item.expiresAt <= this.now()) {
         nextItems.set(itemId, {
           ...item,
           state: 'permanent-failure',
@@ -296,20 +393,27 @@ export class OutboxStore {
 
   private load(): void {
     const primary = this.readSnapshot(this.filePath);
-    if (primary) {
-      this.loadSnapshot(primary);
-      if (primary.schemaVersion !== 2) this.persist();
-      return;
-    }
     const backup = this.readSnapshot(this.backupPath);
-    if (backup) {
-      this.loadSnapshot(backup);
-      this.persist();
+    if (primary || backup) {
+      const useBackup = Boolean(backup)
+        && (!primary || this.snapshotFreshness(backup!) > this.snapshotFreshness(primary));
+      const selected = useBackup ? backup! : primary!;
+      this.loadSnapshot(selected);
+      if (useBackup || selected.schemaVersion !== 2 || !Number.isInteger(selected.revision)) {
+        this.persist();
+      }
       return;
     }
     if (existsSync(this.filePath) || existsSync(this.backupPath)) {
       throw new OutboxCorruptionError(this.filePath);
     }
+  }
+
+  private snapshotFreshness(snapshot: LegacySnapshot): number {
+    if (Number.isInteger(snapshot.revision) && snapshot.revision! >= 0) {
+      return Number.MAX_SAFE_INTEGER / 2 + snapshot.revision!;
+    }
+    return asFiniteNumber(snapshot.nextSequence, 0);
   }
 
   private readSnapshot(filePath: string): LegacySnapshot | undefined {
@@ -324,6 +428,7 @@ export class OutboxStore {
   }
 
   private loadSnapshot(snapshot: LegacySnapshot): void {
+    this.revision = asFiniteNumber(snapshot.revision, 0);
     let maxSequence = 0;
     for (const raw of snapshot.items ?? []) {
       if (!raw || typeof raw !== 'object') continue;
@@ -350,6 +455,12 @@ export class OutboxStore {
         createdAt,
         expiresAt: asFiniteNumber(value.expiresAt, createdAt + this.defaultTtlMs),
         state: value.state === 'permanent-failure' ? 'permanent-failure' : 'pending',
+        ...(value.deliveryReceipt?.reservationId && Number.isInteger(value.deliveryReceipt.quotaGeneration)
+          ? { deliveryReceipt: {
+              reservationId: value.deliveryReceipt.reservationId,
+              quotaGeneration: value.deliveryReceipt.quotaGeneration,
+            } }
+          : {}),
         ...(value.continuationNoticeAttached ? { continuationNoticeAttached: true } : {}),
         ...(value.recoveryRequired ? { recoveryRequired: true } : {}),
         ...(value.terminalError ? { terminalError: value.terminalError } : {}),
@@ -362,10 +473,12 @@ export class OutboxStore {
   }
 
   private persistState(items: Map<string, OutboxItem>, nextSequence: number): void {
-    const payload: PersistedOutbox = { schemaVersion: 2, nextSequence, items: [...items.values()] };
+    const revision = this.revision + 1;
+    const payload: PersistedOutbox = { schemaVersion: 2, revision, nextSequence, items: [...items.values()] };
     const encoded = JSON.stringify(payload, null, 2);
     atomicWrite(this.backupPath, encoded);
     atomicWrite(this.filePath, encoded);
+    this.revision = revision;
   }
 
   private persist(): void {

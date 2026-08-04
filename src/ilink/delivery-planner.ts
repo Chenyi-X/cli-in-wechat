@@ -17,6 +17,7 @@ export interface DeliveryWindow<T extends DeliveryItem = DeliveryItem> {
 export interface DeliveryPlanOptions {
   sentItems: number;
   maxItems: number;
+  maxItemsByPriority?: Partial<Record<DeliveryPriority, number>>;
   maxBytes?: number;
   continuationNotice: string;
 }
@@ -43,22 +44,37 @@ export function planDeliveryWindow<T extends DeliveryItem>(
     .sort((a, b) => PRIORITY_RANK[a.item.priority] - PRIORITY_RANK[b.item.priority] || a.index - b.index)
     .map(({ item }) => item);
 
-  const available = Math.max(0, Math.floor(options.maxItems) - Math.max(0, Math.floor(options.sentItems)));
-  const count = Math.min(available, ordered.length);
-  const selected = ordered.slice(0, count).map((item) => ({ ...item }));
+  const sentItems = Math.max(0, Math.floor(options.sentItems));
+  const maxItems = Math.max(0, Math.floor(options.maxItems));
+  const selected: T[] = [];
+  for (const item of ordered) {
+    const priorityLimit = Math.min(
+      maxItems,
+      Math.max(0, Math.floor(options.maxItemsByPriority?.[item.priority] ?? maxItems)),
+    );
+    if (sentItems + selected.length >= priorityLimit) break;
+    selected.push({ ...item });
+  }
   const remainingItems = ordered.length - selected.length;
-  const needsContinuation = remainingItems > 0;
+  const last = selected.at(-1);
+  const closesPriorityWindow = Boolean(last)
+    && sentItems + selected.length >= Math.min(
+      maxItems,
+      Math.max(0, Math.floor(options.maxItemsByPriority?.[last!.priority] ?? maxItems)),
+    )
+    && sentItems + selected.length < maxItems;
+  const needsContinuation = remainingItems > 0 || closesPriorityWindow;
 
   if (needsContinuation && selected.length > 0) {
-    const last = selected[selected.length - 1];
-    if (last.continuationNoticeAttached) return { items: selected, remainingItems, needsContinuation };
+    const selectedLast = selected[selected.length - 1];
+    if (selectedLast.continuationNoticeAttached) return { items: selected, remainingItems, needsContinuation };
     const suffix = `\n\n${options.continuationNotice}`;
-    const text = `${last.text}${suffix}`;
+    const text = `${selectedLast.text}${suffix}`;
     const bytes = Buffer.byteLength(text, 'utf8');
     if (options.maxBytes !== undefined && bytes > options.maxBytes) {
-      throw new RangeError(`continuation notice exceeds maxBytes for ${last.itemId}`);
+      throw new RangeError(`continuation notice exceeds maxBytes for ${selectedLast.itemId}`);
     }
-    selected[selected.length - 1] = { ...last, text, bytes, continuationNoticeAttached: true };
+    selected[selected.length - 1] = { ...selectedLast, text, bytes, continuationNoticeAttached: true };
   }
 
   return { items: selected, remainingItems, needsContinuation };

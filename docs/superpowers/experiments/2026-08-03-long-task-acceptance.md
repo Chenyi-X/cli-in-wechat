@@ -12,11 +12,18 @@ seeing the complete response in WeChat.
 | 25 final chunks | `test/client-send.test.ts` sends 10, 10, then 5 |
 | Exact ten / continuation bytes | `test/delivery-planner.test.ts` |
 | Restart and frozen client ID | `test/outbox.test.ts`, `test/client-send.test.ts` |
+| Confirmed-response crash journal and idempotent quota reconciliation | `test/outbox.test.ts`, `test/quota.test.ts`, `test/client-send.test.ts` |
+| Restart after chunks 7 and 10 | `test/client-send.test.ts` |
 | Legacy schema/current thirteen records | `test/outbox.test.ts` |
 | Ambiguous and `ret=-2` classification | `test/client-send.test.ts`, `test/send-result.test.ts` |
+| Same-inbound ambiguity gate and zero transport retries | `test/client-send.test.ts` |
+| Activity reserve, configurable windows, and in-flight generation races | `test/client-send.test.ts`, `test/quota.test.ts`, `test/router.test.ts` |
+| Torn primary/backup recovery and expired-failure requeue | `test/outbox.test.ts` |
 | Duplicate inbound and two-user isolation | `test/quota.test.ts` |
 | Exact `继续` routing and ordinary prompt preservation | `test/router.test.ts` |
 | Redacted diagnostics and `/status` | `test/diagnostics.test.ts`, `test/router.test.ts` |
+
+Latest automated run: 151 tests, 149 passed, 2 expected platform skips; typecheck and build passed.
 
 ## Real-Device Gate
 

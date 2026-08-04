@@ -103,3 +103,38 @@ test('returns an empty window when no inbound budget remains', () => {
   assert.equal(plan.remainingItems, 1);
   assert.equal(plan.needsContinuation, true);
 });
+
+test('covers the required final chunk counts at the ten-item boundary', () => {
+  for (const count of [1, 9, 10, 11, 13, 20, 25]) {
+    const items = Array.from({ length: count }, (_, index) => ({
+      itemId: `${count}-${index}`,
+      text: `chunk-${index}`,
+      priority: 'final' as const,
+      bytes: 7,
+    }));
+    const plan = planDeliveryWindow(items, {
+      sentItems: 0,
+      maxItems: 10,
+      continuationNotice: '续发',
+    });
+    assert.equal(plan.items.length, Math.min(count, 10), `count=${count}`);
+    assert.equal(plan.remainingItems, Math.max(0, count - 10), `count=${count}`);
+    assert.equal(plan.needsContinuation, count > 10, `count=${count}`);
+  }
+});
+
+test('closes a low-priority sub-window with an attached continuation notice', () => {
+  const plan = planDeliveryWindow([
+    { itemId: 'activity-9', text: 'activity', priority: 'activity', bytes: 8 },
+  ], {
+    sentItems: 8,
+    maxItems: 10,
+    maxItemsByPriority: { activity: 9, intermediate: 9 },
+    continuationNotice: '续发',
+  });
+
+  assert.equal(plan.items.length, 1);
+  assert.equal(plan.remainingItems, 0);
+  assert.equal(plan.needsContinuation, true);
+  assert.equal(plan.items[0].text, 'activity\n\n续发');
+});

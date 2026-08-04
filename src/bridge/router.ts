@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { execSync } from 'node:child_process';
 import { log } from '../utils/logger.js';
-import { ILinkClient } from '../ilink/client.js';
+import { ILinkClient, isDeliveryFinalizationError } from '../ilink/client.js';
 import { AdapterRegistry } from '../adapters/registry.js';
 import { SessionManager } from './session.js';
 import { formatResponse } from './formatter.js';
@@ -155,13 +155,32 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
     await new Promise((resolve) => setTimeout(resolve, ms));
   }
 
-  private async sendNormalActivityBatches(uid: string, lines: string[]): Promise<boolean> {
+  private async sendTextAfterConfirmation(
+    uid: string,
+    text: string,
+    options: Parameters<ILinkClient['sendText']>[2],
+    context: string,
+  ): Promise<void> {
+    try {
+      await this.ilink.sendText(uid, text, options);
+    } catch (err) {
+      if (!isDeliveryFinalizationError(err)) throw err;
+      log.error(`[${context}] 消息已确认，等待本地交付状态恢复:`, err);
+    }
+  }
+
+  private async sendNormalActivityBatches(uid: string, lines: string[], generation?: number): Promise<boolean> {
     const batches = this.splitNormalActivityLines(lines);
     if (batches.length <= 1) return false;
 
     for (let i = 0; i < batches.length; i++) {
       const title = `Activity (${i + 1}/${batches.length})`;
-      await this.ilink.sendText(uid, [title, ...batches[i]].join('\n'));
+      await this.sendTextAfterConfirmation(
+        uid,
+        [title, ...batches[i]].join('\n'),
+        { priority: 'activity', generation },
+        'activity',
+      );
       if (i < batches.length - 1) await this.sleep(NORMAL_ACTIVITY_SPLIT_DELAY_MS);
     }
     return true;
@@ -171,6 +190,9 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
   private async handle(msg: WeixinMessage, text: string, refText: string, media?: DownloadedMedia[]): Promise<void> {
     const uid = msg.from_user_id;
     if (this.config.allowedUsers.length > 0 && !this.config.allowedUsers.includes(uid)) return;
+    const taskGeneration = (this.ilink as ILinkClient & {
+      getDeliveryStatus?: (userId: string) => { quota: { generation: number } };
+    }).getDeliveryStatus?.call(this.ilink, uid)?.quota.generation;
 
     const trimmed = text.trim();
 
@@ -200,7 +222,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
 
     // ── /command ──
     if (trimmed.startsWith('/')) {
-      await this.handleSlash(uid, trimmed);
+      await this.handleSlash(uid, trimmed, taskGeneration);
       return;
     }
 
@@ -215,7 +237,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
       if (t1 && t2 && this.registry.isAvailable(t1) && this.registry.isAvailable(t2)) {
         const busy = [t1, t2].find(t => this.active.has(`${uid}:${t}`));
         if (busy) { await this.ilink.sendText(uid, `${busy} 在忙`); return; }
-        await this.chain(uid, t1, t2, prompt + mediaContext, media);
+        await this.chain(uid, t1, t2, prompt + mediaContext, media, taskGeneration);
         return;
       }
     }
@@ -234,7 +256,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
       this.sessions.update(uid, { defaultTool: toolName });
       if (this.active.has(`${uid}:${toolName}`)) { await this.ilink.sendText(uid, `${toolName} 在忙`); return; }
       const fullPrompt = `以下是 ${prev.tool} 的输出:\n\n${prev.text}\n\n---\n\n${prompt}${mediaContext}`;
-      await this.exec(uid, toolName, fullPrompt, media);
+      await this.exec(uid, toolName, fullPrompt, media, taskGeneration);
       return;
     }
 
@@ -275,12 +297,12 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
 
     const prompt = atMatch ? atMatch[2].trim() : trimmed;
     const combined = [prompt, refText].filter(Boolean).join('\n\n') + mediaContext;
-    await this.exec(uid, toolName, combined, media);
+    await this.exec(uid, toolName, combined, media, taskGeneration);
   }
 
   // ─── /command → ALL are commands, never pass through ────
 
-  private async handleSlash(uid: string, text: string): Promise<boolean> {
+  private async handleSlash(uid: string, text: string, taskGeneration?: number): Promise<boolean> {
     const parts = text.substring(1).split(/\s+/);
     const cmd = parts[0].toLowerCase();
     const arg = parts.slice(1).join(' ').trim();
@@ -378,7 +400,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
         ];
         const getDeliveryStatus = (this.ilink as ILinkClient & {
           getDeliveryStatus?: (userId: string) => {
-            quota: { sentItems: number; remainingItems: number; rateBackoffUntil: number };
+            quota: { sentItems: number; remainingItems: number; maxItemsPerWindow: number; rateBackoffUntil: number };
             pending: unknown[];
             failed: unknown[];
           };
@@ -386,7 +408,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
         if (getDeliveryStatus) {
           const delivery = getDeliveryStatus.call(this.ilink, uid);
           const backoff = delivery.quota.rateBackoffUntil > Date.now() ? 'backoff' : 'ready';
-          lines.push(`delivery: pending=${delivery.pending.length} failed=${delivery.failed.length} sent=${delivery.quota.sentItems}/10 remaining=${delivery.quota.remainingItems} ${backoff}`);
+          lines.push(`delivery: pending=${delivery.pending.length} failed=${delivery.failed.length} sent=${delivery.quota.sentItems}/${delivery.quota.maxItemsPerWindow} remaining=${delivery.quota.remainingItems} ${backoff}`);
         }
         await reply(lines.join('\n'));
         return true;
@@ -744,7 +766,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
       case 'diff': {
         const tool = settings.defaultTool || this.config.defaultTool;
         if (this.registry.isAvailable(tool)) {
-          await this.exec(uid, tool, arg || 'Show the current git diff of uncommitted changes. Be concise.');
+          await this.exec(uid, tool, arg || 'Show the current git diff of uncommitted changes. Be concise.', undefined, taskGeneration);
         }
         return true;
       }
@@ -752,7 +774,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
       case 'commit': {
         const tool = settings.defaultTool || this.config.defaultTool;
         if (this.registry.isAvailable(tool)) {
-          await this.exec(uid, tool, arg || 'Create a git commit for all staged changes with an appropriate commit message.');
+          await this.exec(uid, tool, arg || 'Create a git commit for all staged changes with an appropriate commit message.', undefined, taskGeneration);
         }
         return true;
       }
@@ -760,7 +782,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
       case 'review': {
         const tool = settings.defaultTool || this.config.defaultTool;
         if (this.registry.isAvailable(tool)) {
-          await this.exec(uid, tool, arg || 'Review the current code changes (git diff) and provide feedback on quality, bugs, and improvements.');
+          await this.exec(uid, tool, arg || 'Review the current code changes (git diff) and provide feedback on quality, bugs, and improvements.', undefined, taskGeneration);
         }
         return true;
       }
@@ -769,7 +791,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
         const tool = settings.defaultTool || this.config.defaultTool;
         const file = tool === 'codex' ? 'AGENTS.md' : tool === 'gemini' ? 'GEMINI.md' : 'CLAUDE.md';
         if (this.registry.isAvailable(tool)) {
-          await this.exec(uid, tool, arg || `Analyze this project and create a ${file} configuration file with appropriate instructions.`);
+          await this.exec(uid, tool, arg || `Analyze this project and create a ${file} configuration file with appropriate instructions.`, undefined, taskGeneration);
         }
         return true;
       }
@@ -795,7 +817,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
       case 'files': {
         const tool = settings.defaultTool || this.config.defaultTool;
         if (this.registry.isAvailable(tool)) {
-          await this.exec(uid, tool, 'List all files in the current working directory. Show the tree structure concisely.');
+          await this.exec(uid, tool, 'List all files in the current working directory. Show the tree structure concisely.', undefined, taskGeneration);
         }
         return true;
       }
@@ -834,7 +856,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
           // /plan <description> → send plan request to tool
           const tool = settings.defaultTool || this.config.defaultTool;
           if (this.registry.isAvailable(tool)) {
-            await this.exec(uid, tool, `Create a detailed plan for: ${arg}. Only plan, do not execute.`);
+            await this.exec(uid, tool, `Create a detailed plan for: ${arg}. Only plan, do not execute.`, undefined, taskGeneration);
           }
         } else {
           // /plan with no args → switch to plan mode
@@ -1076,7 +1098,14 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
 
   // ─── Chain: tool1 → tool2 ─────────────────────────────
 
-  private async chain(uid: string, tool1: string, tool2: string, prompt: string, media?: DownloadedMedia[]): Promise<void> {
+  private async chain(
+    uid: string,
+    tool1: string,
+    tool2: string,
+    prompt: string,
+    media?: DownloadedMedia[],
+    taskGeneration?: number,
+  ): Promise<void> {
     const adapter1 = this.registry.get(tool1);
     const adapter2 = this.registry.get(tool2);
     if (!adapter1 || !adapter2) return;
@@ -1094,7 +1123,9 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
 
       if (abort.signal.aborted || r1.error) {
         if (!abort.signal.aborted) {
-          await this.ilink.sendText(uid, formatResponse(n1 + r1.text, { tool: adapter1.displayName, error: true }));
+          await this.ilink.sendText(uid, formatResponse(n1 + r1.text, { tool: adapter1.displayName, error: true }), {
+            priority: 'final', generation: taskGeneration,
+          });
         }
         return;
       }
@@ -1123,11 +1154,15 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
         tool: `${adapter1.displayName} → ${adapter2.displayName}`,
         duration: elapsed,
         error: r2.error,
-      }));
+      }), { priority: 'final', generation: taskGeneration });
     } catch (err: unknown) {
       if (!abort.signal.aborted) {
         log.error(`[chain] 失败:`, err);
-        await this.ilink.sendText(uid, `链式调用失败: ${(err as Error).message}`);
+        if (!isDeliveryFinalizationError(err)) {
+          await this.ilink.sendText(uid, `链式调用失败: ${(err as Error).message}`, {
+            priority: 'final', generation: taskGeneration,
+          });
+        }
       }
     } finally {
       stopTyping();
@@ -1235,7 +1270,13 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
     return answers;
   }
 
-  private async exec(uid: string, toolName: string, prompt: string, media?: DownloadedMedia[]): Promise<void> {
+  private async exec(
+    uid: string,
+    toolName: string,
+    prompt: string,
+    media?: DownloadedMedia[],
+    taskGeneration?: number,
+  ): Promise<void> {
     const adapter = this.registry.get(toolName);
     if (!adapter) return;
 
@@ -1245,6 +1286,9 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
     const start = Date.now();
     const settings = this.sessions.get(uid);
     const msgMode = this.normalizeMsgMode(settings.msgMode);
+    taskGeneration ??= (this.ilink as ILinkClient & {
+      getDeliveryStatus?: (userId: string) => { quota: { generation: number } };
+    }).getDeliveryStatus?.call(this.ilink, uid)?.quota.generation;
 
     // Track if we've streamed text (to avoid duplicate with final result)
     let hasStreamedText = false;
@@ -1252,10 +1296,14 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
 
     // Serialize intermediate sends in-order to avoid burst/concurrency.
     let sendQueue: Promise<unknown> = Promise.resolve();
-    const enqueueIntermediateSend = (text: string): void => {
+    const enqueueIntermediateSend = (text: string, priority: 'intermediate' | 'activity' = 'intermediate'): void => {
       if (!text.trim()) return;
       sendQueue = sendQueue
-        .then(() => this.ilink.sendText(uid, text, { streamType: 'intermediate' }))
+        .then(() => this.ilink.sendText(uid, text, {
+          streamType: 'intermediate',
+          priority,
+          generation: taskGeneration,
+        }))
         .catch((err) => {
           intermediateSendFailed = true;
           log.error(`[${toolName}] 发送中间消息失败:`, err);
@@ -1288,7 +1336,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
       if (activityLines.length === 0) return;
       const payload = ['Activity', ...activityLines].join('\n');
       activityLines.length = 0;
-      enqueueIntermediateSend(payload);
+      enqueueIntermediateSend(payload, 'activity');
     };
 
     const scheduleTextFlush = (): void => {
@@ -1366,7 +1414,10 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
 
       // Send thinking content if enabled (only in compact mode, non-compact already streamed)
       if (settings.showThoughts && result.thinking && msgMode === 'compact') {
-        await this.ilink.sendText(uid, `💭 思考:\n${result.thinking}\n\n---`);
+        await this.sendTextAfterConfirmation(uid, `💭 思考:\n${result.thinking}\n\n---`, {
+          priority: 'intermediate',
+          generation: taskGeneration,
+        }, `${toolName}:thinking`);
       }
 
       const sentNotice = sentFiles.length > 0
@@ -1374,7 +1425,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
         : '';
 
       const splitActivitySent = msgMode === 'normal' && finalActivityLines.length > 0
-        ? await this.sendNormalActivityBatches(uid, finalActivityLines)
+        ? await this.sendNormalActivityBatches(uid, finalActivityLines, taskGeneration)
         : false;
 
       const finalActivityBlock = msgMode === 'normal' && finalActivityLines.length > 0 && !splitActivitySent
@@ -1386,23 +1437,26 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
         const tailNotice = intermediateSendFailed
           ? `${notice}[部分中间消息发送失败]${sentNotice}`
           : `${notice}${sentNotice}`;
-        await this.ilink.sendText(uid, formatResponse(`${finalActivityBlock}${tailNotice}`.trim(), {
+        await this.sendTextAfterConfirmation(uid, formatResponse(`${finalActivityBlock}${tailNotice}`.trim(), {
           tool: adapter.displayName,
           duration: result.duration || (Date.now() - start),
           error: result.error,
-        }));
+        }), { priority: 'final', generation: taskGeneration }, `${toolName}:final`);
       } else {
         // compact mode or no streamed text: send full result
-        await this.ilink.sendText(uid, formatResponse(`${finalActivityBlock}${notice}${cleanText}${sentNotice}`, {
+        await this.sendTextAfterConfirmation(uid, formatResponse(`${finalActivityBlock}${notice}${cleanText}${sentNotice}`, {
           tool: adapter.displayName,
           duration: result.duration || (Date.now() - start),
           error: result.error,
-        }));
+        }), { priority: 'final', generation: taskGeneration }, `${toolName}:final`);
       }
     } catch (err: unknown) {
       if (!abort.signal.aborted) {
         log.error(`[${toolName}] 失败:`, err);
-        await this.ilink.sendText(uid, `失败: ${(err as Error).message}`);
+        await this.sendTextAfterConfirmation(uid, `失败: ${(err as Error).message}`, {
+          priority: 'final',
+          generation: taskGeneration,
+        }, `${toolName}:failure`);
       }
     } finally {
       // Defensive cleanup for pending timer when task exits early.

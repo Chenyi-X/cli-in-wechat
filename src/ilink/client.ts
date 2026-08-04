@@ -37,6 +37,9 @@ export type SendStreamType = 'regular' | 'intermediate';
 
 export interface ILinkClientOptions {
   accountId?: string;
+  outbox?: OutboxStore;
+  quota?: QuotaManager;
+  diagnostics?: DeliveryDiagnostics;
   outboxPath?: string;
   quotaPath?: string;
   diagnosticsPath?: string;
@@ -48,6 +51,29 @@ export interface DeliveryStatus {
   quota: ReturnType<QuotaManager['snapshot']>;
   pending: OutboxItem[];
   failed: OutboxItem[];
+}
+
+export type DeliveryState = 'READY' | 'SENDING' | 'WAITING_INBOUND' | 'RATE_BACKOFF' | 'PERMANENT_FAILURE';
+export interface DeliveryStateSnapshot {
+  state: DeliveryState;
+  pendingCount: number;
+  failedCount: number;
+  quota: DeliveryStatus['quota'];
+}
+
+export class DeliveryFinalizationError extends Error {
+  readonly deliveryConfirmed = true;
+  readonly cause: unknown;
+
+  constructor(public readonly itemId: string, cause: unknown) {
+    super(`delivery confirmed but local finalization failed for ${itemId}`);
+    this.name = 'DeliveryFinalizationError';
+    this.cause = cause;
+  }
+}
+
+export function isDeliveryFinalizationError(err: unknown): err is DeliveryFinalizationError {
+  return Boolean(err && typeof err === 'object' && (err as { deliveryConfirmed?: unknown }).deliveryConfirmed === true);
 }
 
 const MAX_TEXT_BYTES = 2000;
@@ -100,11 +126,11 @@ export class ILinkClient {
     this.pollCursor = loadPollCursor();
     this.contextTokensPath = options.contextTokensPath || join(DATA_DIR, 'context_tokens.json');
     this.contextTokens = loadContextTokensAt(this.contextTokensPath);
-    this.outbox = new OutboxStore(options.outboxPath || join(DATA_DIR, 'outbox.json'));
-    this.quota = new QuotaManager(options.quotaPath || join(DATA_DIR, 'quota.json'), this.accountId, {
+    this.outbox = options.outbox || new OutboxStore(options.outboxPath || join(DATA_DIR, 'outbox.json'));
+    this.quota = options.quota || new QuotaManager(options.quotaPath || join(DATA_DIR, 'quota.json'), this.accountId, {
       maxItemsPerWindow: options.maxItemsPerWindow,
     });
-    this.diagnostics = new DeliveryDiagnostics(options.diagnosticsPath || join(DATA_DIR, 'delivery-diagnostics.jsonl'));
+    this.diagnostics = options.diagnostics || new DeliveryDiagnostics(options.diagnosticsPath || join(DATA_DIR, 'delivery-diagnostics.jsonl'));
   }
 
   onMessage(handler: MessageHandler): void {
@@ -313,7 +339,8 @@ export class ILinkClient {
       return;
     }
 
-    const inbound = this.quota.recordInbound(msg.from_user_id, msg.message_id, msg.context_token);
+    const usableContextToken = msg.context_token || this.contextTokens.get(msg.from_user_id) || '';
+    const inbound = this.quota.recordInbound(msg.from_user_id, msg.message_id, usableContextToken);
     this.diagnostics.record({
       event: 'inbound',
       userId: msg.from_user_id,
@@ -330,12 +357,17 @@ export class ILinkClient {
     }
 
     // Cache context_token for this user
-    this.contextTokens.set(msg.from_user_id, msg.context_token);
+    if (msg.context_token) this.contextTokens.set(msg.from_user_id, msg.context_token);
     this.persistContextTokens();
+    this.outbox.clearRecoveryRequiredForUser(this.accountId, msg.from_user_id);
 
     // Resume generated content before routing the new prompt. This is serialized
     // with normal sends so a new final cannot overtake the recovery window.
-    await this.enqueueSend(msg.from_user_id, () => this.deliverPendingNow(msg.from_user_id));
+    try {
+      await this.enqueueSend(msg.from_user_id, () => this.deliverPendingNow(msg.from_user_id));
+    } catch (err) {
+      log.error(`[delivery] 恢复 ${msg.from_user_id} 的排队消息失败:`, err);
+    }
 
     log.debug(`[msg] item_list=${JSON.stringify(redactSecrets(msg.item_list))}`);
     const { text, refText, mediaItems } = await parseMessage(msg);
@@ -424,23 +456,26 @@ export class ILinkClient {
     return true;
   }
 
-  async sendText(userId: string, text: string, options?: { streamType?: SendStreamType }): Promise<SendResult[]> {
+  async sendText(userId: string, text: string, options?: {
+    streamType?: SendStreamType;
+    priority?: OutboxItem['priority'];
+    generation?: number;
+  }): Promise<SendResult[]> {
     const streamType = options?.streamType || 'regular';
     return this.enqueueSend(userId, async () => {
       const snapshot = this.quota.snapshot(userId);
       const chunks = chunkUtf8Text(text, BODY_CHUNK_BYTES);
-      const priority = streamType === 'intermediate' ? 'intermediate' as const : 'final' as const;
-      const items: OutboxItem[] = [];
-      for (const chunk of chunks) {
-        const item = this.outbox.enqueue({
+      const priority = options?.priority || (streamType === 'intermediate' ? 'intermediate' as const : 'final' as const);
+      const generation = options?.generation ?? snapshot.generation;
+      const items = this.outbox.enqueueTextBatch(chunks.map((chunk) => ({
           accountId: this.accountId,
           userId,
-          generation: snapshot.generation,
+          generation,
           tokenVersion: snapshot.tokenVersion,
           priority,
           text: chunk,
-        });
-        items.push(item);
+        })));
+      for (const item of items) {
         this.diagnostics.record({
           event: 'queue-enqueue',
           userId,
@@ -465,6 +500,27 @@ export class ILinkClient {
     return this.enqueueSend(userId, () => this.deliverPendingNow(userId));
   }
 
+  getDeliveryState(userId: string): DeliveryStateSnapshot {
+    const status = this.getDeliveryStatus(userId);
+    let state: DeliveryState = 'READY';
+    if (status.failed.length > 0) state = 'PERMANENT_FAILURE';
+    else if (status.quota.rateBackoffUntil > Date.now()) state = 'RATE_BACKOFF';
+    else if (this.sendQueues.has(userId)) state = 'SENDING';
+    else if (
+      status.pending.some((item) => item.recoveryRequired)
+      || (status.pending.length > 0
+        && (status.quota.generation === 0 || status.quota.remainingItems === 0 || !this.contextTokens.get(userId)))
+    ) {
+      state = 'WAITING_INBOUND';
+    }
+    return {
+      state,
+      pendingCount: status.pending.length,
+      failedCount: status.failed.length,
+      quota: status.quota,
+    };
+  }
+
   getDeliveryStatus(userId: string): DeliveryStatus {
     const all = this.outbox.list(userId, this.accountId);
     return {
@@ -474,15 +530,41 @@ export class ILinkClient {
     };
   }
 
+  private reconcileDeliveryReceipts(userId: string): void {
+    const confirmed = this.outbox.listPending(userId, this.accountId)
+      .filter((item) => item.deliveryReceipt);
+    for (const item of confirmed) {
+      const receipt = item.deliveryReceipt!;
+      this.quota.commitDelivery({
+        reservationId: receipt.reservationId,
+        userId,
+        itemId: item.itemId,
+        quotaGeneration: receipt.quotaGeneration,
+        bytes: item.bytes,
+      });
+      this.outbox.ack(item.itemId);
+      this.diagnostics.record({ event: 'ack', userId, itemId: item.itemId, bytes: item.bytes });
+    }
+  }
+
   private async deliverPendingNow(userId: string): Promise<SendResult[]> {
+    this.reconcileDeliveryReceipts(userId);
     const pending = this.outbox.listPending(userId, this.accountId);
     if (pending.length === 0) return [];
+    if (pending.some((item) => item.recoveryRequired)) {
+      return pending.map((item) => this.resultForItem(
+        item,
+        item.recoveryRequired ? 'ambiguous' : 'queued',
+        item.terminalError,
+      ));
+    }
 
     const token = this.contextTokens.get(userId);
     if (!token) return pending.map((item) => this.resultForItem(item, 'waiting-for-token'));
 
     const snapshot = this.quota.snapshot(userId);
     if (snapshot.generation === 0) return pending.map((item) => this.resultForItem(item, 'waiting-for-token'));
+    if (snapshot.remainingItems === 0) return pending.map((item) => this.resultForItem(item, 'queued'));
     if (snapshot.rateBackoffUntil > Date.now()) {
       return pending.map((item) => this.resultForItem(item, 'rate-limited', {
         errmsg: 'rate limited; waiting for the next inbound window',
@@ -491,7 +573,8 @@ export class ILinkClient {
 
     const plan = planDeliveryWindow(pending as DeliveryItem[], {
       sentItems: snapshot.sentItems,
-      maxItems: 10,
+      maxItems: snapshot.sentItems + snapshot.remainingItems,
+      maxItemsByPriority: this.quota.maxItemsByPriority(),
       maxBytes: MAX_TEXT_BYTES,
       continuationNotice: CONTINUATION_NOTICE,
     });
@@ -515,6 +598,15 @@ export class ILinkClient {
         planned.text,
         Boolean(planned.continuationNoticeAttached),
       ) || current;
+      const reserved = this.quota.reserve(userId, frozen.bytes, frozen.priority, {
+        generation: frozen.generation,
+        tokenVersion: frozen.tokenVersion,
+      });
+      if (!reserved.allowed) {
+        results.push(this.resultForItem(frozen, 'queued', { errmsg: reserved.reason }));
+        break;
+      }
+      const reservationId = reserved.reservation.reservationId;
       try {
         this.diagnostics.record({
           event: 'request',
@@ -532,11 +624,8 @@ export class ILinkClient {
           clientId: frozen.clientId,
           ret: 0,
         });
-        this.outbox.ack(frozen.itemId);
-        this.quota.confirmSend(userId, frozen.itemId, frozen.bytes);
-        this.diagnostics.record({ event: 'ack', userId, itemId: frozen.itemId, bytes: frozen.bytes });
-        results.push(this.resultForItem(frozen, 'sent'));
       } catch (err) {
+        this.quota.release(reservationId);
         const details = errorDetails(err);
         this.diagnostics.record({
           event: 'response',
@@ -563,6 +652,28 @@ export class ILinkClient {
         }
         break;
       }
+
+      try {
+        if (!this.outbox.recordDeliveryReceipt(frozen.itemId, reservationId, snapshot.generation)) {
+          this.quota.release(reservationId);
+          throw new Error(`failed to persist delivery receipt for ${frozen.itemId}`);
+        }
+        if (!this.quota.commitDelivery({
+          reservationId,
+          userId,
+          itemId: frozen.itemId,
+          quotaGeneration: snapshot.generation,
+          bytes: frozen.bytes,
+        })) {
+          const currentGeneration = this.quota.snapshot(userId).generation;
+          log.warn(`[delivery] 配额窗口在确认期间从 ${snapshot.generation} 前进到 ${currentGeneration}; 已确认消息保持 ack`);
+        }
+        this.outbox.ack(frozen.itemId);
+        this.diagnostics.record({ event: 'ack', userId, itemId: frozen.itemId, bytes: frozen.bytes });
+      } catch (err) {
+        throw isDeliveryFinalizationError(err) ? err : new DeliveryFinalizationError(frozen.itemId, err);
+      }
+      results.push(this.resultForItem(frozen, 'sent'));
     }
     return results;
   }
@@ -600,7 +711,7 @@ export class ILinkClient {
             base_info: this.baseInfo(),
           }),
           label: 'send-text',
-          retries: 2,
+          retries: 0,
           timeoutMs: 30_000,
         },
       );
