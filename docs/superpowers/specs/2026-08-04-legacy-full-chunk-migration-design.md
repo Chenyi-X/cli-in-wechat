@@ -1,7 +1,7 @@
 # Legacy Full-Size Outbox Migration Design
 
 **Date:** 2026-08-04
-**Status:** User approved
+**Status:** User approved, including the schema-2 failure-state amendment
 
 ## Context
 
@@ -18,16 +18,22 @@ The failure evidence is preserved in
 The failed V2 poller is stopped. Neither the live outbox nor any saved snapshot
 will be manually cleared or restored.
 
+The failed V2 startup had already converted the live outbox to schema 2 revision
+2 before the planner error occurred. The live file therefore contains 13
+legacy-derived generation-42 final records plus the queued generation-49 `/new`
+confirmation. A schema-1-only normalization would not repair the authoritative
+live state.
+
 ## Goals
 
-- Migrate eligible schema-1 final batches to the existing V2 body-chunk limit
-  before the first V2 delivery plan.
+- Normalize eligible legacy-derived final batches to the existing V2 body-chunk
+  limit before the first fixed V2 delivery plan.
 - Preserve the concatenated UTF-8 text byte-for-byte and preserve FIFO order.
 - Keep every migrated body chunk at or below 1944 bytes so the 56-byte suffix
   can be attached without exceeding the 2000-byte send limit.
 - Persist the complete migrated snapshot atomically before network I/O.
-- Leave schema-2 payloads and any legacy record carrying delivery-recovery state
-  unchanged.
+- Leave compliant schema-2 payloads and every record carrying delivery-recovery
+  state unchanged.
 - Recover the already queued `/new` confirmation without deleting or replaying
   the inbound command.
 
@@ -36,7 +42,7 @@ will be manually cleared or restored.
 - Raising the 2000-byte send threshold.
 - Sending the continuation notice as an independent bubble.
 - Re-executing the `/new` command or any interrupted agent prompt.
-- Rewriting acknowledged, ambiguous, or schema-2 payloads.
+- Rewriting acknowledged, ambiguous, or already compliant schema-2 payloads.
 - Restoring an older cursor, quota snapshot, or outbox snapshot.
 
 ## Chosen Design
@@ -50,8 +56,9 @@ of WeChat-specific strings and receives only numeric migration limits.
 
 ### Eligibility
 
-Normalization runs only while loading a snapshot whose top-level
-`schemaVersion` is not 2. A batch is eligible when all of these conditions hold:
+Normalization checks every loaded snapshot before polling, regardless of its
+top-level schema version. It remains a no-op unless a batch satisfies all of
+these conditions:
 
 - records are consecutive in sequence order;
 - `priority` is `final` and `state` is `pending`;
@@ -66,6 +73,10 @@ recover. Under the schema-1 client, a final batch larger than the inbound limit
 was rejected as a whole before network I/O; the saved diagnostics likewise show
 the current batch only as queued. The recovery-state exclusions prevent the
 migration from changing payloads that carry evidence of a later send attempt.
+All V2-created text is already chunked at `BODY_CHUNK_BYTES`, so the combination
+of a batch larger than the window and a body larger than that limit is a durable
+signature of legacy-derived data, including data already wrapped in schema 2 by
+the failed V2 process.
 
 ### Transactional Transformation
 
@@ -101,12 +112,13 @@ snapshot restoration is attempted.
 
 ### Runtime Flow After the Fix
 
-On the first fixed startup, `OutboxStore` migrates schema 1 to schema 2 and
-persists the normalized batch before polling. The already handled `/new` command
-response remains queued behind the older final batch. A fresh exact `继续`
-message opens a new quota window: V2 sends the first ten old final chunks, with
-the notice attached to chunk ten. Further `继续` messages drain the remaining
-old chunks and then the queued command response without re-running `/new`.
+On the first fixed startup, `OutboxStore` normalizes the authoritative schema-2
+revision-2 live batch and persists the next revision before polling. The already
+handled `/new` command response remains queued behind the older final batch. A
+fresh exact `继续` message opens a new quota window: V2 sends the first ten old
+final chunks, with the notice attached to chunk ten. Further `继续` messages
+drain the remaining old chunks and then the queued command response without
+re-running `/new`.
 
 ## Test Design
 
@@ -124,8 +136,13 @@ chunks plus one 144-byte chunk in a 13-item final batch. Assert that:
 - primary and backup snapshots contain the same migrated revision; and
 - reloading the migrated snapshot is idempotent.
 
-Add focused cases proving that schema-2 records, non-final records, separate
-generations, and records with receipt or recovery state are not coalesced.
+Add focused cases proving that compliant schema-2 records, non-final records,
+separate generations, and records with receipt or recovery state are not
+coalesced. Add a second real-shaped fixture matching the current failure state:
+schema 2 revision 2, the 13 legacy-derived final records, and the later queued
+`/new` confirmation. Assert that only the legacy-derived batch is normalized,
+its body remains exact, the confirmation remains after it, and reloading the new
+revision is idempotent.
 
 ### Client Regression
 
