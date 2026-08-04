@@ -250,6 +250,16 @@ Do not execute this step until the user explicitly authorizes stopping PID 2176.
 $acceptanceRoot = Get-Content -Raw -LiteralPath 'C:\tmp\cli-in-wechat-v2-active-acceptance.txt'
 $acceptanceRoot = $acceptanceRoot.Trim()
 $liveData = 'C:\Users\35952\.wx-ai-bridge'
+$candidateCommit = (Get-Content -Raw -LiteralPath (Join-Path $acceptanceRoot 'candidate-commit.txt')).Trim()
+$currentHead = (git rev-parse HEAD).Trim()
+if (git status --porcelain) {
+  throw 'V2 worktree is not clean; do not stop the old poller'
+}
+git diff --quiet $candidateCommit $currentHead -- . ':(exclude)docs/**'
+if ($LASTEXITCODE -ne 0) {
+  throw "Non-documentation changes exist between runtime candidate $candidateCommit and HEAD $currentHead"
+}
+$currentHead | Set-Content -LiteralPath (Join-Path $acceptanceRoot 'cutover-head.txt')
 Stop-Process -Id 2176
 Wait-Process -Id 2176 -Timeout 15 -ErrorAction SilentlyContinue
 if (Get-Process -Id 2176 -ErrorAction SilentlyContinue) {
@@ -258,7 +268,10 @@ if (Get-Process -Id 2176 -ErrorAction SilentlyContinue) {
 Copy-Item -LiteralPath $liveData -Destination (Join-Path $acceptanceRoot 'wx-ai-bridge-post-stop') -Recurse
 ```
 
-Expected: PID 2176 is absent and the authoritative post-stop runtime snapshot exists. Never run the next step while PID 2176 remains alive.
+Expected: the worktree is clean, the recorded runtime candidate differs from the
+cutover HEAD only in documentation, PID 2176 is absent, and the authoritative
+post-stop runtime snapshot exists. Never run the next step while PID 2176 remains
+alive.
 
 - [ ] **Step 4: Start exactly one V2 poller and capture its PID and logs**
 

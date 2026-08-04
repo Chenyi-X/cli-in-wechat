@@ -31,6 +31,10 @@ Status: partial API evidence; UI observation and the 20-run gate remain pending.
 
 Preflight candidate: `174c37e02bc701a7366125c2dbe63cf1e418b764`.
 Evidence directory: `C:\tmp\cli-in-wechat-v2-device-20260804-142952`.
+`candidate-commit.txt` intentionally pins the verified runtime-code commit;
+subsequent branch commits modify acceptance documentation only. Before stopping
+the old poller, Step 3 proves there is no non-documentation diff and records the
+exact branch HEAD in `cutover-head.txt`.
 The pre-stop snapshot contains 131 files and all guarded-file SHA-256 hashes
 match the live directory. PID 2176 remained alive after capture; V2 cutover has
 not been authorized or started.
