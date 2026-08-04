@@ -105,3 +105,13 @@ test('migrates the legacy schema-one item shape without dropping final records',
   assert.equal(persisted.schemaVersion, 2);
   assert.equal(persisted.items.length, 13);
 });
+
+test('recovers the primary file from a valid backup snapshot', () => {
+  const filePath = tempPath();
+  const store = new OutboxStore(filePath);
+  store.enqueue(input({ itemId: 'recover-1' }));
+  writeFileSync(filePath, '{ not valid json');
+
+  const recovered = new OutboxStore(filePath);
+  assert.equal(recovered.listPending('user-a')[0]?.itemId, 'recover-1');
+});
