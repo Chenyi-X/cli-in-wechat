@@ -17,6 +17,7 @@ import {
   legacyFullChunkText,
   schemaOneLegacyFullChunkFixture,
   schemaTwoFailureFixture,
+  schemaTwoMixedFailureFixture,
 } from './fixtures/legacy-full-chunk.js';
 
 function tempPath(): string {
@@ -51,6 +52,36 @@ function assertSafePersistedSequences(filePath: string): void {
   }
   assert.ok(Number.isSafeInteger(persisted.nextSequence));
   assert.ok(persisted.nextSequence > Math.max(...sequences));
+}
+
+function stableMigrationFields(item: Record<string, unknown> | OutboxItem) {
+  return {
+    accountId: item.accountId,
+    userId: item.userId,
+    generation: item.generation,
+    tokenVersion: item.tokenVersion,
+    priority: item.priority,
+    text: item.text,
+    bytes: item.bytes,
+    createdAt: item.createdAt,
+    expiresAt: item.expiresAt,
+    state: item.state,
+    itemId: item.itemId,
+    clientId: item.clientId,
+  };
+}
+
+function assertMigrationRejectedWithoutWrite(filePath: string, original: string): void {
+  assert.throws(
+    () => new OutboxStore(filePath, migrationOptions()),
+    (error: unknown) => {
+      assert.ok(error instanceof OutboxMigrationError);
+      assert.match(error.message, /^outbox migration failed: /);
+      return true;
+    },
+  );
+  assert.equal(readFileSync(filePath, 'utf8'), original);
+  assert.equal(existsSync(`${filePath}.bak`), false);
 }
 
 test('freezes text and client id before send and reloads them after restart', () => {
@@ -264,6 +295,129 @@ test('normalizes an already-wrapped schema-two failure snapshot once', () => {
   assert.deepEqual(reloaded.listPending('user-a', 'account-a'), pending);
 });
 
+test('normalizes only the eligible batch in a 43-item mixed queue', () => {
+  const filePath = tempPath();
+  const fixture = schemaTwoMixedFailureFixture();
+  const expectedIds = fixture.items.map((item) => String(item.itemId));
+  const unrelated = fixture.items.filter((item) => item.generation !== 42);
+  writeFileSync(filePath, JSON.stringify(fixture));
+
+  const store = new OutboxStore(filePath, migrationOptions());
+  const migratedGeneration = store.listPending('user-a', 'account-a')
+    .filter((item) => item.generation === 42);
+
+  assert.equal(store.list().length, 43);
+  assert.equal(migratedGeneration.length, 13);
+  assert.equal(migratedGeneration.map((item) => item.text).join(''), legacyFullChunkText);
+  assert.ok(migratedGeneration.every((item) => item.bytes <= MIGRATED_BODY_BYTES));
+  for (const expected of unrelated) {
+    const actual = store.get(String(expected.itemId));
+    assert.ok(actual);
+    assert.deepEqual(stableMigrationFields(actual), stableMigrationFields(expected));
+  }
+
+  const primary = JSON.parse(readFileSync(filePath, 'utf8'));
+  const backup = JSON.parse(readFileSync(`${filePath}.bak`, 'utf8'));
+  assert.equal(primary.revision, 3);
+  assert.equal(backup.revision, primary.revision);
+  assert.deepEqual(primary, backup);
+  assert.deepEqual(primary.items.map((item: OutboxItem) => item.itemId), expectedIds);
+  assert.deepEqual(primary.items.map((item: OutboxItem) => item.sequence),
+    Array.from({ length: 43 }, (_, index) => index + 1));
+
+  const primaryBeforeReload = readFileSync(filePath, 'utf8');
+  const reloaded = new OutboxStore(filePath, migrationOptions());
+  assert.equal(readFileSync(filePath, 'utf8'), primaryBeforeReload);
+  assert.equal(reloaded.list().length, 43);
+});
+
+test('rejects malformed schema-two records before migration persistence', async (t) => {
+  for (const { name, append } of [
+    {
+      name: 'missing text',
+      append: () => {
+        const record = {
+          ...schemaTwoFailureFixture().items[13],
+          itemId: 'missing-text',
+          clientId: 'missing-text-client',
+          sequence: 15,
+          accountId: 'account-invalid',
+          userId: 'user-invalid',
+          generation: 50,
+        };
+        delete record.text;
+        return record;
+      },
+    },
+    {
+      name: 'missing item id',
+      append: () => {
+        const record = {
+          ...schemaTwoFailureFixture().items[13],
+          clientId: 'missing-item-id-client',
+          sequence: 15,
+          accountId: 'account-invalid',
+          userId: 'user-invalid',
+          generation: 50,
+        };
+        delete record.itemId;
+        return record;
+      },
+    },
+    {
+      name: 'missing client id',
+      append: () => {
+        const record = {
+          ...schemaTwoFailureFixture().items[13],
+          itemId: 'missing-client-id',
+          sequence: 15,
+          accountId: 'account-invalid',
+          userId: 'user-invalid',
+          generation: 50,
+        };
+        delete record.clientId;
+        return record;
+      },
+    },
+    {
+      name: 'non-object entry',
+      append: () => null,
+    },
+  ]) {
+    await t.test(name, () => {
+      const filePath = tempPath();
+      const fixture = schemaTwoFailureFixture();
+      fixture.items.push(append() as Record<string, unknown>);
+      fixture.nextSequence = 16;
+      const original = JSON.stringify(fixture, null, 2);
+      writeFileSync(filePath, original);
+
+      assertMigrationRejectedWithoutWrite(filePath, original);
+    });
+  }
+});
+
+test('rejects a duplicate stable item id before migration persistence', () => {
+  const filePath = tempPath();
+  const fixture = schemaTwoFailureFixture();
+  fixture.items.push({
+    ...fixture.items[13],
+    itemId: 'legacy-1',
+    clientId: 'duplicate-client',
+    sequence: 15,
+    accountId: 'account-duplicate',
+    userId: 'user-duplicate',
+    generation: 50,
+    text: 'duplicate record',
+    bytes: Buffer.byteLength('duplicate record', 'utf8'),
+  });
+  fixture.nextSequence = 16;
+  const original = JSON.stringify(fixture, null, 2);
+  writeFileSync(filePath, original);
+
+  assertMigrationRejectedWithoutWrite(filePath, original);
+});
+
 test('rejects incomplete or invalid migration configuration', () => {
   assert.throws(
     () => new OutboxStore(tempPath(), { bodyChunkBytes: 0, inboundItemLimit: 10 }),
@@ -469,6 +623,32 @@ test('sanitizes unsafe migration sequences without losing snapshot FIFO order', 
   assertSafePersistedSequences(filePath);
 });
 
+for (const { name, sequenceFor } of [
+  { name: 'duplicate', sequenceFor: () => 100 },
+  { name: 'non-monotonic', sequenceFor: (index: number) => 100 - index },
+]) {
+  test(`canonicalizes ${name} safe sequences without losing snapshot FIFO order`, () => {
+    const filePath = tempPath();
+    const fixture = schemaTwoFailureFixture();
+    fixture.items.forEach((item, index) => { item.sequence = sequenceFor(index); });
+    fixture.nextSequence = 1_000;
+    writeFileSync(filePath, JSON.stringify(fixture));
+
+    const store = new OutboxStore(filePath, migrationOptions());
+    const pending = store.listPending('user-a', 'account-a');
+
+    assert.deepEqual(pending.map((item) => item.itemId), [
+      ...Array.from({ length: 13 }, (_, index) => `legacy-${index + 1}`),
+      'new-confirmation',
+    ]);
+    assert.equal(
+      pending.filter((item) => item.generation === 42).map((item) => item.text).join(''),
+      legacyFullChunkText,
+    );
+    assertSafePersistedSequences(filePath);
+  });
+}
+
 for (const { name, value } of [
   { name: 'fractional', value: 1.5 },
   { name: 'negative', value: -1 },
@@ -514,6 +694,44 @@ test('rejects migration when no safe next sequence remains', () => {
     },
   );
   assert.equal(readFileSync(filePath, 'utf8'), encoded);
+});
+
+test('rejects enqueue when no safe successor sequence remains without changing snapshots', () => {
+  const filePath = tempPath();
+  const fixture = schemaTwoFailureFixture();
+  fixture.nextSequence = Number.MAX_SAFE_INTEGER;
+  writeFileSync(filePath, JSON.stringify(fixture));
+  const store = new OutboxStore(filePath, migrationOptions());
+  const primaryBefore = readFileSync(filePath, 'utf8');
+  const backupBefore = readFileSync(`${filePath}.bak`, 'utf8');
+
+  assert.throws(
+    () => store.enqueue(input({ itemId: 'sequence-capacity', generation: 50 })),
+    (error: unknown) => {
+      assert.ok(error instanceof OutboxMigrationError);
+      assert.match(error.message, /sequence capacity/i);
+      return true;
+    },
+  );
+  assert.equal(store.get('sequence-capacity'), undefined);
+  assert.equal(readFileSync(filePath, 'utf8'), primaryBefore);
+  assert.equal(readFileSync(`${filePath}.bak`, 'utf8'), backupBefore);
+  assert.doesNotThrow(() => new OutboxStore(filePath, migrationOptions()));
+});
+
+test('a public update persists only canonical sequence invariants', () => {
+  const filePath = tempPath();
+  const fixture = schemaTwoFailureFixture();
+  fixture.items = fixture.items.slice(0, 2);
+  fixture.items[0].sequence = 2;
+  fixture.items[1].sequence = 1;
+  fixture.nextSequence = 1;
+  writeFileSync(filePath, JSON.stringify(fixture));
+  const store = new OutboxStore(filePath, migrationOptions());
+
+  assert.ok(store.freezeText('legacy-1', 'updated text'));
+
+  assertSafePersistedSequences(filePath);
 });
 
 test('recovers the primary file from a valid backup snapshot', () => {

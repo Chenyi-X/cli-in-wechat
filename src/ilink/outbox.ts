@@ -195,11 +195,14 @@ export class OutboxStore {
         nextItems.delete(eviction.itemId);
       }
       const createdAt = input.createdAt ?? this.now();
+      const sequence = asPositiveSafeInteger(nextSequence);
+      if (sequence === undefined) throw sequenceCapacityError();
+      const followingSequence = nextSafeSequence(sequence);
       const item: OutboxItem = {
         schemaVersion: 2,
         itemId: input.itemId ?? randomUUID(),
         clientId: input.clientId ?? randomUUID(),
-        sequence: nextSequence++,
+        sequence,
         kind: 'text',
         accountId: input.accountId,
         userId: input.userId,
@@ -213,6 +216,7 @@ export class OutboxStore {
         state: 'pending',
       };
       nextItems.set(item.itemId, item);
+      nextSequence = followingSequence;
       result.push(item);
       changed = true;
     }
@@ -469,20 +473,44 @@ export class OutboxStore {
 
   private decodeSnapshot(snapshot: LegacySnapshot): LoadedOutboxState {
     const items = new Map<string, OutboxItem>();
+    const requiresStableIds = snapshot.schemaVersion === 2;
     let maxSequence = 0;
-    for (const raw of snapshot.items ?? []) {
-      if (!raw || typeof raw !== 'object') continue;
+    for (const [index, raw] of (snapshot.items ?? []).entries()) {
+      if (!raw || typeof raw !== 'object') {
+        throw new OutboxMigrationError(`invalid item at index ${index}: expected an object`);
+      }
       const value = raw as Partial<OutboxItem>;
-      if (typeof value.text !== 'string') continue;
+      if (typeof value.text !== 'string') {
+        throw new OutboxMigrationError(`invalid item at index ${index}: text must be a string`);
+      }
+      const providedItemId = typeof value.itemId === 'string' && value.itemId.length > 0
+        ? value.itemId
+        : undefined;
+      const providedClientId = typeof value.clientId === 'string' && value.clientId.length > 0
+        ? value.clientId
+        : undefined;
+      if (requiresStableIds && providedItemId === undefined) {
+        throw new OutboxMigrationError(`invalid schema-two item at index ${index}: itemId must be a nonempty string`);
+      }
+      if (requiresStableIds && providedClientId === undefined) {
+        throw new OutboxMigrationError(`invalid schema-two item at index ${index}: clientId must be a nonempty string`);
+      }
+      const itemId = providedItemId ?? randomUUID();
+      if (items.has(itemId)) {
+        throw new OutboxMigrationError(`duplicate itemId at index ${index}: ${itemId}`);
+      }
       const priority = value.priority && PRIORITY_RANK[value.priority] !== undefined
         ? value.priority
         : 'final';
-      const sequence = asPositiveSafeInteger(value.sequence) ?? nextSafeSequence(maxSequence);
+      const candidateSequence = asPositiveSafeInteger(value.sequence);
+      const sequence = candidateSequence !== undefined && candidateSequence > maxSequence
+        ? candidateSequence
+        : nextSafeSequence(maxSequence);
       const createdAt = asFiniteNumber(value.createdAt, this.now());
       const item: OutboxItem = {
         schemaVersion: 2,
-        itemId: value.itemId || randomUUID(),
-        clientId: value.clientId || randomUUID(),
+        itemId,
+        clientId: providedClientId ?? randomUUID(),
         sequence,
         kind: 'text',
         accountId: value.accountId || '',
@@ -505,9 +533,8 @@ export class OutboxStore {
         ...(value.recoveryRequired ? { recoveryRequired: true } : {}),
         ...(value.terminalError ? { terminalError: value.terminalError } : {}),
       };
-      if (items.has(item.itemId)) continue;
       items.set(item.itemId, item);
-      maxSequence = Math.max(maxSequence, sequence);
+      maxSequence = sequence;
     }
     const persistedNextSequence = asPositiveSafeInteger(snapshot.nextSequence);
     return {
@@ -598,6 +625,7 @@ export class OutboxStore {
   }
 
   private persistState(items: Map<string, OutboxItem>, nextSequence: number): void {
+    assertPersistableSequences(items, nextSequence);
     const revision = this.revision + 1;
     const payload: PersistedOutbox = { schemaVersion: 2, revision, nextSequence, items: [...items.values()] };
     const encoded = JSON.stringify(payload, null, 2);
@@ -640,4 +668,21 @@ function nextSafeSequence(sequence: number): number {
 
 function sequenceCapacityError(): OutboxMigrationError {
   return new OutboxMigrationError('sequence capacity exhausted; no safe nextSequence remains');
+}
+
+function assertPersistableSequences(items: Map<string, OutboxItem>, nextSequence: number): void {
+  let previousSequence = 0;
+  for (const item of items.values()) {
+    if (asPositiveSafeInteger(item.sequence) === undefined || item.sequence <= previousSequence) {
+      throw new OutboxMigrationError(
+        'persisted sequence invariant failed: item sequences must be positive, safe, unique, and strictly increasing',
+      );
+    }
+    previousSequence = item.sequence;
+  }
+  if (asPositiveSafeInteger(nextSequence) === undefined || nextSequence <= previousSequence) {
+    throw new OutboxMigrationError(
+      'persisted sequence invariant failed: nextSequence must be safe and greater than every item sequence',
+    );
+  }
 }

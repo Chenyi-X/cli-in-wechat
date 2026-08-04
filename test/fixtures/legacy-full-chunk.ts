@@ -75,3 +75,58 @@ export function schemaTwoFailureFixture(): OutboxFixtureSnapshot {
     ],
   };
 }
+
+function mixedUnrelatedItem(position: 'before' | 'after', index: number, sequence: number): Record<string, unknown> {
+  const text = `${position}-${index + 1}`;
+  const priorities = ['activity', 'intermediate', 'control'] as const;
+  return {
+    schemaVersion: 2,
+    itemId: `mixed-${position}-${index + 1}`,
+    clientId: `mixed-${position}-client-${index + 1}`,
+    sequence,
+    kind: 'text',
+    accountId: `account-${position}-${index % 3}`,
+    userId: `user-${position}-${index + 1}`,
+    generation: 100 + sequence,
+    tokenVersion: 20 + (index % 4),
+    priority: priorities[index % priorities.length],
+    text,
+    bytes: Buffer.byteLength(text, 'utf8'),
+    createdAt: CREATED_AT + 1_000 + sequence,
+    expiresAt: EXPIRES_AT,
+    state: 'pending',
+  };
+}
+
+export function schemaTwoMixedFailureFixture(): OutboxFixtureSnapshot {
+  return {
+    schemaVersion: 2,
+    revision: 2,
+    nextSequence: 44,
+    items: [
+      ...Array.from({ length: 15 }, (_, index) => mixedUnrelatedItem('before', index, index + 1)),
+      ...LEGACY_TEXTS.map((text, index) => ({
+        ...legacyItem(index, text, 2),
+        sequence: index + 16,
+      })),
+      {
+        schemaVersion: 2,
+        itemId: 'new-confirmation',
+        clientId: 'new-confirmation-client',
+        sequence: 29,
+        kind: 'text',
+        accountId: 'account-a',
+        userId: 'user-a',
+        generation: 49,
+        tokenVersion: 8,
+        priority: 'final',
+        text: '新会话',
+        bytes: Buffer.byteLength('新会话', 'utf8'),
+        createdAt: CREATED_AT + 100,
+        expiresAt: EXPIRES_AT,
+        state: 'pending',
+      },
+      ...Array.from({ length: 14 }, (_, index) => mixedUnrelatedItem('after', index, index + 30)),
+    ],
+  };
+}
