@@ -18,6 +18,7 @@ import { planDeliveryWindow, type DeliveryItem } from './delivery-planner.js';
 import { OutboxStore, type OutboxItem } from './outbox.js';
 import { QuotaManager } from './quota.js';
 import { classifyApiFailure, type ApiErrorDetails, type SendResult } from './send-result.js';
+import { DeliveryDiagnostics } from './diagnostics.js';
 
 const CHANNEL_VERSION = '1.0.2';
 const HTTP_TIMEOUT_MS = 45_000;
@@ -38,12 +39,14 @@ export interface ILinkClientOptions {
   accountId?: string;
   outboxPath?: string;
   quotaPath?: string;
+  diagnosticsPath?: string;
   maxItemsPerWindow?: number;
 }
 
 export interface DeliveryStatus {
   quota: ReturnType<QuotaManager['snapshot']>;
   pending: OutboxItem[];
+  failed: OutboxItem[];
 }
 
 const MAX_TEXT_BYTES = 2000;
@@ -69,6 +72,7 @@ export class ILinkClient {
   private readonly accountId: string;
   private readonly outbox: OutboxStore;
   private readonly quota: QuotaManager;
+  private readonly diagnostics: DeliveryDiagnostics;
   private pollCursor: string;
   private running = false;
   private contextTokens = new Map<string, string>();
@@ -97,6 +101,7 @@ export class ILinkClient {
     this.quota = new QuotaManager(options.quotaPath || join(DATA_DIR, 'quota.json'), this.accountId, {
       maxItemsPerWindow: options.maxItemsPerWindow,
     });
+    this.diagnostics = new DeliveryDiagnostics(options.diagnosticsPath || join(DATA_DIR, 'delivery-diagnostics.jsonl'));
   }
 
   onMessage(handler: MessageHandler): void {
@@ -306,6 +311,14 @@ export class ILinkClient {
     }
 
     const inbound = this.quota.recordInbound(msg.from_user_id, msg.message_id, msg.context_token);
+    this.diagnostics.record({
+      event: 'inbound',
+      userId: msg.from_user_id,
+      messageId: msg.message_id,
+      generation: inbound.generation,
+      tokenVersion: inbound.tokenVersion,
+      duplicate: inbound.duplicate,
+    });
     // The in-memory de-dup cache is intentionally bounded. The durable quota
     // ledger is the second line of defense after a process restart.
     if (inbound.duplicate) {
@@ -405,14 +418,24 @@ export class ILinkClient {
       const priority = streamType === 'intermediate' ? 'intermediate' as const : 'final' as const;
       const items: OutboxItem[] = [];
       for (const chunk of chunks) {
-        items.push(this.outbox.enqueue({
+        const item = this.outbox.enqueue({
           accountId: this.accountId,
           userId,
           generation: snapshot.generation,
           tokenVersion: snapshot.tokenVersion,
           priority,
           text: chunk,
-        }));
+        });
+        items.push(item);
+        this.diagnostics.record({
+          event: 'queue-enqueue',
+          userId,
+          itemId: item.itemId,
+          generation: item.generation,
+          tokenVersion: item.tokenVersion,
+          priority: item.priority,
+          bytes: item.bytes,
+        });
       }
       log.debug(`发送给 [${userId.substring(0, 12)}...] (${chunks.length} 块): ${text.substring(0, 100)}${text.length > 100 ? '…' : ''}`);
 
@@ -429,9 +452,11 @@ export class ILinkClient {
   }
 
   getDeliveryStatus(userId: string): DeliveryStatus {
+    const all = this.outbox.list(userId, this.accountId);
     return {
       quota: this.quota.snapshot(userId),
-      pending: this.outbox.listPending(userId, this.accountId),
+      pending: all.filter((item) => item.state === 'pending'),
+      failed: all.filter((item) => item.state === 'permanent-failure'),
     };
   }
 
@@ -456,6 +481,16 @@ export class ILinkClient {
       maxBytes: MAX_TEXT_BYTES,
       continuationNotice: CONTINUATION_NOTICE,
     });
+    this.diagnostics.record({
+      event: 'plan',
+      userId,
+      generation: snapshot.generation,
+      tokenVersion: snapshot.tokenVersion,
+      sentItems: snapshot.sentItems,
+      plannedItems: plan.items.length,
+      remainingItems: plan.remainingItems,
+      needsContinuation: plan.needsContinuation,
+    });
     const results: SendResult[] = [];
 
     for (const planned of plan.items) {
@@ -467,12 +502,38 @@ export class ILinkClient {
         Boolean(planned.continuationNoticeAttached),
       ) || current;
       try {
+        this.diagnostics.record({
+          event: 'request',
+          userId,
+          itemId: frozen.itemId,
+          clientId: frozen.clientId,
+          generation: frozen.generation,
+          bytes: frozen.bytes,
+        });
         await this.sendRawTextMessage(userId, token, frozen);
+        this.diagnostics.record({
+          event: 'response',
+          userId,
+          itemId: frozen.itemId,
+          clientId: frozen.clientId,
+          ret: 0,
+        });
         this.outbox.ack(frozen.itemId);
         this.quota.confirmSend(userId, frozen.itemId, frozen.bytes);
+        this.diagnostics.record({ event: 'ack', userId, itemId: frozen.itemId, bytes: frozen.bytes });
         results.push(this.resultForItem(frozen, 'sent'));
       } catch (err) {
         const details = errorDetails(err);
+        this.diagnostics.record({
+          event: 'response',
+          userId,
+          itemId: frozen.itemId,
+          clientId: frozen.clientId,
+          ret: details.ret,
+          errcode: details.errcode,
+          errmsg: details.errmsg,
+          httpStatus: details.httpStatus,
+        });
         const classified = classifyApiFailure(details);
         if (classified?.status === 'rate-limited') {
           const cooldownMs = this.nextCooldownMs(this.getRateLimitState(userId).consecutiveRet2 + 1);

@@ -376,6 +376,18 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
           `会话: ${sids}`,
           `可用: ${this.registry.getAvailableNames().join(', ')}`,
         ];
+        const getDeliveryStatus = (this.ilink as ILinkClient & {
+          getDeliveryStatus?: (userId: string) => {
+            quota: { sentItems: number; remainingItems: number; rateBackoffUntil: number };
+            pending: unknown[];
+            failed: unknown[];
+          };
+        }).getDeliveryStatus;
+        if (getDeliveryStatus) {
+          const delivery = getDeliveryStatus.call(this.ilink, uid);
+          const backoff = delivery.quota.rateBackoffUntil > Date.now() ? 'backoff' : 'ready';
+          lines.push(`delivery: pending=${delivery.pending.length} failed=${delivery.failed.length} sent=${delivery.quota.sentItems}/10 remaining=${delivery.quota.remainingItems} ${backoff}`);
+        }
         await reply(lines.join('\n'));
         return true;
       }

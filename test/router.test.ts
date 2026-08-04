@@ -189,6 +189,19 @@ test('ordinary text still reaches the adapter after recovery is attempted', asyn
   assert.equal(capturedPrompt, 'new question');
 });
 
+test('/status exposes durable delivery counters when the client provides them', async () => {
+  const { router, messages } = createRouter();
+  (router as any).ilink.getDeliveryStatus = () => ({
+    quota: { sentItems: 7, remainingItems: 3, rateBackoffUntil: 0 },
+    pending: [{ itemId: 'pending-1' }],
+    failed: [{ itemId: 'failed-1' }],
+  });
+
+  await router.handleSlash('u1', '/status');
+
+  assert.match(messages.at(-1)?.text || '', /delivery: pending=1 failed=1 sent=7\/10 remaining=3 ready/);
+});
+
 test('handleSlash /model strips accidental /. suffix from model name', async () => {
   const { router, sessions, messages } = createRouter();
 
