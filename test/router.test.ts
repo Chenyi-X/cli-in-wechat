@@ -9,6 +9,7 @@ import type { WeixinMessage } from '../src/ilink/types.js';
 function createRouter() {
   const messages: Array<{ uid: string; text: string }> = [];
   const starts: string[] = [];
+  const recoveries: string[] = [];
 
   const ilink = {
     sendText: async (uid: string, text: string) => {
@@ -17,6 +18,10 @@ function createRouter() {
     startTyping: async (uid: string) => {
       starts.push(uid);
       return () => {};
+    },
+    recoverPending: async (uid: string) => {
+      recoveries.push(uid);
+      return [];
     },
     onMessage: () => {},
   };
@@ -54,7 +59,7 @@ function createRouter() {
   };
 
   const router = new Router(ilink as any, registry as any, sessions as any, config);
-  return { router: router as any, messages, starts, sessions };
+  return { router: router as any, messages, starts, recoveries, sessions };
 }
 
 function makeMessage(uid: string): WeixinMessage {
@@ -156,6 +161,32 @@ test('handle() omits refText in combined prompt if refText is empty', async () =
   await router.handle(makeMessage('u1'), 'explain', '');
 
   assert.equal(capturedPrompt, 'explain');
+});
+
+test('exact 继续 consumes the message after attempting outbox recovery', async () => {
+  const { router, recoveries } = createRouter();
+  let execCalled = false;
+  router.exec = async () => {
+    execCalled = true;
+  };
+
+  await router.handle(makeMessage('u1'), '  继续  ', '');
+
+  assert.deepEqual(recoveries, ['u1']);
+  assert.equal(execCalled, false);
+});
+
+test('ordinary text still reaches the adapter after recovery is attempted', async () => {
+  const { router, recoveries } = createRouter();
+  let capturedPrompt = '';
+  router.exec = async (_uid: string, _tool: string, prompt: string) => {
+    capturedPrompt = prompt;
+  };
+
+  await router.handle(makeMessage('u1'), 'new question', '');
+
+  assert.deepEqual(recoveries, ['u1']);
+  assert.equal(capturedPrompt, 'new question');
 });
 
 test('handleSlash /model strips accidental /. suffix from model name', async () => {
