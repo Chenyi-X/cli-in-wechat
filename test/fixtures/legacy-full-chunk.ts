@@ -23,9 +23,9 @@ export interface OutboxFixtureSnapshot {
 function legacyItem(index: number, text: string, schemaVersion: 1 | 2): Record<string, unknown> {
   return {
     schemaVersion,
-    itemId: `legacy-${index}`,
-    clientId: `legacy-client-${index}`,
-    sequence: index,
+    itemId: `legacy-${index + 1}`,
+    clientId: `legacy-client-${index + 1}`,
+    sequence: index + 1,
     kind: 'text',
     accountId: 'account-a',
     userId: 'user-a',
@@ -34,7 +34,7 @@ function legacyItem(index: number, text: string, schemaVersion: 1 | 2): Record<s
     priority: 'final',
     text,
     bytes: Buffer.byteLength(text, 'utf8'),
-    createdAt: CREATED_AT,
+    createdAt: CREATED_AT + index,
     expiresAt: EXPIRES_AT,
     state: 'pending',
   };
@@ -44,7 +44,7 @@ export function schemaOneLegacyFullChunkFixture(): OutboxFixtureSnapshot {
   return {
     schemaVersion: 1,
     nextSequence: 14,
-    items: LEGACY_TEXTS.map((text, index) => legacyItem(index + 1, text, 1)),
+    items: LEGACY_TEXTS.map((text, index) => legacyItem(index, text, 1)),
   };
 }
 
@@ -54,11 +54,11 @@ export function schemaTwoFailureFixture(): OutboxFixtureSnapshot {
     revision: 2,
     nextSequence: 15,
     items: [
-      ...LEGACY_TEXTS.map((text, index) => legacyItem(index + 1, text, 2)),
+      ...LEGACY_TEXTS.map((text, index) => legacyItem(index, text, 2)),
       {
         schemaVersion: 2,
-        itemId: 'confirmation-14',
-        clientId: 'confirmation-client-14',
+        itemId: 'new-confirmation',
+        clientId: 'new-confirmation-client',
         sequence: 14,
         kind: 'text',
         accountId: 'account-a',
