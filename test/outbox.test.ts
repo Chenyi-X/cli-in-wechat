@@ -418,6 +418,122 @@ test('rejects a duplicate stable item id before migration persistence', () => {
   assertMigrationRejectedWithoutWrite(filePath, original);
 });
 
+test('rejects malformed schema-two delivery state before migration persistence', async (t) => {
+  for (const { name, mutate } of [
+    {
+      name: 'unknown priority',
+      mutate: (item: Record<string, unknown>) => { item.priority = 'unknown-priority'; },
+    },
+    {
+      name: 'unknown state',
+      mutate: (item: Record<string, unknown>) => { item.state = 'unknown-state'; },
+    },
+    {
+      name: 'null delivery receipt',
+      mutate: (item: Record<string, unknown>) => { item.deliveryReceipt = null; },
+    },
+    {
+      name: 'array delivery receipt',
+      mutate: (item: Record<string, unknown>) => { item.deliveryReceipt = []; },
+    },
+    {
+      name: 'missing receipt reservation id',
+      mutate: (item: Record<string, unknown>) => {
+        item.deliveryReceipt = { quotaGeneration: 42 };
+      },
+    },
+    {
+      name: 'empty receipt reservation id',
+      mutate: (item: Record<string, unknown>) => {
+        item.deliveryReceipt = { reservationId: '', quotaGeneration: 42 };
+      },
+    },
+    {
+      name: 'fractional receipt quota generation',
+      mutate: (item: Record<string, unknown>) => {
+        item.deliveryReceipt = { reservationId: 'reservation-1', quotaGeneration: 1.5 };
+      },
+    },
+    {
+      name: 'unsafe receipt quota generation',
+      mutate: (item: Record<string, unknown>) => {
+        item.deliveryReceipt = { reservationId: 'reservation-1', quotaGeneration: 1e20 };
+      },
+    },
+    {
+      name: 'negative receipt quota generation',
+      mutate: (item: Record<string, unknown>) => {
+        item.deliveryReceipt = { reservationId: 'reservation-1', quotaGeneration: -1 };
+      },
+    },
+    {
+      name: 'non-boolean recovery required',
+      mutate: (item: Record<string, unknown>) => { item.recoveryRequired = 'true'; },
+    },
+    {
+      name: 'non-boolean continuation notice',
+      mutate: (item: Record<string, unknown>) => { item.continuationNoticeAttached = 1; },
+    },
+  ]) {
+    await t.test(name, () => {
+      const filePath = tempPath();
+      const fixture = schemaTwoFailureFixture();
+      mutate(fixture.items[6]);
+      const original = JSON.stringify(fixture, null, 2);
+      writeFileSync(filePath, original);
+
+      assertMigrationRejectedWithoutWrite(filePath, original);
+    });
+  }
+});
+
+test('preserves explicit false schema-two delivery flags through migration and reload', () => {
+  const filePath = tempPath();
+  const fixture = schemaTwoFailureFixture();
+  fixture.items[6].recoveryRequired = false;
+  fixture.items[6].continuationNoticeAttached = false;
+  writeFileSync(filePath, JSON.stringify(fixture));
+
+  const store = new OutboxStore(filePath, migrationOptions());
+  const migrated = store.get('legacy-7');
+  assert.ok(migrated);
+  assert.equal(Object.hasOwn(migrated, 'recoveryRequired'), true);
+  assert.equal(migrated.recoveryRequired, false);
+  assert.equal(Object.hasOwn(migrated, 'continuationNoticeAttached'), true);
+  assert.equal(migrated.continuationNoticeAttached, false);
+
+  const primary = JSON.parse(readFileSync(filePath, 'utf8'));
+  const backup = JSON.parse(readFileSync(`${filePath}.bak`, 'utf8'));
+  for (const snapshot of [primary, backup]) {
+    const item = snapshot.items.find((candidate: OutboxItem) => candidate.itemId === 'legacy-7');
+    assert.ok(item);
+    assert.equal(Object.hasOwn(item, 'recoveryRequired'), true);
+    assert.equal(item.recoveryRequired, false);
+    assert.equal(Object.hasOwn(item, 'continuationNoticeAttached'), true);
+    assert.equal(item.continuationNoticeAttached, false);
+  }
+
+  const reloaded = new OutboxStore(filePath, migrationOptions()).get('legacy-7');
+  assert.ok(reloaded);
+  assert.equal(Object.hasOwn(reloaded, 'recoveryRequired'), true);
+  assert.equal(reloaded.recoveryRequired, false);
+  assert.equal(Object.hasOwn(reloaded, 'continuationNoticeAttached'), true);
+  assert.equal(reloaded.continuationNoticeAttached, false);
+});
+
+test('keeps permissive priority and state defaults for schema-one snapshots', () => {
+  const filePath = tempPath();
+  const fixture = schemaOneLegacyFullChunkFixture();
+  fixture.items[6].priority = 'unknown-priority';
+  fixture.items[6].state = 'unknown-state';
+  writeFileSync(filePath, JSON.stringify(fixture));
+
+  const store = new OutboxStore(filePath, migrationOptions());
+
+  assert.equal(store.get('legacy-7')?.priority, 'final');
+  assert.equal(store.get('legacy-7')?.state, 'pending');
+});
+
 test('rejects incomplete or invalid migration configuration', () => {
   assert.throws(
     () => new OutboxStore(tempPath(), { bodyChunkBytes: 0, inboundItemLimit: 10 }),

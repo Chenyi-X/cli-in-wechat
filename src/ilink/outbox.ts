@@ -111,6 +111,14 @@ interface NormalizedOutboxState {
   changed: boolean;
 }
 
+interface DecodedDeliveryState {
+  priority: OutboxPriority;
+  state: OutboxState;
+  deliveryReceipt?: OutboxItem['deliveryReceipt'];
+  continuationNoticeAttached?: boolean;
+  recoveryRequired?: boolean;
+}
+
 const PRIORITY_RANK: Record<OutboxPriority, number> = {
   final: 0,
   control: 1,
@@ -499,9 +507,7 @@ export class OutboxStore {
       if (items.has(itemId)) {
         throw new OutboxMigrationError(`duplicate itemId at index ${index}: ${itemId}`);
       }
-      const priority = value.priority && PRIORITY_RANK[value.priority] !== undefined
-        ? value.priority
-        : 'final';
+      const deliveryState = decodeDeliveryState(value, index, requiresStableIds);
       const candidateSequence = asPositiveSafeInteger(value.sequence);
       const sequence = candidateSequence !== undefined && candidateSequence > maxSequence
         ? candidateSequence
@@ -517,20 +523,19 @@ export class OutboxStore {
         userId: value.userId || '',
         generation: asFiniteNumber(value.generation, 0),
         tokenVersion: asFiniteNumber(value.tokenVersion, 0),
-        priority,
+        priority: deliveryState.priority,
         text: value.text,
         bytes: Buffer.byteLength(value.text, 'utf8'),
         createdAt,
         expiresAt: asFiniteNumber(value.expiresAt, createdAt + this.defaultTtlMs),
-        state: value.state === 'permanent-failure' ? 'permanent-failure' : 'pending',
-        ...(value.deliveryReceipt?.reservationId && Number.isInteger(value.deliveryReceipt.quotaGeneration)
-          ? { deliveryReceipt: {
-              reservationId: value.deliveryReceipt.reservationId,
-              quotaGeneration: value.deliveryReceipt.quotaGeneration,
-            } }
+        state: deliveryState.state,
+        ...(deliveryState.deliveryReceipt ? { deliveryReceipt: deliveryState.deliveryReceipt } : {}),
+        ...(Object.hasOwn(deliveryState, 'continuationNoticeAttached')
+          ? { continuationNoticeAttached: deliveryState.continuationNoticeAttached }
           : {}),
-        ...(value.continuationNoticeAttached ? { continuationNoticeAttached: true } : {}),
-        ...(value.recoveryRequired ? { recoveryRequired: true } : {}),
+        ...(Object.hasOwn(deliveryState, 'recoveryRequired')
+          ? { recoveryRequired: deliveryState.recoveryRequired }
+          : {}),
         ...(value.terminalError ? { terminalError: value.terminalError } : {}),
       };
       items.set(item.itemId, item);
@@ -646,6 +651,78 @@ function sameMigrationBatch(left: OutboxItem, right: OutboxItem): boolean {
     && left.userId === right.userId
     && left.generation === right.generation
     && left.tokenVersion === right.tokenVersion;
+}
+
+function decodeDeliveryState(
+  value: Partial<OutboxItem>,
+  index: number,
+  strictSchemaTwo: boolean,
+): DecodedDeliveryState {
+  if (!strictSchemaTwo) {
+    return {
+      priority: isOutboxPriority(value.priority) ? value.priority : 'final',
+      state: value.state === 'permanent-failure' ? 'permanent-failure' : 'pending',
+      ...(value.deliveryReceipt?.reservationId && Number.isInteger(value.deliveryReceipt.quotaGeneration)
+        ? { deliveryReceipt: {
+            reservationId: value.deliveryReceipt.reservationId,
+            quotaGeneration: value.deliveryReceipt.quotaGeneration,
+          } }
+        : {}),
+      ...(value.continuationNoticeAttached ? { continuationNoticeAttached: true } : {}),
+      ...(value.recoveryRequired ? { recoveryRequired: true } : {}),
+    };
+  }
+
+  if (!isOutboxPriority(value.priority)) {
+    throw new OutboxMigrationError(`invalid schema-two item at index ${index}: unknown priority`);
+  }
+  if (value.state !== 'pending' && value.state !== 'permanent-failure') {
+    throw new OutboxMigrationError(`invalid schema-two item at index ${index}: unknown state`);
+  }
+
+  const raw = value as Record<string, unknown>;
+  const deliveryReceipt = raw.deliveryReceipt;
+  let decodedReceipt: OutboxItem['deliveryReceipt'];
+  if (deliveryReceipt !== undefined) {
+    if (!deliveryReceipt || typeof deliveryReceipt !== 'object' || Array.isArray(deliveryReceipt)) {
+      throw new OutboxMigrationError(`invalid schema-two item at index ${index}: malformed deliveryReceipt`);
+    }
+    const receipt = deliveryReceipt as Record<string, unknown>;
+    if (typeof receipt.reservationId !== 'string' || receipt.reservationId.length === 0
+      || !Number.isSafeInteger(receipt.quotaGeneration)
+      || (receipt.quotaGeneration as number) < 0) {
+      throw new OutboxMigrationError(`invalid schema-two item at index ${index}: malformed deliveryReceipt`);
+    }
+    decodedReceipt = {
+      reservationId: receipt.reservationId,
+      quotaGeneration: receipt.quotaGeneration as number,
+    };
+  }
+
+  const hasRecoveryRequired = Object.hasOwn(raw, 'recoveryRequired');
+  if (hasRecoveryRequired && typeof raw.recoveryRequired !== 'boolean') {
+    throw new OutboxMigrationError(`invalid schema-two item at index ${index}: recoveryRequired must be boolean`);
+  }
+  const hasContinuationNotice = Object.hasOwn(raw, 'continuationNoticeAttached');
+  if (hasContinuationNotice && typeof raw.continuationNoticeAttached !== 'boolean') {
+    throw new OutboxMigrationError(
+      `invalid schema-two item at index ${index}: continuationNoticeAttached must be boolean`,
+    );
+  }
+
+  return {
+    priority: value.priority,
+    state: value.state,
+    ...(decodedReceipt ? { deliveryReceipt: decodedReceipt } : {}),
+    ...(hasContinuationNotice
+      ? { continuationNoticeAttached: raw.continuationNoticeAttached as boolean }
+      : {}),
+    ...(hasRecoveryRequired ? { recoveryRequired: raw.recoveryRequired as boolean } : {}),
+  };
+}
+
+function isOutboxPriority(value: unknown): value is OutboxPriority {
+  return typeof value === 'string' && Object.hasOwn(PRIORITY_RANK, value);
 }
 
 function asFiniteNumber(value: unknown, fallback: number): number {
