@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 
 import { atomicWrite } from '../config.js';
+import { chunkUtf8Text } from './text-chunk.js';
 
 export type OutboxPriority = 'final' | 'control' | 'media' | 'intermediate' | 'activity';
 export type OutboxState = 'pending' | 'permanent-failure';
@@ -58,6 +59,8 @@ export interface OutboxOptions {
   maxBytesPerUser?: number;
   finalReserveItems?: number;
   finalReserveBytes?: number;
+  bodyChunkBytes?: number;
+  inboundItemLimit?: number;
   now?: () => number;
 }
 
@@ -75,6 +78,13 @@ export class OutboxCorruptionError extends Error {
   }
 }
 
+export class OutboxMigrationError extends Error {
+  constructor(message: string) {
+    super(`outbox migration failed: ${message}`);
+    this.name = 'OutboxMigrationError';
+  }
+}
+
 interface PersistedOutbox {
   schemaVersion: 2;
   revision: number;
@@ -87,6 +97,18 @@ interface LegacySnapshot {
   revision?: number;
   nextSequence?: number;
   items?: unknown[];
+}
+
+interface LoadedOutboxState {
+  revision: number;
+  nextSequence: number;
+  items: Map<string, OutboxItem>;
+}
+
+interface NormalizedOutboxState {
+  nextSequence: number;
+  items: Map<string, OutboxItem>;
+  changed: boolean;
 }
 
 const PRIORITY_RANK: Record<OutboxPriority, number> = {
@@ -107,6 +129,8 @@ export class OutboxStore {
   private readonly maxBytesPerUser: number;
   private readonly finalReserveItems: number;
   private readonly finalReserveBytes: number;
+  private readonly bodyChunkBytes?: number;
+  private readonly inboundItemLimit?: number;
   private readonly now: () => number;
   private nextSequence = 1;
   private revision = 0;
@@ -118,6 +142,19 @@ export class OutboxStore {
     this.maxBytesPerUser = options.maxBytesPerUser ?? 1_000_000;
     this.finalReserveItems = Math.max(0, Math.floor(options.finalReserveItems ?? 1));
     this.finalReserveBytes = Math.max(0, Math.floor(options.finalReserveBytes ?? 2_000));
+    if (options.bodyChunkBytes === undefined && options.inboundItemLimit === undefined) {
+      this.bodyChunkBytes = undefined;
+      this.inboundItemLimit = undefined;
+    } else {
+      if (!Number.isInteger(options.bodyChunkBytes) || options.bodyChunkBytes! <= 0) {
+        throw new OutboxMigrationError('invalid bodyChunkBytes: expected a positive integer');
+      }
+      if (!Number.isInteger(options.inboundItemLimit) || options.inboundItemLimit! <= 0) {
+        throw new OutboxMigrationError('invalid inboundItemLimit: expected a positive integer');
+      }
+      this.bodyChunkBytes = options.bodyChunkBytes;
+      this.inboundItemLimit = options.inboundItemLimit;
+    }
     this.now = options.now ?? Date.now;
     mkdirSync(dirname(filePath), { recursive: true });
     this.load();
@@ -398,10 +435,13 @@ export class OutboxStore {
       const useBackup = Boolean(backup)
         && (!primary || this.snapshotFreshness(backup!) > this.snapshotFreshness(primary));
       const selected = useBackup ? backup! : primary!;
-      this.loadSnapshot(selected);
-      if (useBackup || selected.schemaVersion !== 2 || !Number.isInteger(selected.revision)) {
-        this.persist();
+      const loaded = this.decodeSnapshot(selected);
+      const normalized = this.normalizeLoadedState(loaded);
+      this.revision = loaded.revision;
+      if (normalized.changed || useBackup || selected.schemaVersion !== 2 || !Number.isInteger(selected.revision)) {
+        this.persistState(normalized.items, normalized.nextSequence);
       }
+      this.publish(normalized.items, normalized.nextSequence);
       return;
     }
     if (existsSync(this.filePath) || existsSync(this.backupPath)) {
@@ -427,8 +467,8 @@ export class OutboxStore {
     }
   }
 
-  private loadSnapshot(snapshot: LegacySnapshot): void {
-    this.revision = asFiniteNumber(snapshot.revision, 0);
+  private decodeSnapshot(snapshot: LegacySnapshot): LoadedOutboxState {
+    const items = new Map<string, OutboxItem>();
     let maxSequence = 0;
     for (const raw of snapshot.items ?? []) {
       if (!raw || typeof raw !== 'object') continue;
@@ -465,11 +505,87 @@ export class OutboxStore {
         ...(value.recoveryRequired ? { recoveryRequired: true } : {}),
         ...(value.terminalError ? { terminalError: value.terminalError } : {}),
       };
-      if (this.items.has(item.itemId)) continue;
-      this.items.set(item.itemId, item);
+      if (items.has(item.itemId)) continue;
+      items.set(item.itemId, item);
       maxSequence = Math.max(maxSequence, sequence);
     }
-    this.nextSequence = Math.max(Number.isInteger(snapshot.nextSequence) ? snapshot.nextSequence! : 1, maxSequence + 1);
+    return {
+      revision: asFiniteNumber(snapshot.revision, 0),
+      nextSequence: Math.max(Number.isInteger(snapshot.nextSequence) ? snapshot.nextSequence! : 1, maxSequence + 1),
+      items,
+    };
+  }
+
+  private normalizeLoadedState(state: LoadedOutboxState): NormalizedOutboxState {
+    if (this.bodyChunkBytes === undefined || this.inboundItemLimit === undefined) {
+      return { nextSequence: state.nextSequence, items: state.items, changed: false };
+    }
+
+    const ordered = [...state.items.values()]
+      .sort((a, b) => a.sequence - b.sequence || a.itemId.localeCompare(b.itemId));
+    const normalized: OutboxItem[] = [];
+    let changed = false;
+
+    for (let start = 0; start < ordered.length;) {
+      const first = ordered[start];
+      let end = start + 1;
+      while (end < ordered.length && sameMigrationBatch(first, ordered[end])) end += 1;
+      const batch = ordered.slice(start, end);
+      const eligible = batch.length > this.inboundItemLimit
+        && batch.every((item) => item.priority === 'final'
+          && item.state === 'pending'
+          && !item.deliveryReceipt
+          && !item.recoveryRequired
+          && !item.continuationNoticeAttached)
+        && batch.some((item) => Buffer.byteLength(item.text, 'utf8') > this.bodyChunkBytes!);
+
+      if (!eligible) {
+        normalized.push(...batch);
+        start = end;
+        continue;
+      }
+
+      const text = batch.map((item) => item.text).join('');
+      const chunks = chunkUtf8Text(text, this.bodyChunkBytes);
+      if (chunks.join('') !== text
+        || chunks.some((chunk) => Buffer.byteLength(chunk, 'utf8') > this.bodyChunkBytes!)) {
+        throw new OutboxMigrationError(
+          `normalization could not preserve text within bodyChunkBytes for account ${first.accountId}, user ${first.userId}`,
+        );
+      }
+
+      const last = batch[batch.length - 1];
+      normalized.push(...chunks.map((chunk, index): OutboxItem => {
+        const base = batch[index] ?? last;
+        return {
+          ...base,
+          schemaVersion: 2,
+          itemId: index < batch.length ? base.itemId : randomUUID(),
+          clientId: index < batch.length ? base.clientId : randomUUID(),
+          text: chunk,
+          bytes: Buffer.byteLength(chunk, 'utf8'),
+        };
+      }));
+      changed = true;
+      start = end;
+    }
+
+    if (!changed) {
+      return { nextSequence: state.nextSequence, items: state.items, changed: false };
+    }
+
+    const firstSequence = ordered[0]?.sequence ?? 1;
+    const items = new Map<string, OutboxItem>();
+    normalized.forEach((item, index) => {
+      const resequenced = { ...item, sequence: firstSequence + index };
+      items.set(resequenced.itemId, resequenced);
+    });
+    const maxSequence = firstSequence + normalized.length - 1;
+    return {
+      nextSequence: Math.max(state.nextSequence, maxSequence + 1),
+      items,
+      changed: true,
+    };
   }
 
   private persistState(items: Map<string, OutboxItem>, nextSequence: number): void {
@@ -481,15 +597,18 @@ export class OutboxStore {
     this.revision = revision;
   }
 
-  private persist(): void {
-    this.persistState(this.items, this.nextSequence);
-  }
-
   private publish(items: Map<string, OutboxItem>, nextSequence: number): void {
     this.items.clear();
     for (const [itemId, item] of items) this.items.set(itemId, item);
     this.nextSequence = nextSequence;
   }
+}
+
+function sameMigrationBatch(left: OutboxItem, right: OutboxItem): boolean {
+  return left.accountId === right.accountId
+    && left.userId === right.userId
+    && left.generation === right.generation
+    && left.tokenVersion === right.tokenVersion;
 }
 
 function asFiniteNumber(value: unknown, fallback: number): number {

@@ -9,6 +9,14 @@ import {
   OutboxStore,
   type OutboxItem,
 } from '../src/ilink/outbox.js';
+import { planDeliveryWindow, type DeliveryItem } from '../src/ilink/delivery-planner.js';
+import {
+  INBOUND_WINDOW_ITEMS,
+  MIGRATED_BODY_BYTES,
+  legacyFullChunkText,
+  schemaOneLegacyFullChunkFixture,
+  schemaTwoFailureFixture,
+} from './fixtures/legacy-full-chunk.js';
 
 function tempPath(): string {
   return join(mkdtempSync(join(tmpdir(), 'quota-v2-outbox-')), 'outbox.json');
@@ -23,6 +31,13 @@ function input(overrides: Partial<OutboxItem> = {}) {
     priority: 'final' as const,
     text: 'frozen body',
     ...overrides,
+  };
+}
+
+function migrationOptions() {
+  return {
+    bodyChunkBytes: MIGRATED_BODY_BYTES,
+    inboundItemLimit: INBOUND_WINDOW_ITEMS,
   };
 }
 
@@ -163,6 +178,72 @@ test('migrates the legacy schema-one item shape without dropping final records',
   const persisted = JSON.parse(readFileSync(filePath, 'utf8'));
   assert.equal(persisted.schemaVersion, 2);
   assert.equal(persisted.items.length, 13);
+});
+
+test('normalizes an oversized schema-one final batch before delivery planning', () => {
+  const filePath = tempPath();
+  const fixture = schemaOneLegacyFullChunkFixture();
+  writeFileSync(filePath, JSON.stringify(fixture));
+
+  const store = new OutboxStore(filePath, migrationOptions());
+  const pending = store.listPending('user-a', 'account-a');
+
+  assert.equal(pending.length, 13);
+  assert.equal(pending.map((item) => item.text).join(''), legacyFullChunkText);
+  assert.deepEqual(pending.map((item) => item.itemId),
+    Array.from({ length: 13 }, (_, index) => `legacy-${index + 1}`));
+  assert.deepEqual(pending.map((item) => item.clientId),
+    Array.from({ length: 13 }, (_, index) => `legacy-client-${index + 1}`));
+  assert.ok(pending.every((item) => item.bytes <= MIGRATED_BODY_BYTES));
+  assert.deepEqual(pending.map((item) => item.bytes), [
+    ...Array.from({ length: 10 }, () => 1_944),
+    1_943,
+    1_944,
+    817,
+  ]);
+  assert.deepEqual(
+    pending.map((item) => ({ createdAt: item.createdAt, expiresAt: item.expiresAt })),
+    fixture.items.map((item) => ({ createdAt: item.createdAt, expiresAt: item.expiresAt })),
+  );
+  assert.doesNotThrow(() => planDeliveryWindow(pending as DeliveryItem[], {
+    sentItems: 0,
+    maxItems: INBOUND_WINDOW_ITEMS,
+    maxBytes: 2_000,
+    continuationNotice: '后续内容已排队，请回复“继续”续发。',
+  }));
+
+  const persisted = JSON.parse(readFileSync(filePath, 'utf8'));
+  const backup = JSON.parse(readFileSync(`${filePath}.bak`, 'utf8'));
+  assert.equal(persisted.schemaVersion, 2);
+  assert.equal(backup.schemaVersion, 2);
+  assert.equal(persisted.revision, backup.revision);
+  assert.deepEqual(persisted, backup);
+
+  const primaryBeforeReload = readFileSync(filePath, 'utf8');
+  const reloaded = new OutboxStore(filePath, migrationOptions());
+  assert.equal(readFileSync(filePath, 'utf8'), primaryBeforeReload);
+  assert.deepEqual(reloaded.listPending('user-a', 'account-a'), pending);
+});
+
+test('normalizes an already-wrapped schema-two failure snapshot once', () => {
+  const filePath = tempPath();
+  writeFileSync(filePath, JSON.stringify(schemaTwoFailureFixture()));
+
+  const store = new OutboxStore(filePath, migrationOptions());
+  const pending = store.listPending('user-a', 'account-a');
+  const oldGeneration = pending.filter((item) => item.generation === 42);
+
+  assert.equal(oldGeneration.length, 13);
+  assert.equal(oldGeneration.map((item) => item.text).join(''), legacyFullChunkText);
+  assert.ok(oldGeneration.every((item) => item.bytes <= MIGRATED_BODY_BYTES));
+  assert.equal(pending.at(-1)?.itemId, 'new-confirmation');
+  assert.equal(pending.at(-1)?.text, '新会话');
+  assert.equal(JSON.parse(readFileSync(filePath, 'utf8')).revision, 3);
+
+  const primaryBeforeReload = readFileSync(filePath, 'utf8');
+  const reloaded = new OutboxStore(filePath, migrationOptions());
+  assert.equal(readFileSync(filePath, 'utf8'), primaryBeforeReload);
+  assert.deepEqual(reloaded.listPending('user-a', 'account-a'), pending);
 });
 
 test('recovers the primary file from a valid backup snapshot', () => {
