@@ -163,23 +163,25 @@ test('preserves the incident-shaped mixed-priority queue in fifo order during mi
   await withFetchResponses(Array.from({ length: 10 }, () => ({ ret: 0 })), async (requests) => {
     await processInboundAndRecover(client, message(50, 'user-a', 'fresh-token', '继续'));
 
-    assert.equal(requests.length, 9);
+    assert.equal(requests.length, 10);
     const bodies = requests.map((request) => request.body.msg.item_list[0].text_item.text as string);
-    const expectedBodies = Array.from({ length: 9 }, (_, index) => `legacy-intermediate-${index + 1}`);
-    expectedBodies[8] += '\n\n后续内容已排队，请回复“继续”续发。';
+    const expectedBodies = [
+      ...Array.from({ length: 9 }, (_, index) => `legacy-intermediate-${index + 1}`),
+      'legacy-activity-1\n\n后续内容已排队，请回复“继续”续发。',
+    ];
     assert.deepEqual(bodies, expectedBodies);
     assert.ok(bodies.every((body) => Buffer.byteLength(body, 'utf8') <= 2_000));
-    assert.ok(bodies[8].endsWith('\n\n后续内容已排队，请回复“继续”续发。'));
+    assert.ok(bodies[9].endsWith('\n\n后续内容已排队，请回复“继续”续发。'));
     assert.ok(!bodies.includes('后续内容已排队，请回复“继续”续发。'));
 
     const pending = client.getDeliveryStatus('user-a').pending;
     assert.deepEqual(pending.map((item) => item.itemId), [
-      ...Array.from({ length: 19 }, (_, index) => `legacy-activity-${index + 1}`),
+      ...Array.from({ length: 18 }, (_, index) => `legacy-activity-${index + 2}`),
       ...Array.from({ length: 13 }, (_, index) => `legacy-${index + 1}`),
       'incident-control',
       'new-confirmation',
     ]);
-    assert.equal(pending.filter((item) => item.priority === 'activity').length, 19);
+    assert.equal(pending.filter((item) => item.priority === 'activity').length, 18);
     const confirmation = pending.find((item) => item.itemId === 'new-confirmation');
     assert.deepEqual(
       confirmation && {
@@ -272,26 +274,26 @@ test('keeps all streamed body chunks ahead of a final footer across windows', as
 
   await withFetchResponses(Array.from({ length: 15 }, () => ({ ret: 0 })), async (requests) => {
     await client.sendText('user-a', body, { streamType: 'intermediate', priority: 'intermediate' });
-    assert.equal(requests.length, 9);
+    assert.equal(requests.length, 10);
     assert.deepEqual(
-      requests.slice(0, 8).map((request) => request.body.msg.item_list[0].text_item.text),
-      chunks.slice(0, 8),
+      requests.slice(0, 9).map((request) => request.body.msg.item_list[0].text_item.text),
+      chunks.slice(0, 9),
     );
     assert.equal(
-      requests[8].body.msg.item_list[0].text_item.text,
-      `${chunks[8]}\n\n后续内容已排队，请回复“继续”续发。`,
+      requests[9].body.msg.item_list[0].text_item.text,
+      `${chunks[9]}\n\n后续内容已排队，请回复“继续”续发。`,
     );
 
     await client.sendText('user-a', '— Codex | 30.0s', { priority: 'final' });
     assert.deepEqual(
       client.getDeliveryStatus('user-a').pending.map((item) => item.text),
-      [...chunks.slice(9), '— Codex | 30.0s'],
+      [...chunks.slice(10), '— Codex | 30.0s'],
     );
 
     await processInboundAndRecover(client, message(2, 'user-a', 'next-token', '继续'));
     assert.deepEqual(
-      requests.slice(9).map((request) => request.body.msg.item_list[0].text_item.text),
-      [...chunks.slice(9), '— Codex | 30.0s'],
+      requests.slice(10).map((request) => request.body.msg.item_list[0].text_item.text),
+      [...chunks.slice(10), '— Codex | 30.0s'],
     );
     assert.equal(client.getDeliveryStatus('user-a').pending.length, 0);
   });
@@ -358,19 +360,22 @@ test('activity holdback preserves fifo order when the final result arrives', asy
       await client.sendText('user-a', `activity-${index + 1}`, { priority: 'activity' });
     }
     assert.equal(requests.length, 9);
-    assert.match(requests[8].body.msg.item_list[0].text_item.text, /请回复“继续”续发。$/);
+    assert.equal(requests[8].body.msg.item_list[0].text_item.text, 'activity-9');
 
     await client.sendText('user-a', 'final-result', { priority: 'final' });
-    assert.equal(requests.length, 9);
+    assert.equal(requests.length, 10);
+    assert.equal(
+      requests[9].body.msg.item_list[0].text_item.text,
+      'activity-10\n\n后续内容已排队，请回复“继续”续发。',
+    );
     assert.deepEqual(client.getDeliveryStatus('user-a').pending.map((item) => item.text), [
-      'activity-10',
       'final-result',
     ]);
 
     await processInboundAndRecover(client, message(2, 'user-a', 'next-token', '继续'));
     assert.deepEqual(
-      requests.slice(9).map((request) => request.body.msg.item_list[0].text_item.text),
-      ['activity-10', 'final-result'],
+      requests.slice(10).map((request) => request.body.msg.item_list[0].text_item.text),
+      ['final-result'],
     );
     assert.equal(client.getDeliveryStatus('user-a').pending.length, 0);
   });

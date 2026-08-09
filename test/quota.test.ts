@@ -196,6 +196,18 @@ test('holds one live-stream slot for a discoverable continuation boundary', () =
   assert.equal(quota.snapshot('user-a').sentItems, 1);
 });
 
+test('default quota allows streamed records to use all ten item slots', () => {
+  const quota = new QuotaManager(tempPath(), 'account-a');
+  quota.recordInbound('user-a', 1, 'token-1');
+
+  for (let index = 0; index < 10; index += 1) {
+    assert.equal(quota.reserve('user-a', 1, 'activity').allowed, true);
+  }
+  const blocked = quota.reserve('user-a', 1, 'activity');
+  assert.equal(blocked.allowed, false);
+  assert.equal(blocked.reason, 'intermediate-budget');
+});
+
 test('enforces stream holdbacks and preserves explicit reservation context', () => {
   const quota = new QuotaManager(tempPath(), 'account-a', {
     maxItemsPerWindow: 5,

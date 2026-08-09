@@ -19,11 +19,11 @@ export const DEFAULT_QUOTA_LIMITS: QuotaLimits = {
   maxItemsPerWindow: 10,
   maxBytes: 200_000,
   maxItems: 100,
-  finalReserveItems: 1,
+  finalReserveItems: 0,
   finalReserveBytes: 2_000,
   maxItemsPerToken: 10,
-  maxIntermediateItemsPerToken: 9,
-  finalReserveItemsPerToken: 1,
+  maxIntermediateItemsPerToken: 10,
+  finalReserveItemsPerToken: 0,
 };
 
 export type QuotaPriority = 'final' | 'control' | 'media' | 'intermediate' | 'activity';

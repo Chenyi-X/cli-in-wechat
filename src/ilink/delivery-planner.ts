@@ -44,6 +44,20 @@ export function planDeliveryWindow<T extends DeliveryItem>(
     if (sentItems + selected.length >= priorityLimit) break;
     selected.push({ ...item });
   }
+  const selectedLast = selected.at(-1);
+  const isUnresolvedStreamBoundary = Boolean(selectedLast)
+    && sentItems + selected.length === maxItems
+    && selected.length === ordered.length
+    && (selectedLast!.priority === 'activity' || selectedLast!.priority === 'intermediate');
+  if (isUnresolvedStreamBoundary) {
+    selected.pop();
+    return {
+      items: selected,
+      remainingItems: ordered.length - selected.length,
+      needsContinuation: false,
+    };
+  }
+
   const remainingItems = ordered.length - selected.length;
   const last = selected.at(-1);
   const closesPriorityWindow = Boolean(last)

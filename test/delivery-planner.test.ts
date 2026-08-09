@@ -125,7 +125,7 @@ test('covers the required final chunk counts at the ten-item boundary', () => {
   }
 });
 
-test('holds one stream slot for a discoverable continuation without reordering', () => {
+test('holds an unresolved tenth streamed record without closing the window early', () => {
   const plan = planDeliveryWindow(Array.from({ length: 10 }, (_, index) => ({
     itemId: `activity-${index + 1}`,
     text: `activity-${index + 1}`,
@@ -134,12 +134,63 @@ test('holds one stream slot for a discoverable continuation without reordering',
   })), {
     sentItems: 0,
     maxItems: 10,
-    maxItemsByPriority: { activity: 9, intermediate: 9 },
+    maxItemsByPriority: { activity: 10, intermediate: 10 },
     continuationNotice: '续发',
   });
 
   assert.equal(plan.items.length, 9);
   assert.equal(plan.remainingItems, 1);
+  assert.equal(plan.needsContinuation, false);
+  assert.equal(plan.items[8].text, 'activity-9');
+});
+
+test('uses the tenth slot when a later final proves the streaming boundary', () => {
+  const items = [
+    ...Array.from({ length: 10 }, (_, index) => ({
+      itemId: `activity-${index + 1}`,
+      text: `activity-${index + 1}`,
+      priority: 'activity' as const,
+      bytes: 11,
+    })),
+    { itemId: 'final-1', text: 'footer', priority: 'final' as const, bytes: 6 },
+  ];
+
+  const plan = planDeliveryWindow(items, {
+    sentItems: 0,
+    maxItems: 10,
+    maxItemsByPriority: { activity: 10, intermediate: 10 },
+    continuationNotice: '续发',
+  });
+
+  assert.deepEqual(
+    plan.items.map((item) => item.itemId),
+    Array.from({ length: 10 }, (_, index) => `activity-${index + 1}`),
+  );
+  assert.equal(plan.items[9].text, 'activity-10\n\n续发');
+  assert.equal(plan.remainingItems, 1);
   assert.equal(plan.needsContinuation, true);
-  assert.equal(plan.items[8].text, 'activity-9\n\n续发');
+});
+
+test('lets a terminal final fill the tenth slot without a continuation notice', () => {
+  const items = [
+    ...Array.from({ length: 9 }, (_, index) => ({
+      itemId: `activity-${index + 1}`,
+      text: `activity-${index + 1}`,
+      priority: 'activity' as const,
+      bytes: 11,
+    })),
+    { itemId: 'final-1', text: 'footer', priority: 'final' as const, bytes: 6 },
+  ];
+
+  const plan = planDeliveryWindow(items, {
+    sentItems: 0,
+    maxItems: 10,
+    maxItemsByPriority: { activity: 10, intermediate: 10 },
+    continuationNotice: '续发',
+  });
+
+  assert.equal(plan.items.length, 10);
+  assert.equal(plan.items[9].text, 'footer');
+  assert.equal(plan.remainingItems, 0);
+  assert.equal(plan.needsContinuation, false);
 });
