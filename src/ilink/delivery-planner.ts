@@ -22,14 +22,6 @@ export interface DeliveryPlanOptions {
   continuationNotice: string;
 }
 
-const PRIORITY_RANK: Record<DeliveryPriority, number> = {
-  final: 0,
-  control: 1,
-  media: 2,
-  intermediate: 3,
-  activity: 4,
-};
-
 /**
  * Select one inbound delivery window without mutating the queue. The caller
  * persists the selected items before sending and removes them only after an
@@ -39,31 +31,17 @@ export function planDeliveryWindow<T extends DeliveryItem>(
   items: readonly T[],
   options: DeliveryPlanOptions,
 ): DeliveryWindow<T> {
-  const ordered = items
-    .map((item, index) => ({ item, index }))
-    .sort((a, b) => PRIORITY_RANK[a.item.priority] - PRIORITY_RANK[b.item.priority] || a.index - b.index)
-    .map(({ item }) => item);
+  const ordered = [...items];
 
   const sentItems = Math.max(0, Math.floor(options.sentItems));
   const maxItems = Math.max(0, Math.floor(options.maxItems));
   const selected: T[] = [];
   for (const item of ordered) {
-    const priorityLimit = Math.min(
-      maxItems,
-      Math.max(0, Math.floor(options.maxItemsByPriority?.[item.priority] ?? maxItems)),
-    );
-    if (sentItems + selected.length >= priorityLimit) break;
+    if (sentItems + selected.length >= maxItems) break;
     selected.push({ ...item });
   }
   const remainingItems = ordered.length - selected.length;
-  const last = selected.at(-1);
-  const closesPriorityWindow = Boolean(last)
-    && sentItems + selected.length >= Math.min(
-      maxItems,
-      Math.max(0, Math.floor(options.maxItemsByPriority?.[last!.priority] ?? maxItems)),
-    )
-    && sentItems + selected.length < maxItems;
-  const needsContinuation = remainingItems > 0 || closesPriorityWindow;
+  const needsContinuation = remainingItems > 0;
 
   if (needsContinuation && selected.length > 0) {
     const selectedLast = selected[selected.length - 1];

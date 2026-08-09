@@ -84,14 +84,16 @@ test('keeps the continuation notice within the UTF-8 byte limit', () => {
   assert.ok(plan.items[0].text.endsWith('后续内容已排队，请回复“继续”续发。'));
 });
 
-test('prioritizes final items while preserving order within a priority', () => {
+test('preserves fifo order across mixed priorities', () => {
   const plan = planDeliveryWindow([
     { itemId: 'activity-1', text: 'activity', priority: 'activity', bytes: 8 },
     { itemId: 'final-1', text: 'final', priority: 'final', bytes: 5 },
-    { itemId: 'final-2', text: 'final 2', priority: 'final', bytes: 7 },
+    { itemId: 'intermediate-1', text: 'answer', priority: 'intermediate', bytes: 6 },
   ], { sentItems: 0, maxItems: 2, continuationNotice: '续发' });
 
-  assert.deepEqual(plan.items.map((item) => item.itemId), ['final-1', 'final-2']);
+  assert.deepEqual(plan.items.map((item) => item.itemId), ['activity-1', 'final-1']);
+  assert.equal(plan.remainingItems, 1);
+  assert.equal(plan.items[1].text, 'final\n\n续发');
 });
 
 test('returns an empty window when no inbound budget remains', () => {
@@ -123,18 +125,21 @@ test('covers the required final chunk counts at the ten-item boundary', () => {
   }
 });
 
-test('closes a low-priority sub-window with an attached continuation notice', () => {
-  const plan = planDeliveryWindow([
-    { itemId: 'activity-9', text: 'activity', priority: 'activity', bytes: 8 },
-  ], {
-    sentItems: 8,
+test('uses the full window even when legacy priority limits are configured', () => {
+  const plan = planDeliveryWindow(Array.from({ length: 10 }, (_, index) => ({
+    itemId: `activity-${index + 1}`,
+    text: `activity-${index + 1}`,
+    priority: 'activity' as const,
+    bytes: 10,
+  })), {
+    sentItems: 0,
     maxItems: 10,
     maxItemsByPriority: { activity: 9, intermediate: 9 },
     continuationNotice: '续发',
   });
 
-  assert.equal(plan.items.length, 1);
+  assert.equal(plan.items.length, 10);
   assert.equal(plan.remainingItems, 0);
-  assert.equal(plan.needsContinuation, true);
-  assert.equal(plan.items[0].text, 'activity\n\n续发');
+  assert.equal(plan.needsContinuation, false);
+  assert.equal(plan.items[9].text, 'activity-10');
 });
