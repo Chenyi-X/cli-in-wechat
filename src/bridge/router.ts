@@ -190,17 +190,30 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
   private async handle(msg: WeixinMessage, text: string, refText: string, media?: DownloadedMedia[]): Promise<void> {
     const uid = msg.from_user_id;
     if (this.config.allowedUsers.length > 0 && !this.config.allowedUsers.includes(uid)) return;
-    const taskGeneration = (this.ilink as ILinkClient & {
-      getDeliveryStatus?: (userId: string) => { quota: { generation: number } };
-    }).getDeliveryStatus?.call(this.ilink, uid)?.quota.generation;
+    const deliveryClient = this.ilink as ILinkClient & {
+      getDeliveryStatus?: (userId: string) => { quota: { generation: number }; pending: unknown[] };
+      recoverPending?: (userId: string) => Promise<unknown>;
+    };
+    const deliveryStatus = deliveryClient.getDeliveryStatus?.call(this.ilink, uid);
+    const taskGeneration = deliveryStatus?.quota.generation;
 
     const trimmed = text.trim();
 
     // Any fresh inbound may be the user's request to resume durable output.
     // The exact bare command is consumed; all other text continues normally.
-    const recoverPending = (this.ilink as ILinkClient & {
-      recoverPending?: (userId: string) => Promise<unknown>;
-    }).recoverPending;
+    const recoverPending = deliveryClient.recoverPending;
+    if (trimmed === '继续') {
+      if (!recoverPending || deliveryStatus?.pending.length === 0) return;
+      const stopTyping = await this.ilink.startTyping(uid);
+      try {
+        await recoverPending.call(this.ilink, uid);
+      } catch (err) {
+        log.error(`[delivery] 恢复 ${uid} 的排队消息失败:`, err);
+      } finally {
+        stopTyping();
+      }
+      return;
+    }
     if (recoverPending) {
       try {
         await recoverPending.call(this.ilink, uid);
@@ -208,7 +221,6 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
         log.error(`[delivery] 恢复 ${uid} 的排队消息失败:`, err);
       }
     }
-    if (trimmed === '继续') return;
 
     // Build media context for CLI
     let mediaContext = '';

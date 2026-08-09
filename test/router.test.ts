@@ -10,7 +10,9 @@ import type { WeixinMessage } from '../src/ilink/types.js';
 function createRouter() {
   const messages: Array<{ uid: string; text: string; options?: { priority?: string; generation?: number } }> = [];
   const starts: string[] = [];
+  const stops: string[] = [];
   const recoveries: string[] = [];
+  const deliveryEvents: string[] = [];
 
   const ilink = {
     sendText: async (uid: string, text: string, options?: { priority?: string; generation?: number }) => {
@@ -18,12 +20,18 @@ function createRouter() {
     },
     startTyping: async (uid: string) => {
       starts.push(uid);
-      return () => {};
+      deliveryEvents.push(`start:${uid}`);
+      return () => {
+        stops.push(uid);
+        deliveryEvents.push(`stop:${uid}`);
+      };
     },
     recoverPending: async (uid: string) => {
       recoveries.push(uid);
+      deliveryEvents.push(`recover:${uid}`);
       return [];
     },
+    getDeliveryStatus: () => ({ quota: { generation: 1 }, pending: [], failed: [] }),
     onMessage: () => {},
   };
 
@@ -60,7 +68,16 @@ function createRouter() {
   };
 
   const router = new Router(ilink as any, registry as any, sessions as any, config);
-  return { router: router as any, ilink: ilink as any, messages, starts, recoveries, sessions };
+  return {
+    router: router as any,
+    ilink: ilink as any,
+    messages,
+    starts,
+    stops,
+    recoveries,
+    deliveryEvents,
+    sessions,
+  };
 }
 
 function makeMessage(uid: string): WeixinMessage {
@@ -164,8 +181,9 @@ test('handle() omits refText in combined prompt if refText is empty', async () =
   assert.equal(capturedPrompt, 'explain');
 });
 
-test('exact 继续 consumes the message after attempting outbox recovery', async () => {
-  const { router, recoveries } = createRouter();
+test('exact 继续 wraps pending outbox recovery with typing', async () => {
+  const { router, ilink, starts, stops, recoveries, deliveryEvents } = createRouter();
+  ilink.getDeliveryStatus = () => ({ quota: { generation: 1 }, pending: [{ itemId: 'pending-1' }], failed: [] });
   let execCalled = false;
   router.exec = async () => {
     execCalled = true;
@@ -174,6 +192,23 @@ test('exact 继续 consumes the message after attempting outbox recovery', async
   await router.handle(makeMessage('u1'), '  继续  ', '');
 
   assert.deepEqual(recoveries, ['u1']);
+  assert.deepEqual(starts, ['u1']);
+  assert.deepEqual(stops, ['u1']);
+  assert.deepEqual(deliveryEvents, ['start:u1', 'recover:u1', 'stop:u1']);
+  assert.equal(execCalled, false);
+});
+
+test('exact 继续 with an empty outbox is consumed without typing or recovery', async () => {
+  const { router, starts, recoveries } = createRouter();
+  let execCalled = false;
+  router.exec = async () => {
+    execCalled = true;
+  };
+
+  await router.handle(makeMessage('u1'), '继续', '');
+
+  assert.deepEqual(starts, []);
+  assert.deepEqual(recoveries, []);
   assert.equal(execCalled, false);
 });
 
