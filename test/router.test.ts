@@ -198,18 +198,18 @@ test('exact 继续 wraps pending outbox recovery with typing', async () => {
   assert.equal(execCalled, false);
 });
 
-test('exact 继续 with an empty outbox is consumed without typing or recovery', async () => {
+test('exact 继续 with an empty outbox reaches the Agent as an ordinary prompt', async () => {
   const { router, starts, recoveries } = createRouter();
-  let execCalled = false;
-  router.exec = async () => {
-    execCalled = true;
+  let capturedPrompt = '';
+  router.exec = async (_uid: string, _tool: string, prompt: string) => {
+    capturedPrompt = prompt;
   };
 
   await router.handle(makeMessage('u1'), '继续', '');
 
   assert.deepEqual(starts, []);
-  assert.deepEqual(recoveries, []);
-  assert.equal(execCalled, false);
+  assert.deepEqual(recoveries, ['u1']);
+  assert.equal(capturedPrompt, '继续');
 });
 
 test('ordinary text still reaches the adapter after recovery is attempted', async () => {

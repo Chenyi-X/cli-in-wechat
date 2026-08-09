@@ -202,8 +202,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
     // Any fresh inbound may be the user's request to resume durable output.
     // The exact bare command is consumed; all other text continues normally.
     const recoverPending = deliveryClient.recoverPending;
-    if (trimmed === '继续') {
-      if (!recoverPending || deliveryStatus?.pending.length === 0) return;
+    if (trimmed === '继续' && recoverPending && deliveryStatus?.pending.length) {
       const stopTyping = await this.ilink.startTyping(uid);
       try {
         await recoverPending.call(this.ilink, uid);

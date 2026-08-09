@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { ILinkClient } from '../src/ilink/client.js';
+import { Router } from '../src/bridge/router.js';
 import { OutboxStore } from '../src/ilink/outbox.js';
 import { QuotaManager } from '../src/ilink/quota.js';
 import { chunkUtf8Text } from '../src/ilink/text-chunk.js';
@@ -45,6 +46,11 @@ function message(id: number, uid = 'user-a', contextToken = 'context-token', tex
     context_token: contextToken,
     item_list: [{ type: 1, text_item: { text } }],
   };
+}
+
+async function processInboundAndRecover(client: ILinkClient, inbound: WeixinMessage): Promise<void> {
+  await (client as any).processMessage(inbound);
+  await client.recoverPending(inbound.from_user_id);
 }
 
 async function withFetchResponses(
@@ -90,10 +96,62 @@ test('delivers thirteen queued final chunks as ten then three on the next inboun
     assert.equal(requests.length, 10);
     assert.equal(outbox.listPending('user-a').length, 3);
 
-    await (client as any).processMessage(message(2));
+    await processInboundAndRecover(client, message(2));
     assert.equal(requests.length, 13);
     assert.equal(outbox.listPending('user-a').length, 0);
   });
+});
+
+test('processMessage lets the router wrap exact continuation recovery with typing', async () => {
+  const client = new ILinkClient(CREDS, paths());
+  const outbox = (client as any).outbox;
+  outbox.enqueue({
+    accountId: 'account-a',
+    userId: 'user-a',
+    generation: 1,
+    tokenVersion: 1,
+    priority: 'final',
+    itemId: 'pending-1',
+    text: 'queued body',
+  });
+
+  const events: string[] = [];
+  (client as any).startTyping = async () => {
+    events.push('typing:start');
+    return () => events.push('typing:stop');
+  };
+  const router = new Router(client, {} as any, {} as any, {
+    defaultTool: 'claude',
+    maxResponseChunkSize: 2000,
+    cliTimeout: 300_000,
+    typingInterval: 5_000,
+    allowedUsers: [],
+    workDir: process.cwd(),
+    tools: {},
+  });
+  let execCalled = false;
+  (router as any).exec = async () => { execCalled = true; };
+  client.onMessage((msg, text, refText, media) => (
+    (router as any).handle(msg, text, refText, media)
+  ));
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => {
+    events.push('send:pending-1');
+    return new Response(JSON.stringify({ ret: 0 }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }) as typeof fetch;
+  try {
+    await (client as any).processMessage(message(2, 'user-a', 'next-token', '继续'));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  assert.deepEqual(events, ['typing:start', 'send:pending-1', 'typing:stop']);
+  assert.equal(execCalled, false);
+  assert.equal(client.getDeliveryStatus('user-a').pending.length, 0);
 });
 
 test('preserves the incident-shaped mixed-priority queue in fifo order during migration', async () => {
@@ -103,7 +161,7 @@ test('preserves the incident-shaped mixed-priority queue in fifo order during mi
   const client = new ILinkClient(CREDS, options);
 
   await withFetchResponses(Array.from({ length: 10 }, () => ({ ret: 0 })), async (requests) => {
-    await (client as any).processMessage(message(50, 'user-a', 'fresh-token', '继续'));
+    await processInboundAndRecover(client, message(50, 'user-a', 'fresh-token', '继续'));
 
     assert.equal(requests.length, 9);
     const bodies = requests.map((request) => request.body.msg.item_list[0].text_item.text as string);
@@ -174,7 +232,7 @@ test('uses an injected quota window when migrating the default outbox', async ()
   const client = new ILinkClient(CREDS, { ...options, quota });
 
   await withFetchResponses(Array.from({ length: 5 }, () => ({ ret: 0 })), async (requests) => {
-    await (client as any).processMessage(message(51, 'user-a', 'fresh-token', '继续'));
+    await processInboundAndRecover(client, message(51, 'user-a', 'fresh-token', '继续'));
 
     assert.equal(requests.length, 5);
     const bodies = requests.map((request) => request.body.msg.item_list[0].text_item.text as string);
@@ -197,9 +255,9 @@ test('drains twenty-five queued chunks as ten, ten, and five across inbound wind
   await withFetchResponses(Array.from({ length: 25 }, () => ({ ret: 0 })), async (requests) => {
     await client.recoverPending('user-a');
     assert.equal(requests.length, 10);
-    await (client as any).processMessage(message(2));
+    await processInboundAndRecover(client, message(2));
     assert.equal(requests.length, 20);
-    await (client as any).processMessage(message(3));
+    await processInboundAndRecover(client, message(3));
     assert.equal(requests.length, 25);
     assert.equal(outbox.listPending('user-a').length, 0);
   });
@@ -230,7 +288,7 @@ test('keeps all streamed body chunks ahead of a final footer across windows', as
       [...chunks.slice(9), '— Codex | 30.0s'],
     );
 
-    await (client as any).processMessage(message(2, 'user-a', 'next-token', '继续'));
+    await processInboundAndRecover(client, message(2, 'user-a', 'next-token', '继续'));
     assert.deepEqual(
       requests.slice(9).map((request) => request.body.msg.item_list[0].text_item.text),
       [...chunks.slice(9), '— Codex | 30.0s'],
@@ -261,7 +319,7 @@ test('ambiguous response keeps the frozen client id for the next recovery attemp
     });
 
     await withFetchResponses([{ ret: 0 }], async (retryRequests) => {
-      await (client as any).processMessage(message(2));
+      await processInboundAndRecover(client, message(2));
       assert.equal(retryRequests[0].body.msg.client_id, firstClientId);
       assert.equal(outbox.listPending('user-a').length, 0);
     });
@@ -309,7 +367,7 @@ test('activity holdback preserves fifo order when the final result arrives', asy
       'final-result',
     ]);
 
-    await (client as any).processMessage(message(2, 'user-a', 'next-token', '继续'));
+    await processInboundAndRecover(client, message(2, 'user-a', 'next-token', '继续'));
     assert.deepEqual(
       requests.slice(9).map((request) => request.body.msg.item_list[0].text_item.text),
       ['activity-10', 'final-result'],
@@ -460,7 +518,7 @@ test('restart after the seventh confirmed chunk resumes the ambiguous item with 
     const ambiguousClientId = requests[7].body.msg.client_id;
 
     const restarted = new ILinkClient(CREDS, options);
-    await (restarted as any).processMessage(message(2));
+    await processInboundAndRecover(restarted, message(2));
     assert.equal(requests[8].body.msg.client_id, ambiguousClientId);
     assert.equal(restarted.getDeliveryStatus('user-a').pending.length, 0);
   });
@@ -482,7 +540,7 @@ test('restart after the tenth confirmed chunk resumes the remaining three', asyn
     await first.recoverPending('user-a');
     assert.equal(requests.length, 10);
     const restarted = new ILinkClient(CREDS, options);
-    await (restarted as any).processMessage(message(2));
+    await processInboundAndRecover(restarted, message(2));
     assert.equal(requests.length, 13);
     assert.equal(restarted.getDeliveryStatus('user-a').pending.length, 0);
   });

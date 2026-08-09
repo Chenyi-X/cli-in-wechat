@@ -365,14 +365,6 @@ export class ILinkClient {
     this.persistContextTokens();
     this.outbox.clearRecoveryRequiredForUser(this.accountId, msg.from_user_id);
 
-    // Resume generated content before routing the new prompt. This is serialized
-    // with normal sends so a new final cannot overtake the recovery window.
-    try {
-      await this.enqueueSend(msg.from_user_id, () => this.deliverPendingNow(msg.from_user_id));
-    } catch (err) {
-      log.error(`[delivery] 恢复 ${msg.from_user_id} 的排队消息失败:`, err);
-    }
-
     log.debug(`[msg] item_list=${JSON.stringify(redactSecrets(msg.item_list))}`);
     const { text, refText, mediaItems } = await parseMessage(msg);
     if (!text && !refText && mediaItems.length === 0) return;
