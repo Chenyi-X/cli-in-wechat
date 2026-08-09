@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -59,6 +59,7 @@ function isolatedOptions() {
     quotaPath: join(dir, 'quota.json'),
     diagnosticsPath: join(dir, 'delivery-diagnostics.jsonl'),
     contextTokensPath: join(dir, 'context_tokens.json'),
+    pollCursorPath: join(dir, 'poll_cursor.txt'),
   };
 }
 
@@ -84,4 +85,84 @@ test('isFreshMessage: evicts oldest beyond the 1000-entry cap but keeps recent o
   assert.equal(client.isFreshMessage('u', 0), true, 'evicted key is treated as fresh again');
   // A recently-seen key is still remembered.
   assert.equal(client.isFreshMessage('u', 999), false);
+});
+
+test('getUpdates stages its cursor until the full response batch is committed', async () => {
+  const options = isolatedOptions();
+  const client = new ILinkClient(DUMMY_CREDS, options) as any;
+  const originalFetch = globalThis.fetch;
+  client.pollCursor = 'cursor-before';
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    ret: 0,
+    msgs: [],
+    get_updates_buf: 'cursor-after',
+  }), { status: 200 });
+  try {
+    await client.getUpdates();
+    assert.equal(client.pollCursor, 'cursor-before');
+    assert.equal(client.pendingPollCursor, 'cursor-after');
+
+    client.commitPendingPollCursor();
+    assert.equal(client.pollCursor, 'cursor-after');
+    assert.equal(readFileSync(options.pollCursorPath, 'utf8'), 'cursor-after');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('a failed async handler leaves the inbound replayable until a successful retry', async () => {
+  const options = isolatedOptions();
+  const client = new ILinkClient(DUMMY_CREDS, options) as any;
+  let attempts = 0;
+  client.onMessage(async () => {
+    attempts += 1;
+    if (attempts === 1) throw new Error('handler failed');
+  });
+  const inbound = {
+    message_id: 1,
+    from_user_id: 'user-a',
+    to_user_id: 'bot-user',
+    client_id: 'inbound-client-1',
+    create_time_ms: Date.now(),
+    message_type: 1,
+    message_state: 0,
+    context_token: 'context-a',
+    item_list: [{ type: 1, text_item: { text: 'retry me' } }],
+  };
+
+  await assert.rejects(client.processMessage(inbound), /handler failed/);
+  let persisted = JSON.parse(readFileSync(options.quotaPath, 'utf8')) as any;
+  let state = persisted.users[`b\u0000user-a`];
+  assert.deepEqual(state.pendingInboundIds, ['1']);
+  assert.equal(state.seenInboundIds.includes('1'), false);
+
+  await client.processMessage(inbound);
+  persisted = JSON.parse(readFileSync(options.quotaPath, 'utf8')) as any;
+  state = persisted.users[`b\u0000user-a`];
+  assert.equal(attempts, 2);
+  assert.deepEqual(state.pendingInboundIds, []);
+  assert.equal(state.seenInboundIds.includes('1'), true);
+  assert.equal(state.generation, 1);
+});
+
+test('an empty inbound is completed instead of remaining pending forever', async () => {
+  const options = isolatedOptions();
+  const client = new ILinkClient(DUMMY_CREDS, options) as any;
+
+  await client.processMessage({
+    message_id: 2,
+    from_user_id: 'user-empty',
+    to_user_id: 'bot-user',
+    client_id: 'inbound-client-2',
+    create_time_ms: Date.now(),
+    message_type: 1,
+    message_state: 0,
+    context_token: 'context-a',
+    item_list: [],
+  });
+
+  const persisted = JSON.parse(readFileSync(options.quotaPath, 'utf8')) as any;
+  const state = persisted.users[`b\u0000user-empty`];
+  assert.deepEqual(state.pendingInboundIds, []);
+  assert.equal(state.seenInboundIds.includes('2'), true);
 });

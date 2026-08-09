@@ -25,6 +25,23 @@ test('classifyApiFailure preserves non-rate API errors and does not trust errmsg
   });
 });
 
+test('classifyApiFailure treats deterministic HTTP 4xx responses as permanent', () => {
+  for (const httpStatus of [400, 401, 403, 413]) {
+    const error = { httpStatus, errmsg: `HTTP ${httpStatus}` };
+    assert.deepEqual(classifyApiFailure(error), {
+      status: 'permanent-failure',
+      ambiguous: false,
+      error,
+    });
+  }
+});
+
+test('classifyApiFailure keeps timeout and overload HTTP responses retryable', () => {
+  assert.equal(classifyApiFailure({ httpStatus: 408 })?.status, 'ambiguous');
+  assert.equal(classifyApiFailure({ httpStatus: 429 })?.status, 'rate-limited');
+  assert.equal(classifyApiFailure({ httpStatus: 503 })?.status, 'ambiguous');
+});
+
 test('SendResult exposes the durable item identity and generation metadata', () => {
   const result: SendResult = {
     status: 'queued',

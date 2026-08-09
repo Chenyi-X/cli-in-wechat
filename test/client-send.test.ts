@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 import { ILinkClient } from '../src/ilink/client.js';
 import { Router } from '../src/bridge/router.js';
@@ -126,6 +126,7 @@ test('processMessage lets the router wrap exact continuation recovery with typin
     cliTimeout: 300_000,
     typingInterval: 5_000,
     allowedUsers: [],
+    allowAllUsers: true,
     workDir: process.cwd(),
     tools: {},
   });
@@ -398,6 +399,223 @@ test('rate-limited ret=-2 stops the window without a second client retry', async
   });
 });
 
+test('rate-limit cooldown automatically resumes pending text and success resets the streak', async () => {
+  const client = new ILinkClient(CREDS, {
+    ...paths(),
+    rateLimitBaseCooldownMs: 10,
+    rateLimitMaxCooldownMs: 10,
+  });
+  await (client as any).processMessage(message(1));
+  await withFetchResponses([{ ret: -2, errmsg: 'rate limited' }, { ret: 0 }], async (requests) => {
+    const first = await client.sendText('user-a', 'body');
+    assert.equal(first[0].status, 'rate-limited');
+
+    const deadline = Date.now() + 1_000;
+    while (requests.length < 2 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+
+    assert.equal(requests.length, 2);
+    assert.equal(client.getDeliveryStatus('user-a').pending.length, 0);
+    assert.equal((client as any).getRateLimitState('user-a').consecutiveRet2, 0);
+  });
+  client.stop();
+});
+
+test('restart after an expired cooldown immediately resumes the persisted pending text', async () => {
+  const options = paths();
+  const first = new ILinkClient(CREDS, {
+    ...options,
+    rateLimitBaseCooldownMs: 10,
+    rateLimitMaxCooldownMs: 10,
+  });
+  await (first as any).processMessage(message(1));
+  await withFetchResponses([{ ret: -2, errmsg: 'rate limited' }], async () => {
+    await first.sendText('user-a', 'body');
+  });
+  first.stop();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  await withFetchResponses([{ ret: 0 }], async (requests) => {
+    const restarted = new ILinkClient(CREDS, {
+      ...options,
+      rateLimitBaseCooldownMs: 10,
+      rateLimitMaxCooldownMs: 10,
+    });
+    const deadline = Date.now() + 1_000;
+    while (requests.length < 1 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(requests.length, 1);
+    assert.equal(restarted.getDeliveryStatus('user-a').pending.length, 0);
+    restarted.stop();
+  });
+});
+
+test('media sendmessage consumes the shared window budget', async () => {
+  const options = paths();
+  const filePath = join(dirname(options.outboxPath), 'report.txt');
+  writeFileSync(filePath, 'report', 'utf8');
+  const client = new ILinkClient(CREDS, options);
+  await (client as any).processMessage(message(1));
+  (client as any).uploadToCdn = async () => ({
+    rawsize: 6,
+    filesize: 16,
+    aeskey: Buffer.alloc(16),
+    downloadParam: 'download-param',
+  });
+  let rawSendCalls = 0;
+  let legacyRetryCalls = 0;
+  (client as any).sendRawMessage = async () => { rawSendCalls += 1; };
+  (client as any).sendRawMessageWithRetry = async () => { legacyRetryCalls += 1; };
+
+  await client.sendFile('user-a', filePath);
+
+  assert.equal(rawSendCalls, 1);
+  assert.equal(legacyRetryCalls, 0);
+  assert.equal(client.getDeliveryStatus('user-a').quota.sentItems, 1);
+  assert.equal(client.getDeliveryStatus('user-a').quota.remainingItems, 9);
+});
+
+test('exhausted text budget blocks media before upload and sendmessage', async () => {
+  const options = paths();
+  const filePath = join(dirname(options.outboxPath), 'report.txt');
+  writeFileSync(filePath, 'report', 'utf8');
+  const client = new ILinkClient(CREDS, options);
+  await (client as any).processMessage(message(1));
+  const quota = (client as any).quota as QuotaManager;
+  for (let index = 0; index < 10; index += 1) {
+    assert.equal(quota.confirmSend('user-a', `existing-${index}`), true);
+  }
+  let uploadCalls = 0;
+  let sendCalls = 0;
+  (client as any).uploadToCdn = async () => {
+    uploadCalls += 1;
+    throw new Error('must not upload');
+  };
+  (client as any).sendRawMessage = async () => { sendCalls += 1; };
+
+  await assert.rejects(client.sendFile('user-a', filePath), /budget|quota|window/i);
+  assert.equal(uploadCalls, 0);
+  assert.equal(sendCalls, 0);
+});
+
+test('media HTTP 429 releases its reservation, enters cooldown, and does not retry', async () => {
+  const options = paths();
+  const filePath = join(dirname(options.outboxPath), 'report.txt');
+  writeFileSync(filePath, 'report', 'utf8');
+  const client = new ILinkClient(CREDS, {
+    ...options,
+    rateLimitBaseCooldownMs: 1_000,
+    rateLimitMaxCooldownMs: 1_000,
+  });
+  await (client as any).processMessage(message(1));
+  (client as any).uploadToCdn = async () => ({
+    rawsize: 6,
+    filesize: 16,
+    aeskey: Buffer.alloc(16),
+    downloadParam: 'download-param',
+  });
+  const originalFetch = globalThis.fetch;
+  let requests = 0;
+  globalThis.fetch = (async () => {
+    requests += 1;
+    return new Response('slow down', { status: 429 });
+  }) as typeof fetch;
+  try {
+    await assert.rejects(client.sendFile('user-a', filePath), /429/);
+    const quota = client.getDeliveryStatus('user-a').quota;
+    assert.equal(requests, 1);
+    assert.equal(quota.sentItems, 0);
+    assert.equal(quota.reservedItems, 0);
+    assert.equal(quota.rateBackoffUntil > Date.now(), true);
+  } finally {
+    globalThis.fetch = originalFetch;
+    client.stop();
+  }
+});
+
+test('media transport ambiguity makes exactly one sendmessage request', async () => {
+  const options = paths();
+  const filePath = join(dirname(options.outboxPath), 'report.txt');
+  writeFileSync(filePath, 'report', 'utf8');
+  const client = new ILinkClient(CREDS, options);
+  await (client as any).processMessage(message(1));
+  (client as any).uploadToCdn = async () => ({
+    rawsize: 6,
+    filesize: 16,
+    aeskey: Buffer.alloc(16),
+    downloadParam: 'download-param',
+  });
+  const originalFetch = globalThis.fetch;
+  let requests = 0;
+  globalThis.fetch = (async () => {
+    requests += 1;
+    const error = new Error('connection reset') as NodeJS.ErrnoException;
+    error.code = 'ECONNRESET';
+    throw error;
+  }) as typeof fetch;
+  try {
+    await assert.rejects(client.sendFile('user-a', filePath), /ECONNRESET|连接被重置/);
+    assert.equal(requests, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('media upload ambiguity does not consume the sendmessage budget', async () => {
+  const options = paths();
+  const filePath = join(dirname(options.outboxPath), 'report.txt');
+  writeFileSync(filePath, 'report', 'utf8');
+  const client = new ILinkClient(CREDS, options);
+  await (client as any).processMessage(message(1));
+  let sendCalls = 0;
+  (client as any).uploadToCdn = async () => {
+    const error = new Error('upload connection reset') as NodeJS.ErrnoException;
+    error.code = 'ECONNRESET';
+    throw error;
+  };
+  (client as any).sendRawMessage = async () => { sendCalls += 1; };
+
+  await assert.rejects(client.sendFile('user-a', filePath), /upload connection reset/);
+
+  const quota = client.getDeliveryStatus('user-a').quota;
+  assert.equal(sendCalls, 0);
+  assert.equal(quota.sentItems, 0);
+  assert.equal(quota.reservedItems, 0);
+  assert.equal(quota.rateBackoffUntil, 0);
+});
+
+test('media ret=-2 without errmsg is ambiguous without entering cooldown', async () => {
+  const options = paths();
+  const filePath = join(dirname(options.outboxPath), 'report.txt');
+  writeFileSync(filePath, 'report', 'utf8');
+  const client = new ILinkClient(CREDS, options);
+  await (client as any).processMessage(message(1));
+  (client as any).uploadToCdn = async () => ({
+    rawsize: 6,
+    filesize: 16,
+    aeskey: Buffer.alloc(16),
+    downloadParam: 'download-param',
+  });
+  const originalFetch = globalThis.fetch;
+  let requests = 0;
+  globalThis.fetch = (async () => {
+    requests += 1;
+    return new Response(JSON.stringify({ ret: -2 }), { status: 200 });
+  }) as typeof fetch;
+  try {
+    await assert.rejects(client.sendFile('user-a', filePath), /ret=-2/);
+    const quota = client.getDeliveryStatus('user-a').quota;
+    assert.equal(requests, 1);
+    assert.equal(quota.sentItems, 1);
+    assert.equal(quota.reservedItems, 0);
+    assert.equal(quota.rateBackoffUntil, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('rate-limited boundary retry removes the stale continuation notice', async () => {
   const client = new ILinkClient(CREDS, paths());
   await (client as any).processMessage(message(1));
@@ -525,6 +743,42 @@ test('non-rate ret=-2 is ambiguous and remains durable for recovery', async () =
     assert.equal(requests.length, 1);
     assert.equal((client as any).outbox.listPending('user-a')[0].recoveryRequired, true);
   });
+});
+
+test('HTTP 400 permanently fails only the bad item and unblocks the FIFO suffix', async () => {
+  const client = new ILinkClient(CREDS, paths());
+  await (client as any).processMessage(message(1));
+  const outbox = (client as any).outbox as OutboxStore;
+  for (const [itemId, text] of [['bad-item', 'bad'], ['good-item', 'good']] as const) {
+    outbox.enqueue({
+      accountId: 'account-a',
+      userId: 'user-a',
+      generation: 1,
+      tokenVersion: 1,
+      priority: 'final',
+      itemId,
+      text,
+    });
+  }
+  const originalFetch = globalThis.fetch;
+  let requests = 0;
+  globalThis.fetch = (async () => {
+    requests += 1;
+    return requests === 1
+      ? new Response('invalid payload', { status: 400 })
+      : new Response(JSON.stringify({ ret: 0 }), { status: 200 });
+  }) as typeof fetch;
+  try {
+    const first = await client.recoverPending('user-a');
+    assert.equal(first[0].status, 'permanent-failure');
+    await client.recoverPending('user-a');
+
+    assert.equal(requests, 2);
+    assert.equal(client.getDeliveryStatus('user-a').pending.length, 0);
+    assert.deepEqual(client.getDeliveryStatus('user-a').failed.map((item) => item.itemId), ['bad-item']);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test('an unconfirmed transport failure becomes ambiguous without an immediate retry', async () => {

@@ -62,6 +62,7 @@ interface UserQuotaState {
   tokenVersion: number;
   tokenFingerprint?: string;
   seenInboundIds: string[];
+  pendingInboundIds: string[];
   sentItems: number;
   sentBytes: number;
   confirmedItemIds: string[];
@@ -110,6 +111,7 @@ function emptyState(accountId: string, userId: string): UserQuotaState {
     generation: 0,
     tokenVersion: 0,
     seenInboundIds: [],
+    pendingInboundIds: [],
     sentItems: 0,
     sentBytes: 0,
     confirmedItemIds: [],
@@ -133,6 +135,7 @@ function normalizeMaxItemsPerWindow(limits: Partial<QuotaLimits>): number {
 export class QuotaManager {
   private readonly users = new Map<string, UserQuotaState>();
   private readonly foreignUsers = new Map<string, UserQuotaState>();
+  private readonly activeInboundIds = new Set<string>();
   private readonly limits: QuotaLimits;
 
   constructor(
@@ -162,12 +165,19 @@ export class QuotaManager {
   recordInbound(userId: string, messageId: string | number, contextToken: string): InboundResult {
     const state = this.getState(userId);
     const id = String(messageId);
-    if (state.seenInboundIds.includes(id)) {
+    const inboundKey = `${userId}:${id}`;
+    if (state.seenInboundIds.includes(id) || this.activeInboundIds.has(inboundKey)) {
       return this.inboundResult(state, true);
     }
 
-    state.seenInboundIds.push(id);
-    if (state.seenInboundIds.length > 1000) state.seenInboundIds.shift();
+    const isRetry = state.pendingInboundIds.includes(id);
+    if (isRetry) {
+      this.activeInboundIds.add(inboundKey);
+      return this.inboundResult(state, false);
+    }
+
+    state.pendingInboundIds.push(id);
+    this.activeInboundIds.add(inboundKey);
     state.generation += 1;
     state.sentItems = 0;
     state.sentBytes = 0;
@@ -185,6 +195,27 @@ export class QuotaManager {
     }
     this.persist();
     return this.inboundResult(state, false);
+  }
+
+  completeInbound(userId: string, messageId: string | number): boolean {
+    const state = this.getState(userId);
+    const id = String(messageId);
+    const inboundKey = `${userId}:${id}`;
+    const pendingIndex = state.pendingInboundIds.indexOf(id);
+    if (pendingIndex < 0 && !this.activeInboundIds.has(inboundKey)) return false;
+
+    this.activeInboundIds.delete(inboundKey);
+    if (pendingIndex >= 0) state.pendingInboundIds.splice(pendingIndex, 1);
+    if (!state.seenInboundIds.includes(id)) {
+      state.seenInboundIds.push(id);
+      if (state.seenInboundIds.length > 1000) state.seenInboundIds.shift();
+    }
+    this.persist();
+    return true;
+  }
+
+  abandonInbound(userId: string, messageId: string | number): boolean {
+    return this.activeInboundIds.delete(`${userId}:${String(messageId)}`);
   }
 
   confirmSend(userId: string, itemId: string, bytes = 0): boolean {
@@ -433,6 +464,7 @@ export class QuotaManager {
           generation: asNumber(value.generation ?? (value as any).inboundGeneration, 0),
           tokenVersion: asNumber(value.tokenVersion, 0),
           seenInboundIds: Array.isArray(value.seenInboundIds) ? value.seenInboundIds.map(String) : [],
+          pendingInboundIds: Array.isArray(value.pendingInboundIds) ? value.pendingInboundIds.map(String) : [],
           sentItems: asNumber(value.sentItems, 0),
           sentBytes: asNumber(value.sentBytes, 0),
           confirmedItemIds: Array.isArray(value.confirmedItemIds) ? value.confirmedItemIds.map(String) : [],

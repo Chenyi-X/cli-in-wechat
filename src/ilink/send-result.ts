@@ -32,7 +32,20 @@ export interface ClassifiedApiFailure {
 
 /** Classify an application response without inferring meaning from errmsg text. */
 export function classifyApiFailure(error: ApiErrorDetails): ClassifiedApiFailure | null {
-  if (error.ret === undefined || error.ret === 0) return null;
+  if (error.ret === 0) return null;
+  if (error.ret === undefined) {
+    const status = error.httpStatus;
+    if (status === undefined) {
+      return { status: 'ambiguous', ambiguous: true, error };
+    }
+    if (status === 429) {
+      return { status: 'rate-limited', ambiguous: false, error };
+    }
+    if (status >= 400 && status < 500 && status !== 408 && status !== 425) {
+      return { status: 'permanent-failure', ambiguous: false, error };
+    }
+    return { status: 'ambiguous', ambiguous: true, error };
+  }
   if (error.ret === -2) {
     const rateLimited = /rate\s*limited/i.test(error.errmsg || '');
     return {

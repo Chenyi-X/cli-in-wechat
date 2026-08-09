@@ -63,6 +63,7 @@ function createRouter() {
     cliTimeout: 300_000,
     typingInterval: 5000,
     allowedUsers: [],
+    allowAllUsers: true,
     workDir: process.cwd(),
     tools: {},
   };
@@ -79,6 +80,16 @@ function createRouter() {
     sessions,
   };
 }
+
+test('router denies users when neither a whitelist nor public opt-in is configured', async () => {
+  const { router, messages } = createRouter();
+  router.config.allowedUsers = [];
+  router.config.allowAllUsers = false;
+
+  await router.handle(makeMessage('stranger'), 'run command', '');
+
+  assert.equal(messages.length, 0);
+});
 
 function makeMessage(uid: string): WeixinMessage {
   return {

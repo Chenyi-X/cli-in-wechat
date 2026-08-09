@@ -31,8 +31,6 @@ import { DeliveryDiagnostics } from './diagnostics.js';
 const CHANNEL_VERSION = '1.0.2';
 const HTTP_TIMEOUT_MS = 45_000;
 const CDN_BASE_URL = 'https://novac2c.cdn.weixin.qq.com/c2c';
-const REGULAR_RETRY_DELAYS_MS = [0, 30_000, 60_000, 120_000] as const;
-const INTERMEDIATE_RETRY_DELAYS_MS = [0, 12_000] as const;
 const BASE_RATE_LIMIT_COOLDOWN_MS = 150_000; // ~2.5 minutes
 const MAX_RATE_LIMIT_COOLDOWN_MS = 420_000; // ~7 minutes
 
@@ -52,8 +50,11 @@ export interface ILinkClientOptions {
   quotaPath?: string;
   diagnosticsPath?: string;
   contextTokensPath?: string;
+  pollCursorPath?: string;
   maxItemsPerWindow?: number;
   maxTextBytes?: number;
+  rateLimitBaseCooldownMs?: number;
+  rateLimitMaxCooldownMs?: number;
 }
 
 export interface DeliveryStatus {
@@ -90,8 +91,6 @@ const CONTINUATION_SUFFIX = `\n\n${CONTINUATION_NOTICE}`;
 
 interface UserRateLimitState {
   consecutiveRet2: number;
-  suppressIntermediateUntil: number;
-  blockAllSendsUntil: number;
 }
 
 export type MessageHandler = (
@@ -108,15 +107,20 @@ export class ILinkClient {
   private readonly quota: QuotaManager;
   private readonly diagnostics: DeliveryDiagnostics;
   private readonly contextTokensPath: string;
+  private readonly pollCursorPath: string;
   private readonly maxTextBytes: number;
   private readonly bodyChunkBytes: number;
+  private readonly rateLimitBaseCooldownMs: number;
+  private readonly rateLimitMaxCooldownMs: number;
   private pollCursor: string;
+  private pendingPollCursor?: string;
   private running = false;
   private contextTokens = new Map<string, string>();
   private typingTickets = new Map<string, { ticket: string; ts: number }>();
   private handlers: MessageHandler[] = [];
   private sendQueues = new Map<string, Promise<unknown>>();
   private rateLimitStates = new Map<string, UserRateLimitState>();
+  private rateLimitTimers = new Map<string, NodeJS.Timeout>();
   private backoffMs = 1000;
   private abortController: AbortController | null = null;
   private consecutiveFailures = 0;
@@ -132,7 +136,8 @@ export class ILinkClient {
   constructor(credentials: Credentials, options: ILinkClientOptions = {}) {
     this.credentials = credentials;
     this.accountId = options.accountId || credentials.ilinkBotId || credentials.ilinkUserId || 'default-account';
-    this.pollCursor = loadPollCursor();
+    this.pollCursorPath = options.pollCursorPath || join(DATA_DIR, 'poll_cursor.txt');
+    this.pollCursor = loadPollCursorAt(this.pollCursorPath);
     this.contextTokensPath = options.contextTokensPath || join(DATA_DIR, 'context_tokens.json');
     this.contextTokens = loadContextTokensAt(this.contextTokensPath);
     const minimumTextBytes = Buffer.byteLength(CONTINUATION_SUFFIX, 'utf8') + 1;
@@ -141,6 +146,12 @@ export class ILinkClient {
       ? Math.max(minimumTextBytes, Math.floor(configuredTextBytes))
       : DEFAULT_MAX_RESPONSE_CHUNK_BYTES;
     this.bodyChunkBytes = this.maxTextBytes - Buffer.byteLength(CONTINUATION_SUFFIX, 'utf8');
+    this.rateLimitBaseCooldownMs = Math.max(0, Math.floor(
+      options.rateLimitBaseCooldownMs ?? BASE_RATE_LIMIT_COOLDOWN_MS,
+    ));
+    this.rateLimitMaxCooldownMs = Math.max(this.rateLimitBaseCooldownMs, Math.floor(
+      options.rateLimitMaxCooldownMs ?? MAX_RATE_LIMIT_COOLDOWN_MS,
+    ));
     this.quota = options.quota || new QuotaManager(options.quotaPath || join(DATA_DIR, 'quota.json'), this.accountId, {
       maxItemsPerWindow: options.maxItemsPerWindow,
     });
@@ -149,7 +160,15 @@ export class ILinkClient {
       bodyChunkBytes: this.bodyChunkBytes,
       inboundItemLimit: maxItemsPerWindow,
     });
-    this.diagnostics = options.diagnostics || new DeliveryDiagnostics(options.diagnosticsPath || join(DATA_DIR, 'delivery-diagnostics.jsonl'));
+    this.diagnostics = options.diagnostics || new DeliveryDiagnostics(
+      options.diagnosticsPath || join(DATA_DIR, 'delivery-diagnostics.jsonl'),
+      { onError: (error) => log.error('[delivery] 诊断日志已停用:', error) },
+    );
+    const pendingUsers = new Set(this.outbox.list(undefined, this.accountId).map((item) => item.userId));
+    for (const userId of pendingUsers) {
+      const until = this.quota.snapshot(userId).rateBackoffUntil;
+      if (until > 0) this.scheduleRateLimitRecovery(userId, until);
+    }
   }
 
   onMessage(handler: MessageHandler): void {
@@ -181,6 +200,13 @@ export class ILinkClient {
     return true;
   }
 
+  private forgetMessage(userId: string, id: number): void {
+    const key = `${userId}:${id}`;
+    if (!this.seenMsgIds.delete(key)) return;
+    const index = this.seenMsgOrder.indexOf(key);
+    if (index >= 0) this.seenMsgOrder.splice(index, 1);
+  }
+
   private headers(): Record<string, string> {
     return {
       'Content-Type': 'application/json',
@@ -205,6 +231,8 @@ export class ILinkClient {
   stop(): void {
     this.running = false;
     this.abortController?.abort();
+    for (const timer of this.rateLimitTimers.values()) clearTimeout(timer);
+    this.rateLimitTimers.clear();
     log.info('iLink 消息轮询已停止');
   }
 
@@ -220,6 +248,7 @@ export class ILinkClient {
         for (const msg of msgs) {
           await this.processMessage(msg);
         }
+        this.commitPendingPollCursor();
       } catch (err: unknown) {
         if (!this.running) return;
 
@@ -336,8 +365,7 @@ export class ILinkClient {
       }
 
       if (data.get_updates_buf) {
-        this.pollCursor = data.get_updates_buf;
-        savePollCursor(this.pollCursor);
+        this.pendingPollCursor = data.get_updates_buf;
       }
 
       return data.msgs || [];
@@ -358,6 +386,16 @@ export class ILinkClient {
       return;
     }
 
+    try {
+      await this.processFreshMessage(msg);
+    } catch (error) {
+      this.forgetMessage(msg.from_user_id, msg.message_id);
+      this.quota.abandonInbound(msg.from_user_id, msg.message_id);
+      throw error;
+    }
+  }
+
+  private async processFreshMessage(msg: WeixinMessage): Promise<void> {
     const usableContextToken = msg.context_token || this.contextTokens.get(msg.from_user_id) || '';
     const inbound = this.quota.recordInbound(msg.from_user_id, msg.message_id, usableContextToken);
     this.diagnostics.record({
@@ -382,21 +420,39 @@ export class ILinkClient {
 
     log.debug(`[msg] item_list=${JSON.stringify(redactSecrets(msg.item_list))}`);
     const { text, refText, mediaItems } = await parseMessage(msg);
-    if (!text && !refText && mediaItems.length === 0) return;
 
     log.debug(`收到 [${msg.from_user_id.substring(0, 12)}...]: ${text.substring(0, 60)}${mediaItems.length > 0 ? ` (+${mediaItems.length} media)` : ''}`);
+
+    if (!text && !refText && mediaItems.length === 0) {
+      this.quota.completeInbound(msg.from_user_id, msg.message_id);
+      return;
+    }
 
     for (const handler of this.handlers) {
       try {
         await handler(msg, text, refText, mediaItems.length > 0 ? mediaItems : undefined);
       } catch (err) {
         log.error('消息处理器异常:', err);
+        throw err;
       }
     }
+    this.quota.completeInbound(msg.from_user_id, msg.message_id);
   }
 
   getContextToken(userId: string): string | undefined {
     return this.contextTokens.get(userId);
+  }
+
+  private commitPendingPollCursor(): void {
+    if (!this.pendingPollCursor) return;
+    this.pollCursor = this.pendingPollCursor;
+    this.pendingPollCursor = undefined;
+    if (this.pollCursorPath === join(DATA_DIR, 'poll_cursor.txt')) {
+      savePollCursor(this.pollCursor);
+    } else {
+      mkdirSync(dirname(this.pollCursorPath), { recursive: true });
+      atomicWrite(this.pollCursorPath, this.pollCursor);
+    }
   }
 
   private persistContextTokens(): void {
@@ -427,44 +483,43 @@ export class ILinkClient {
   private getRateLimitState(userId: string): UserRateLimitState {
     const state = this.rateLimitStates.get(userId) || {
       consecutiveRet2: 0,
-      suppressIntermediateUntil: 0,
-      blockAllSendsUntil: 0,
     };
     this.rateLimitStates.set(userId, state);
     return state;
   }
 
-  private isRateLimitedError(err: unknown): boolean {
-    const msg = err instanceof Error ? err.message : String(err);
-    return msg.includes('ret=-2');
-  }
-
   private nextCooldownMs(consecutiveRet2: number): number {
     // 2nd consecutive ret=-2 => 150s; then linear backoff up to ~7min.
     const steps = Math.max(0, consecutiveRet2 - 2);
-    return Math.min(MAX_RATE_LIMIT_COOLDOWN_MS, BASE_RATE_LIMIT_COOLDOWN_MS + steps * 60_000);
+    return Math.min(this.rateLimitMaxCooldownMs, this.rateLimitBaseCooldownMs + steps * 60_000);
   }
 
-  private async gateSendWindow(userId: string, streamType: SendStreamType): Promise<boolean> {
-    const state = this.getRateLimitState(userId);
-    const now = Date.now();
-
-    if (streamType === 'intermediate' && now < state.suppressIntermediateUntil) {
-      log.debug(`[send] 跳过中间消息(保护模式): ${userId.substring(0, 12)}...`);
-      return false;
-    }
-
-    if (now < state.blockAllSendsUntil) {
-      if (streamType === 'intermediate') {
-        log.debug('[send] 中间消息命中全局发送冷却，直接跳过');
-        return false;
+  private scheduleRateLimitRecovery(userId: string, until: number): void {
+    const current = this.rateLimitTimers.get(userId);
+    if (current) clearTimeout(current);
+    const timer = setTimeout(() => {
+      this.rateLimitTimers.delete(userId);
+      try { this.quota.clearRateBackoff(userId); } catch (error) {
+        log.error('[delivery] 无法清除限流状态:', error);
+        return;
       }
-      const waitMs = state.blockAllSendsUntil - now;
-      log.warn(`[send] 命中限流冷却窗口，延迟发送 ${Math.ceil(waitMs / 1000)}s`);
-      await sleep(waitMs);
-    }
+      void this.recoverPending(userId).catch((error) => {
+        log.error('[delivery] 限流到期自动续发失败:', error);
+      });
+    }, Math.max(0, until - Date.now()));
+    timer.unref?.();
+    this.rateLimitTimers.set(userId, timer);
+  }
 
-    return true;
+  private resetRateLimitState(userId: string): void {
+    const state = this.getRateLimitState(userId);
+    state.consecutiveRet2 = 0;
+    const timer = this.rateLimitTimers.get(userId);
+    if (timer) clearTimeout(timer);
+    this.rateLimitTimers.delete(userId);
+    try { this.quota.clearRateBackoff(userId); } catch (error) {
+      log.warn('[delivery] 已发送，但无法清除持久限流状态:', error);
+    }
   }
 
   async sendText(userId: string, text: string, options?: {
@@ -652,7 +707,8 @@ export class ILinkClient {
         if (classified?.status === 'rate-limited') {
           const cooldownMs = this.nextCooldownMs(this.getRateLimitState(userId).consecutiveRet2 + 1);
           this.getRateLimitState(userId).consecutiveRet2 += 1;
-          this.quota.markRateBackoff(userId, cooldownMs);
+          const until = this.quota.markRateBackoff(userId, cooldownMs);
+          this.scheduleRateLimitRecovery(userId, until);
           this.outbox.freezeText(
             current.itemId,
             current.text,
@@ -686,6 +742,7 @@ export class ILinkClient {
         }
         this.outbox.ack(frozen.itemId);
         this.diagnostics.record({ event: 'ack', userId, itemId: frozen.itemId, bytes: frozen.bytes });
+        this.resetRateLimitState(userId);
       } catch (err) {
         throw isDeliveryFinalizationError(err) ? err : new DeliveryFinalizationError(frozen.itemId, err);
       }
@@ -756,53 +813,6 @@ export class ILinkClient {
     }
   }
 
-  private async sendRawMessageWithRetry(
-    userId: string,
-    contextToken: string,
-    itemList: MessageItem[],
-    streamType: SendStreamType = 'regular',
-  ): Promise<void> {
-    const state = this.getRateLimitState(userId);
-    let lastErr: unknown = null;
-    const retryDelays = streamType === 'regular'
-      ? REGULAR_RETRY_DELAYS_MS
-      : INTERMEDIATE_RETRY_DELAYS_MS;
-
-    for (let attempt = 0; attempt < retryDelays.length; attempt++) {
-      const delay = retryDelays[attempt];
-      if (delay > 0) await sleep(delay);
-
-      if (!(await this.gateSendWindow(userId, streamType))) {
-        return;
-      }
-
-      try {
-        await this.sendRawMessage(userId, contextToken, itemList);
-        state.consecutiveRet2 = 0;
-        state.blockAllSendsUntil = 0;
-        return;
-      } catch (err) {
-        lastErr = err;
-        const isRateLimited = this.isRateLimitedError(err);
-
-        if (isRateLimited) {
-          state.consecutiveRet2 += 1;
-          const cooldownMs = this.nextCooldownMs(state.consecutiveRet2);
-          const until = Date.now() + cooldownMs;
-          state.blockAllSendsUntil = Math.max(state.blockAllSendsUntil, until);
-          state.suppressIntermediateUntil = Math.max(state.suppressIntermediateUntil, until);
-          log.warn(`[send] 命中限流 ret=-2，进入冷却 ${Math.round(cooldownMs / 1000)}s (连续${state.consecutiveRet2}次)`);
-        }
-
-        if (!isRateLimited || attempt === retryDelays.length - 1) {
-          throw err;
-        }
-        log.warn(`[send] ret=-2 延迟重试 (${attempt + 1}/${retryDelays.length - 1})`);
-      }
-    }
-    throw lastErr instanceof Error ? lastErr : new Error('发送消息失败');
-  }
-
   private async sendRawMessage(
     userId: string,
     contextToken: string,
@@ -825,20 +835,36 @@ export class ILinkClient {
           },
           base_info: this.baseInfo(),
         }),
-        label: 'send',
-        retries: 2,
+        label: 'send-media',
+        retries: 0,
         timeoutMs: 30_000,
       },
     );
 
     if (!res.ok) {
       const body = await res.text().catch(() => '');
-      throw new Error(`发送消息失败: HTTP ${res.status} ${body}`);
+      throw new ILinkApiError({ httpStatus: res.status, errmsg: `HTTP ${res.status} ${body}` });
     }
 
-    const data = (await res.json()) as { ret?: number; errmsg?: string };
+    const raw = await res.text().catch(() => '');
+    if (!raw.trim()) {
+      throw new ILinkApiError({ httpStatus: res.status, errmsg: 'empty sendmessage response' });
+    }
+    let data: { ret?: number; errcode?: number; errmsg?: string; message_id?: number | string };
+    try {
+      data = JSON.parse(raw) as typeof data;
+    } catch {
+      throw new ILinkApiError({ httpStatus: res.status, errmsg: 'sendmessage response was not valid JSON' });
+    }
     if (data.ret !== undefined && data.ret !== 0) {
-      throw new Error(`发送消息失败: ${data.errmsg || `ret=${data.ret}`}`);
+      throw new ILinkApiError({
+        ret: data.ret,
+        errcode: data.errcode,
+        errmsg: data.errmsg || `ret=${data.ret}`,
+      });
+    }
+    if (data.ret !== 0 && data.message_id === undefined) {
+      throw new ILinkApiError({ httpStatus: res.status, errmsg: 'sendmessage response did not confirm delivery' });
     }
   }
 
@@ -855,11 +881,10 @@ export class ILinkClient {
       throw new Error(`文件不存在: ${filePath}`);
     }
 
-    const upload = await this.uploadToCdn(userId, filePath, UPLOAD_MEDIA_TYPE_FILE);
     const fileName = title || basename(filePath);
-
-    await this.enqueueSend(userId, async () => {
-      await this.sendRawMessageWithRetry(userId, token, [
+    await this.withMediaBudget(userId, async () => {
+      const upload = await this.uploadToCdn(userId, filePath, UPLOAD_MEDIA_TYPE_FILE);
+      return [
         {
           type: 4,
           file_item: {
@@ -872,7 +897,7 @@ export class ILinkClient {
             },
           },
         },
-      ]);
+      ];
     });
 
     log.info(`[sendFile] 已发送: ${fileName}`);
@@ -893,10 +918,9 @@ export class ILinkClient {
       await this.sendText(userId, caption);
     }
 
-    const upload = await this.uploadToCdn(userId, imagePath, UPLOAD_MEDIA_TYPE_IMAGE);
-
-    await this.enqueueSend(userId, async () => {
-      await this.sendRawMessageWithRetry(userId, token, [
+    await this.withMediaBudget(userId, async () => {
+      const upload = await this.uploadToCdn(userId, imagePath, UPLOAD_MEDIA_TYPE_IMAGE);
+      return [
         {
           type: 2,
           image_item: {
@@ -908,7 +932,7 @@ export class ILinkClient {
             mid_size: upload.filesize,
           },
         },
-      ]);
+      ];
     });
 
     log.info(`[sendImage] 已发送图片: ${basename(imagePath)}`);
@@ -925,10 +949,9 @@ export class ILinkClient {
       throw new Error(`视频不存在: ${videoPath}`);
     }
 
-    const upload = await this.uploadToCdn(userId, videoPath, UPLOAD_MEDIA_TYPE_VIDEO);
-
-    await this.enqueueSend(userId, async () => {
-      await this.sendRawMessageWithRetry(userId, token, [
+    await this.withMediaBudget(userId, async () => {
+      const upload = await this.uploadToCdn(userId, videoPath, UPLOAD_MEDIA_TYPE_VIDEO);
+      return [
         {
           type: 5,
           video_item: {
@@ -940,10 +963,70 @@ export class ILinkClient {
             video_size: upload.filesize,
           },
         },
-      ]);
+      ];
     });
 
     log.info(`[sendVideo] 已发送视频: ${basename(videoPath)}`);
+  }
+
+  private async withMediaBudget(userId: string, prepare: () => Promise<MessageItem[]>): Promise<void> {
+    return this.enqueueSend(userId, async () => {
+      await this.deliverPendingNow(userId);
+      if (this.outbox.listPending(userId, this.accountId).length > 0) {
+        throw new Error('media send blocked: text delivery backlog must be drained first');
+      }
+
+      const preflightSnapshot = this.quota.snapshot(userId);
+      if (preflightSnapshot.rateBackoffUntil > Date.now()) {
+        this.scheduleRateLimitRecovery(userId, preflightSnapshot.rateBackoffUntil);
+        throw new Error('media send blocked: delivery window is rate limited');
+      }
+      const preflight = this.quota.reserve(userId, 0, 'media', {
+        generation: preflightSnapshot.generation,
+        tokenVersion: preflightSnapshot.tokenVersion,
+      });
+      if (!preflight.allowed) {
+        throw new Error(`media send blocked by quota budget: ${preflight.reason}`);
+      }
+      this.quota.release(preflight.reservation.reservationId);
+
+      const itemList = await prepare();
+      const token = this.contextTokens.get(userId);
+      if (!token) throw new Error('media send blocked: missing context token');
+      const snapshot = this.quota.snapshot(userId);
+      const reserved = this.quota.reserve(userId, 0, 'media', {
+        generation: snapshot.generation,
+        tokenVersion: snapshot.tokenVersion,
+      });
+      if (!reserved.allowed) {
+        throw new Error(`media send blocked by quota budget: ${reserved.reason}`);
+      }
+
+      const reservationId = reserved.reservation.reservationId;
+      try {
+        await this.sendRawMessage(userId, token, itemList);
+      } catch (error) {
+        const details = errorDetails(error);
+        const classified = classifyApiFailure(details);
+        if (classified?.status === 'rate-limited') {
+          this.quota.release(reservationId);
+          const state = this.getRateLimitState(userId);
+          state.consecutiveRet2 += 1;
+          const until = this.quota.markRateBackoff(userId, this.nextCooldownMs(state.consecutiveRet2));
+          this.scheduleRateLimitRecovery(userId, until);
+        } else if (classified?.ambiguous) {
+          this.quota.commit(reservationId);
+        } else {
+          this.quota.release(reservationId);
+        }
+        throw error;
+      }
+
+      if (!this.quota.commit(reservationId)) {
+        this.quota.confirmSend(userId, `media:${reservationId}`);
+      }
+      this.resetRateLimitState(userId);
+    });
   }
 
   private async uploadToCdn(
@@ -1229,6 +1312,16 @@ function loadContextTokensAt(filePath: string): Map<string, string> {
     return new Map(Object.entries(parsed).filter((entry): entry is [string, string] => typeof entry[1] === 'string'));
   } catch {
     return new Map();
+  }
+}
+
+function loadPollCursorAt(filePath: string): string {
+  if (filePath === join(DATA_DIR, 'poll_cursor.txt')) return loadPollCursor();
+  if (!existsSync(filePath)) return '';
+  try {
+    return readFileSync(filePath, 'utf8').trim();
+  } catch {
+    return '';
   }
 }
 

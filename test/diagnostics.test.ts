@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -42,4 +42,29 @@ test('redactDiagnostic preserves structured delivery counters', () => {
   assert.equal(output.remainingItems, 3);
   assert.equal(output.body.aes_key, '***');
   assert.equal(output.body.count, 2);
+});
+
+test('diagnostic filesystem failures never escape into message processing', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'quota-v2-diagnostics-failure-'));
+  const blockedParent = join(dir, 'not-a-directory');
+  writeFileSync(blockedParent, 'file', 'utf8');
+  const errors: unknown[] = [];
+
+  let diagnostics: DeliveryDiagnostics | undefined;
+  assert.doesNotThrow(() => {
+    diagnostics = new DeliveryDiagnostics(join(blockedParent, 'delivery.jsonl'), {
+      onError: (error) => errors.push(error),
+    });
+  });
+  assert.doesNotThrow(() => diagnostics!.record({ event: 'inbound', userId: 'user-a' }));
+  assert.equal(errors.length, 1);
+
+  const directoryPath = join(dir, 'is-a-directory');
+  mkdirSync(directoryPath);
+  const appendErrors: unknown[] = [];
+  const appendFailure = new DeliveryDiagnostics(directoryPath, {
+    onError: (error) => appendErrors.push(error),
+  });
+  assert.doesNotThrow(() => appendFailure.record({ event: 'request' }));
+  assert.equal(appendErrors.length, 1);
 });

@@ -189,7 +189,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
 
   private async handle(msg: WeixinMessage, text: string, refText: string, media?: DownloadedMedia[]): Promise<void> {
     const uid = msg.from_user_id;
-    if (this.config.allowedUsers.length > 0 && !this.config.allowedUsers.includes(uid)) return;
+    if (!this.config.allowAllUsers && !this.config.allowedUsers.includes(uid)) return;
     const deliveryClient = this.ilink as ILinkClient & {
       getDeliveryStatus?: (userId: string) => { quota: { generation: number }; pending: unknown[] };
       recoverPending?: (userId: string) => Promise<unknown>;

@@ -9,6 +9,7 @@ export interface DeliveryDiagnosticEvent {
 export interface DeliveryDiagnosticsOptions {
   maxTextBytes?: number;
   now?: () => number;
+  onError?: (error: unknown) => void;
 }
 
 const SECRET_KEYS = new Set([
@@ -29,16 +30,34 @@ const TEXT_KEYS = new Set(['text', 'body', 'errmsg', 'errormessage', 'message'])
 export class DeliveryDiagnostics {
   private readonly maxTextBytes: number;
   private readonly now: () => number;
+  private readonly onError?: (error: unknown) => void;
+  private disabled = false;
 
   constructor(private readonly filePath: string, options: DeliveryDiagnosticsOptions = {}) {
     this.maxTextBytes = Math.max(32, Math.floor(options.maxTextBytes ?? 500));
     this.now = options.now ?? Date.now;
-    mkdirSync(dirname(filePath), { recursive: true });
+    this.onError = options.onError;
+    try {
+      mkdirSync(dirname(filePath), { recursive: true });
+    } catch (error) {
+      this.disable(error);
+    }
   }
 
   record(event: DeliveryDiagnosticEvent): void {
-    const sanitized = redactDiagnostic({ timestamp: this.now(), ...event }, this.maxTextBytes);
-    appendFileSync(this.filePath, `${JSON.stringify(sanitized)}\n`, 'utf8');
+    if (this.disabled) return;
+    try {
+      const sanitized = redactDiagnostic({ timestamp: this.now(), ...event }, this.maxTextBytes);
+      appendFileSync(this.filePath, `${JSON.stringify(sanitized)}\n`, 'utf8');
+    } catch (error) {
+      this.disable(error);
+    }
+  }
+
+  private disable(error: unknown): void {
+    if (this.disabled) return;
+    this.disabled = true;
+    try { this.onError?.(error); } catch { /* diagnostics must remain best-effort */ }
   }
 }
 

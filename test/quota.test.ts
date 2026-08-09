@@ -67,6 +67,21 @@ test('a real inbound opens the next window while a poll replay does not', () => 
   assert.equal(quota.remaining('user-a'), 10);
 });
 
+test('an incomplete inbound retries without opening a second quota window', () => {
+  const quota = new QuotaManager(tempPath(), 'account-a');
+  const first = quota.recordInbound('user-a', 'message-1', 'token-1');
+  assert.equal(first.duplicate, false);
+  assert.equal(first.generation, 1);
+
+  assert.equal(quota.abandonInbound('user-a', 'message-1'), true);
+  const retry = quota.recordInbound('user-a', 'message-1', 'token-1');
+  assert.equal(retry.duplicate, false);
+  assert.equal(retry.generation, 1);
+
+  assert.equal(quota.completeInbound('user-a', 'message-1'), true);
+  assert.equal(quota.recordInbound('user-a', 'message-1', 'token-1').duplicate, true);
+});
+
 test('confirmed item IDs are idempotent and do not overrun the window', () => {
   const quota = new QuotaManager(tempPath(), 'account-a');
   quota.recordInbound('user-a', 1, 'token-1');
