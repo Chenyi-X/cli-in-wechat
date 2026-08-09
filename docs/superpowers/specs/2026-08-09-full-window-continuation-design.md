@@ -57,8 +57,9 @@ longer drains pending output before dispatch.
 - Exact trimmed `继续` text with pending records performs
   `startTyping -> recoverPending -> stopTyping`, consumes the command, and never
   invokes an Agent.
-- Exact `继续` text with an empty queue is consumed without typing or Agent
-  execution.
+- Exact `继续` text with an empty queue is an ordinary prompt. It does not start
+  delivery typing and reaches the current Agent session unchanged, including
+  immediately after `/new` or after the pending queue has just drained.
 - Every other fresh inbound first recovers pending FIFO records and then continues
   through normal command or Agent routing.
 
@@ -66,6 +67,8 @@ longer drains pending output before dispatch.
 
 - Add an end-to-end inbound test through `ILinkClient.processMessage()` and the
   real router handler proving typing wraps recovery and the Agent is not invoked.
+- Add router coverage proving exact `继续` reaches the Agent when no queued
+  record exists and remains a recovery command only while the queue is nonempty.
 - Add planner tests for nine streamed records followed by final, ten streamed
   records followed by final, and eleven streamed records. Assert ten-message
   windows, FIFO order, and suffix placement on record ten.
