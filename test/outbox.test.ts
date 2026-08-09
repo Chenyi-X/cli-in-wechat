@@ -278,6 +278,63 @@ test('normalizes an oversized schema-one final batch before delivery planning', 
   assert.deepEqual(reloaded.listPending('user-a', 'account-a'), pending);
 });
 
+test('splits individually oversized pending activity without merging record boundaries', () => {
+  const filePath = tempPath();
+  const activityText = 'A'.repeat(1_500);
+  const intermediateText = 'B'.repeat(1_500);
+  writeFileSync(filePath, JSON.stringify({
+    schemaVersion: 2,
+    revision: 1,
+    nextSequence: 3,
+    items: [
+      {
+        schemaVersion: 2,
+        itemId: 'activity-1',
+        clientId: 'activity-client-1',
+        sequence: 1,
+        kind: 'text',
+        accountId: 'account-a',
+        userId: 'user-a',
+        generation: 1,
+        tokenVersion: 1,
+        priority: 'activity',
+        text: activityText,
+        bytes: 1_500,
+        createdAt: 1,
+        expiresAt: Date.now() + 60_000,
+        state: 'pending',
+      },
+      {
+        schemaVersion: 2,
+        itemId: 'intermediate-1',
+        clientId: 'intermediate-client-1',
+        sequence: 2,
+        kind: 'text',
+        accountId: 'account-a',
+        userId: 'user-a',
+        generation: 1,
+        tokenVersion: 1,
+        priority: 'intermediate',
+        text: intermediateText,
+        bytes: 1_500,
+        createdAt: 2,
+        expiresAt: Date.now() + 60_000,
+        state: 'pending',
+      },
+    ],
+  }));
+
+  const store = new OutboxStore(filePath, { bodyChunkBytes: 1_000, inboundItemLimit: 10 });
+  const pending = store.listPending('user-a', 'account-a');
+
+  assert.equal(pending.length, 4);
+  assert.equal(pending.slice(0, 2).map((item) => item.text).join(''), activityText);
+  assert.equal(pending.slice(2).map((item) => item.text).join(''), intermediateText);
+  assert.equal(pending[0].itemId, 'activity-1');
+  assert.equal(pending[2].itemId, 'intermediate-1');
+  assert.ok(pending.every((item) => item.bytes <= 1_000));
+});
+
 test('normalizes an already-wrapped schema-two failure snapshot once', () => {
   const filePath = tempPath();
   writeFileSync(filePath, JSON.stringify(schemaTwoFailureFixture()));
@@ -382,22 +439,33 @@ test('preserves legacy low-priority items when an oversized final run migrates',
       index === 0 || item.sequence > items[index - 1].sequence));
   });
 
-  await t.test('leaves low-priority items untouched when the final run is ineligible', () => {
+  await t.test('preserves low-priority and frozen final records while splitting safe finals', () => {
     const filePath = tempPath();
     const fixture = schemaTwoMixedFailureFixture();
     const ineligible = fixture.items.find((item) => item.itemId === 'legacy-7');
     assert.ok(ineligible);
     ineligible.state = 'permanent-failure';
-    const before = JSON.stringify(fixture);
-    writeFileSync(filePath, before);
+    writeFileSync(filePath, JSON.stringify(fixture));
 
     const store = new OutboxStore(filePath, migrationOptions());
 
-    assert.equal(store.list().length, 43);
-    assert.ok(store.get('legacy-intermediate-1'));
-    assert.ok(store.get('legacy-activity-19'));
-    assert.equal(readFileSync(filePath, 'utf8'), before);
-    assert.equal(existsSync(`${filePath}.bak`), false);
+    for (const itemId of ['legacy-intermediate-1', 'legacy-activity-19']) {
+      const expected = fixture.items.find((item) => item.itemId === itemId);
+      const actual = store.get(itemId);
+      assert.ok(expected);
+      assert.ok(actual);
+      assert.deepEqual(stableMigrationFields(actual), stableMigrationFields(expected));
+    }
+    const frozen = store.get('legacy-7');
+    assert.ok(frozen);
+    assert.deepEqual(stableMigrationFields(frozen), stableMigrationFields(ineligible));
+    assert.equal(frozen.state, 'permanent-failure');
+    assert.ok(store.list().filter((item) => item.priority === 'final' && item.state === 'pending')
+      .every((item) => item.bytes <= MIGRATED_BODY_BYTES));
+    assert.deepEqual(
+      JSON.parse(readFileSync(filePath, 'utf8')),
+      JSON.parse(readFileSync(`${filePath}.bak`, 'utf8')),
+    );
   });
 });
 
@@ -725,7 +793,7 @@ test('does not publish an unrepresentable UTF-8 rechunk migration', () => {
   assert.equal(existsSync(`${filePath}.bak`), false);
 });
 
-test('does not migrate schema-two batches outside the strict eligibility boundary', async (t) => {
+test('enforces the byte ceiling per safe record while preserving frozen records', async (t) => {
   for (const { name, pretty, mutate } of [
   {
     name: 'all compliant bodies',
@@ -789,23 +857,52 @@ test('does not migrate schema-two batches outside the strict eligibility boundar
       writeFileSync(filePath, before);
 
       const store = new OutboxStore(filePath, migrationOptions());
+      const loaded = store.list();
+      const expectsWrite = fixture.items.some((item) => item.state === 'pending'
+        && !item.deliveryReceipt
+        && !item.recoveryRequired
+        && !item.continuationNoticeAttached
+        && Buffer.byteLength(String(item.text), 'utf8') > MIGRATED_BODY_BYTES);
 
-      for (const item of fixture.items) {
-        const loaded = store.get(String(item.itemId));
-        assert.ok(loaded);
-        assert.equal(loaded.text, item.text);
-        assert.equal(loaded.bytes, item.bytes);
-        assert.equal(loaded.priority, item.priority);
-        assert.equal(loaded.state, item.state);
-        assert.equal(loaded.generation, item.generation);
-        assert.equal(loaded.tokenVersion, item.tokenVersion);
-        assert.deepEqual(loaded.deliveryReceipt, item.deliveryReceipt);
-        assert.equal(loaded.recoveryRequired, item.recoveryRequired);
-        assert.equal(loaded.continuationNoticeAttached, item.continuationNoticeAttached);
+      fixture.items.forEach((item, index) => {
+        const start = loaded.findIndex((candidate) => candidate.itemId === item.itemId);
+        const nextOriginalId = fixture.items[index + 1]?.itemId;
+        const end = nextOriginalId === undefined
+          ? loaded.length
+          : loaded.findIndex((candidate) => candidate.itemId === nextOriginalId);
+        assert.ok(start >= 0);
+        assert.ok(end > start);
+        const records = loaded.slice(start, end);
+        assert.equal(records.map((record) => record.text).join(''), item.text);
+
+        const frozen = item.state !== 'pending'
+          || Boolean(item.deliveryReceipt)
+          || Boolean(item.recoveryRequired)
+          || Boolean(item.continuationNoticeAttached);
+        const oversized = Buffer.byteLength(String(item.text), 'utf8') > MIGRATED_BODY_BYTES;
+        if (!frozen && oversized) {
+          assert.ok(records.length > 1);
+          assert.ok(records.every((record) => record.bytes <= MIGRATED_BODY_BYTES));
+          assert.equal(records[0].itemId, item.itemId);
+          assert.equal(records[0].clientId, item.clientId);
+        } else {
+          assert.equal(records.length, 1);
+          assert.deepEqual(stableMigrationFields(records[0]), stableMigrationFields(item));
+          assert.deepEqual(records[0].deliveryReceipt, item.deliveryReceipt);
+          assert.equal(records[0].recoveryRequired, item.recoveryRequired);
+          assert.equal(records[0].continuationNoticeAttached, item.continuationNoticeAttached);
+        }
+      });
+
+      if (expectsWrite) {
+        assert.deepEqual(
+          JSON.parse(readFileSync(filePath, 'utf8')),
+          JSON.parse(readFileSync(`${filePath}.bak`, 'utf8')),
+        );
+      } else {
+        assert.equal(readFileSync(filePath, 'utf8'), before);
+        assert.equal(existsSync(`${filePath}.bak`), false);
       }
-
-      assert.equal(readFileSync(filePath, 'utf8'), before);
-      assert.equal(existsSync(`${filePath}.bak`), false);
     });
   }
 });

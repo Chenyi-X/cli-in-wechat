@@ -362,6 +362,31 @@ test('default client sends UTF-8 text bodies above 2000 and at most 3800 bytes',
   });
 });
 
+test('configured byte ceiling rechunks a short persisted pending batch before recovery', async () => {
+  const options = paths();
+  const snapshot = schemaTwoFailureFixture();
+  const body = 'A'.repeat(1_500);
+  snapshot.items = [{
+    ...snapshot.items[0],
+    text: body,
+    bytes: Buffer.byteLength(body, 'utf8'),
+  }];
+  snapshot.nextSequence = 2;
+  writeFileSync(options.outboxPath, JSON.stringify(snapshot), 'utf8');
+  const client = new ILinkClient(CREDS, { ...options, maxTextBytes: 1_000 });
+
+  await withFetchResponses(Array.from({ length: 2 }, () => ({ ret: 0 })), async (requests) => {
+    await processInboundAndRecover(client, message(52, 'user-a', 'fresh-token', '继续'));
+
+    const bodies = requests.map(
+      (request) => request.body.msg.item_list[0].text_item.text as string,
+    );
+    assert.equal(bodies.length, 2);
+    assert.ok(bodies.every((text) => Buffer.byteLength(text, 'utf8') <= 1_000));
+    assert.equal(bodies.join(''), body);
+  });
+});
+
 test('rate-limited ret=-2 stops the window without a second client retry', async () => {
   const client = new ILinkClient(CREDS, paths());
   await (client as any).processMessage(message(1));
@@ -370,6 +395,42 @@ test('rate-limited ret=-2 stops the window without a second client retry', async
     assert.equal(result[0].status, 'rate-limited');
     assert.equal(requests.length, 1);
     assert.equal((client as any).quota.snapshot('user-a').rateBackoffUntil > Date.now(), true);
+  });
+});
+
+test('rate-limited boundary retry removes the stale continuation notice', async () => {
+  const client = new ILinkClient(CREDS, paths());
+  await (client as any).processMessage(message(1));
+  const outbox = (client as any).outbox;
+  for (let index = 0; index < 11; index += 1) {
+    outbox.enqueue({
+      accountId: 'account-a',
+      userId: 'user-a',
+      generation: 1,
+      tokenVersion: 1,
+      priority: 'final',
+      itemId: `rate-boundary-${index + 1}`,
+      text: `body-${index + 1}`,
+    });
+  }
+
+  const responses = [
+    ...Array.from({ length: 9 }, () => ({ ret: 0 })),
+    { ret: -2, errmsg: 'rate limited' },
+    { ret: 0 },
+    { ret: 0 },
+  ];
+  await withFetchResponses(responses, async (requests) => {
+    await client.recoverPending('user-a');
+    await processInboundAndRecover(client, message(2, 'user-a', 'next-token', '继续'));
+
+    const bodies = requests.map(
+      (request) => request.body.msg.item_list[0].text_item.text as string,
+    );
+    assert.ok(bodies[9].endsWith('\n\n后续内容已排队，请回复“继续”续发。'));
+    assert.equal(bodies[10], 'body-10');
+    assert.equal(bodies[11], 'body-11');
+    assert.equal(outbox.listPending('user-a').length, 0);
   });
 });
 

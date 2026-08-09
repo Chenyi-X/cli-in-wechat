@@ -519,14 +519,32 @@ export class OutboxStore {
       const batch = ordered.slice(start, end);
       const eligible = batch.length > this.inboundItemLimit
         && batch.every((item) => item.priority === 'final'
-          && item.state === 'pending'
-          && !item.deliveryReceipt
-          && !item.recoveryRequired
-          && !item.continuationNoticeAttached)
+          && canRechunkPendingItem(item))
         && batch.some((item) => Buffer.byteLength(item.text, 'utf8') > this.bodyChunkBytes!);
 
       if (!eligible) {
-        normalized.push(...batch);
+        for (const item of batch) {
+          if (!canRechunkPendingItem(item)
+            || Buffer.byteLength(item.text, 'utf8') <= this.bodyChunkBytes) {
+            normalized.push(item);
+            continue;
+          }
+          const chunks = chunkUtf8Text(item.text, this.bodyChunkBytes);
+          if (chunks.join('') !== item.text
+            || chunks.some((chunk) => Buffer.byteLength(chunk, 'utf8') > this.bodyChunkBytes!)) {
+            throw new OutboxMigrationError(
+              `normalization could not preserve item ${item.itemId} within bodyChunkBytes`,
+            );
+          }
+          normalized.push(...chunks.map((chunk, index): OutboxItem => ({
+            ...item,
+            itemId: index === 0 ? item.itemId : randomUUID(),
+            clientId: index === 0 ? item.clientId : randomUUID(),
+            text: chunk,
+            bytes: Buffer.byteLength(chunk, 'utf8'),
+          })));
+          changed = true;
+        }
         start = end;
         continue;
       }
@@ -604,6 +622,13 @@ function sameMigrationBatch(left: OutboxItem, right: OutboxItem): boolean {
     && left.generation === right.generation
     && left.tokenVersion === right.tokenVersion
     && left.priority === right.priority;
+}
+
+function canRechunkPendingItem(item: OutboxItem): boolean {
+  return item.state === 'pending'
+    && !item.deliveryReceipt
+    && !item.recoveryRequired
+    && !item.continuationNoticeAttached;
 }
 
 function decodeDeliveryState(

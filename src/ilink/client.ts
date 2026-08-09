@@ -653,6 +653,11 @@ export class ILinkClient {
           const cooldownMs = this.nextCooldownMs(this.getRateLimitState(userId).consecutiveRet2 + 1);
           this.getRateLimitState(userId).consecutiveRet2 += 1;
           this.quota.markRateBackoff(userId, cooldownMs);
+          this.outbox.freezeText(
+            current.itemId,
+            current.text,
+            Boolean(current.continuationNoticeAttached),
+          );
           results.push(this.resultForItem(frozen, 'rate-limited', details));
         } else if (classified?.status === 'permanent-failure') {
           this.outbox.markPermanentFailure(frozen.itemId, details);
