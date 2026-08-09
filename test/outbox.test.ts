@@ -127,13 +127,17 @@ test('ambiguous records remain pending with their original payload', () => {
   assert.deepEqual(pending.terminalError, { errmsg: 'timeout' });
 });
 
-test('final enqueue supersedes same-generation activity and intermediate records', () => {
+test('final enqueue preserves same-generation activity and intermediate records in fifo order', () => {
   const store = new OutboxStore(tempPath());
   store.enqueue(input({ itemId: 'activity-1', priority: 'activity', text: 'activity' }));
   store.enqueue(input({ itemId: 'intermediate-1', priority: 'intermediate', text: 'intermediate' }));
   store.enqueue(input({ itemId: 'final-1', priority: 'final', text: 'final' }));
 
-  assert.deepEqual(store.listPending('user-a').map((item) => item.itemId), ['final-1']);
+  assert.deepEqual(store.listPending('user-a').map((item) => item.itemId), [
+    'activity-1',
+    'intermediate-1',
+    'final-1',
+  ]);
 });
 
 test('final enqueue preserves confirmed activity until its receipt is reconciled', () => {
@@ -345,26 +349,19 @@ test('normalizes the incident final run behind same-generation low-priority item
   );
 });
 
-test('supersedes legacy low-priority items only when their final run migrates', async (t) => {
-  await t.test('removes receiptless items and preserves confirmed and unrelated records', () => {
+test('preserves legacy low-priority items when an oversized final run migrates', async (t) => {
+  await t.test('retains receiptless, confirmed, and unrelated records', () => {
     const filePath = tempPath();
     const fixture = schemaTwoMixedFailureFixture();
     const confirmed = fixture.items.find((item) => item.itemId === 'legacy-activity-19');
     assert.ok(confirmed);
     confirmed.deliveryReceipt = { reservationId: 'legacy-confirmed', quotaGeneration: 42 };
-    const removedIds = fixture.items
-      .filter((item) => item.generation === 42
-        && (item.priority === 'activity' || item.priority === 'intermediate')
-        && item.itemId !== confirmed.itemId)
-      .map((item) => String(item.itemId));
-    const expectedRetainedIds = fixture.items
-      .filter((item) => !removedIds.includes(String(item.itemId)))
-      .map((item) => String(item.itemId));
+    const expectedRetainedIds = fixture.items.map((item) => String(item.itemId));
     writeFileSync(filePath, JSON.stringify(fixture));
 
     const store = new OutboxStore(filePath, migrationOptions());
 
-    for (const itemId of removedIds) assert.equal(store.get(itemId), undefined);
+    for (const itemId of expectedRetainedIds) assert.ok(store.get(itemId));
     const retainedConfirmed = store.get(String(confirmed.itemId));
     assert.ok(retainedConfirmed);
     assert.deepEqual(stableMigrationFields(retainedConfirmed), stableMigrationFields(confirmed));
@@ -1051,18 +1048,20 @@ test('batch enqueue is atomic when a later final item exceeds capacity', () => {
   assert.deepEqual(store.listPending('user-a').map((item) => item.itemId), [existing.itemId]);
 });
 
-test('reserves capacity for a future final result while activity is queued', () => {
+test('capacity pressure never evicts queued activity for a final result', () => {
   const store = new OutboxStore(tempPath(), {
     maxItemsPerUser: 2,
-    finalReserveItems: 1,
+    finalReserveItems: 0,
+    finalReserveBytes: 0,
   });
   store.enqueue(input({ itemId: 'activity-1', priority: 'activity', text: 'activity' }));
+  store.enqueue(input({ itemId: 'activity-2', priority: 'activity', text: 'activity 2' }));
 
-  assert.throws(
-    () => store.enqueue(input({ itemId: 'activity-2', priority: 'activity', text: 'activity 2' })),
-    OutboxCapacityError,
-  );
-  assert.equal(store.enqueue(input({ itemId: 'final-1', text: 'final' })).itemId, 'final-1');
+  assert.throws(() => store.enqueue(input({ itemId: 'final-1', text: 'final' })), OutboxCapacityError);
+  assert.deepEqual(store.listPending('user-a').map((item) => item.itemId), [
+    'activity-1',
+    'activity-2',
+  ]);
 });
 
 test('requeues selected permanent failures without changing identity or payload', () => {

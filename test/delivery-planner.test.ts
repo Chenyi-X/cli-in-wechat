@@ -125,7 +125,7 @@ test('covers the required final chunk counts at the ten-item boundary', () => {
   }
 });
 
-test('uses the full window even when legacy priority limits are configured', () => {
+test('holds one stream slot for a discoverable continuation without reordering', () => {
   const plan = planDeliveryWindow(Array.from({ length: 10 }, (_, index) => ({
     itemId: `activity-${index + 1}`,
     text: `activity-${index + 1}`,
@@ -138,8 +138,8 @@ test('uses the full window even when legacy priority limits are configured', () 
     continuationNotice: '续发',
   });
 
-  assert.equal(plan.items.length, 10);
-  assert.equal(plan.remainingItems, 0);
-  assert.equal(plan.needsContinuation, false);
-  assert.equal(plan.items[9].text, 'activity-10');
+  assert.equal(plan.items.length, 9);
+  assert.equal(plan.remainingItems, 1);
+  assert.equal(plan.needsContinuation, true);
+  assert.equal(plan.items[8].text, 'activity-9\n\n续发');
 });

@@ -4,13 +4,13 @@
 
 **Goal:** Preserve every generated answer and Activity record and deliver it in strict outbox sequence across ten-bubble windows and restarts.
 
-**Architecture:** Make outbox sequence the only planner ordering key, remove final supersession and priority-specific quota reserves, and wrap exact continuation recovery with the existing typing API. Keep priority fields for persisted-schema compatibility and diagnostics, not scheduling.
+**Architecture:** Make outbox sequence the only planner ordering key, retain a one-slot live-stream holdback solely for continuation discoverability, remove final supersession, and wrap exact continuation recovery with the existing typing API. Priority can pause the FIFO head but can never delete or reorder records.
 
 **Tech Stack:** TypeScript, Node.js, `node:test`, persisted JSON outbox/quota state, iLink send and typing APIs.
 
 ---
 
-### Task 1: Specify FIFO planning and full-window use
+### Task 1: Specify FIFO planning with a stream holdback
 
 **Files:**
 - Modify: `test/delivery-planner.test.ts`
@@ -22,8 +22,9 @@
 
 Add a planner test whose input order is `activity-1`, `final-1`,
 `intermediate-1` and whose two-item output must be `activity-1`, `final-1`.
-Replace the nine-item low-priority sub-window assertion with an assertion that
-ten mixed-priority records use all ten slots before continuation.
+Assert that ten Activity records send the first nine in FIFO order, attach the
+continuation suffix to record nine, and leave record ten queued. Also assert
+that the planner never skips that queued Activity to select a later final.
 
 - [ ] **Step 2: Run the red tests**
 
@@ -33,14 +34,13 @@ Run:
 node --import tsx --test test/delivery-planner.test.ts test/quota.test.ts
 ```
 
-Expected: FAIL because the planner sorts `final` ahead of earlier records and
-quota still reserves one item for final.
+Expected: FAIL because the planner sorts `final` ahead of earlier records.
 
 - [ ] **Step 3: Implement FIFO planning and total-only quota checks**
 
 Remove `PRIORITY_RANK` sorting and select directly from the received pending
-array. Stop applying `maxItemsByPriority` in planner selection and quota
-reservation; retain persisted limit fields only for backward-compatible reads.
+array. Apply the FIFO head record's stream holdback without scanning later
+records for a priority that could still use the tenth slot.
 
 - [ ] **Step 4: Run focused tests and commit**
 
@@ -50,7 +50,8 @@ git add src/ilink/delivery-planner.ts src/ilink/quota.ts test/delivery-planner.t
 git commit -m "fix: deliver mixed messages in fifo order"
 ```
 
-Expected: focused tests pass.
+Expected: focused tests pass with FIFO ordering and the ninth stream record as
+the visible continuation boundary.
 
 ### Task 2: Preserve queued Activity and streamed answer records
 
@@ -64,9 +65,9 @@ Expected: focused tests pass.
 
 Use a real `ILinkClient` with a ten-item window. Send one streamed body large
 enough for fourteen chunks with `priority: 'intermediate'`, then enqueue a final
-footer. Assert that the first window sends chunks 1-10, the queue contains
-chunks 11-14 followed by the footer, and the next inbound sends those five in
-that order. Assert the tenth request contains the attached continuation suffix.
+footer. Assert that the first window sends chunks 1-9, the queue contains chunks
+10-14 followed by the footer, and the next inbound sends those six in that
+order. Assert the ninth request contains the attached continuation suffix.
 
 - [ ] **Step 2: Replace supersession and eviction expectations**
 

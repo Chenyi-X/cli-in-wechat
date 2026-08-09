@@ -23,8 +23,9 @@ Every generated visible record is durable delivery history:
 - Answer text, verbose Activity, normal-mode Activity summaries, control text,
   and final footers are persisted before network delivery.
 - No final footer may delete, supersede, or jump ahead of an earlier record.
-- Delivery order is the outbox `sequence` order. Priority remains metadata for
-  diagnostics and compatibility only.
+- Delivery order is the outbox `sequence` order. Priority may reserve one live
+  streaming slot so a future record remains discoverable, but it never permits
+  deletion or reordering.
 - Each inbound window sends at most ten records. If records remain, the final
   record in that window carries the continuation suffix.
 - `继续` resumes at the first unsent sequence after a restart or ordinary pause.
@@ -57,15 +58,17 @@ phone shows an execution log rather than a priority-reordered summary.
 
 ### Delivery planner
 
-`planDeliveryWindow` selects the pending FIFO prefix. It does not sort by
-priority and does not apply per-priority sub-window limits. The total item and
-byte limits remain authoritative, including the continuation suffix limit.
+`planDeliveryWindow` selects the pending FIFO prefix and never scans past a
+blocked head record. Live Activity/intermediate records retain the nine-item
+sub-window so the ninth record can carry a continuation notice before a later
+footer exists. A final record may use the tenth slot only when it is already the
+FIFO head; it cannot jump over a queued stream record.
 
 ### Quota manager
 
-Reservations enforce only the total per-inbound item and byte budget. The old
-one-slot final reserve and nine-item intermediate ceiling no longer affect
-delivery. Persisted schema fields remain readable for compatibility.
+Reservations retain the one-slot live-stream holdback and byte reserve. These
+limits provide a visible continuation boundary; they do not authorize priority
+reordering or deletion. Persisted schema fields remain backward compatible.
 
 ### Outbox
 
@@ -94,7 +97,7 @@ surfaced rather than resolved by deleting history.
 Automated coverage must prove:
 
 - mixed Activity, streamed answer, and footer records are delivered by sequence;
-- a fourteen-chunk streamed body plus footer drains as `10 + 5` without loss;
+- a fourteen-chunk streamed body plus footer drains as `9 + 6` without loss;
 - final enqueue preserves pending same-generation Activity and answer chunks;
 - normal consolidated Activity remains queued behind earlier answer chunks;
 - continuation starts and stops typing only when pending records exist;

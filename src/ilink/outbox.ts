@@ -119,13 +119,13 @@ interface DecodedDeliveryState {
   recoveryRequired?: boolean;
 }
 
-const PRIORITY_RANK: Record<OutboxPriority, number> = {
-  final: 0,
-  control: 1,
-  media: 2,
-  intermediate: 3,
-  activity: 4,
-};
+const OUTBOX_PRIORITIES = new Set<OutboxPriority>([
+  'final',
+  'control',
+  'media',
+  'intermediate',
+  'activity',
+]);
 
 const DEFAULT_TTL_MS = 7 * 24 * 60 * 60_000;
 
@@ -135,8 +135,6 @@ export class OutboxStore {
   private readonly defaultTtlMs: number;
   private readonly maxItemsPerUser: number;
   private readonly maxBytesPerUser: number;
-  private readonly finalReserveItems: number;
-  private readonly finalReserveBytes: number;
   private readonly bodyChunkBytes?: number;
   private readonly inboundItemLimit?: number;
   private readonly now: () => number;
@@ -148,8 +146,6 @@ export class OutboxStore {
     this.defaultTtlMs = options.defaultTtlMs ?? DEFAULT_TTL_MS;
     this.maxItemsPerUser = options.maxItemsPerUser ?? 500;
     this.maxBytesPerUser = options.maxBytesPerUser ?? 1_000_000;
-    this.finalReserveItems = Math.max(0, Math.floor(options.finalReserveItems ?? 1));
-    this.finalReserveBytes = Math.max(0, Math.floor(options.finalReserveBytes ?? 2_000));
     if (options.bodyChunkBytes === undefined && options.inboundItemLimit === undefined) {
       this.bodyChunkBytes = undefined;
       this.inboundItemLimit = undefined;
@@ -192,15 +188,10 @@ export class OutboxStore {
           continue;
         }
       }
-      if (input.priority === 'final') {
-        this.removeSuperseded(nextItems, input.accountId, input.userId, input.generation);
-      }
       const bytes = Buffer.byteLength(input.text, 'utf8');
       const userItems = [...nextItems.values()].filter((item) =>
         item.accountId === input.accountId && item.userId === input.userId);
-      for (const eviction of this.ensureCapacity(userItems, input.priority, bytes)) {
-        nextItems.delete(eviction.itemId);
-      }
+      this.ensureCapacity(userItems, bytes);
       const createdAt = input.createdAt ?? this.now();
       const sequence = asPositiveSafeInteger(nextSequence);
       if (sequence === undefined) throw sequenceCapacityError();
@@ -240,8 +231,7 @@ export class OutboxStore {
     return [...this.items.values()]
       .filter((item) => (userId === undefined || item.userId === userId)
         && (accountId === undefined || item.accountId === accountId))
-      .sort((a, b) => PRIORITY_RANK[a.priority] - PRIORITY_RANK[b.priority]
-        || a.sequence - b.sequence
+      .sort((a, b) => a.sequence - b.sequence
         || a.itemId.localeCompare(b.itemId));
   }
 
@@ -371,59 +361,12 @@ export class OutboxStore {
     return changed;
   }
 
-  supersedeIntermediate(accountId: string, userId: string, generation: number): number {
-    const nextItems = new Map(this.items);
-    const removed = this.removeSuperseded(nextItems, accountId, userId, generation);
-    if (removed > 0) {
-      this.persistState(nextItems, this.nextSequence);
-      this.publish(nextItems, this.nextSequence);
-    }
-    return removed;
-  }
-
-  private ensureCapacity(userItems: OutboxItem[], incomingPriority: OutboxPriority, incomingBytes: number): OutboxItem[] {
-    let count = userItems.length + 1;
-    let bytes = userItems.reduce((sum, item) => sum + item.bytes, 0) + incomingBytes;
-    const finalItems = userItems.filter((item) => item.state === 'pending' && item.priority === 'final');
-    const reservedItems = incomingPriority === 'final'
-      ? 0
-      : Math.max(0, this.finalReserveItems - finalItems.length);
-    const reservedBytes = incomingPriority === 'final'
-      ? 0
-      : Math.max(0, this.finalReserveBytes - finalItems.reduce((sum, item) => sum + item.bytes, 0));
-    const fits = () => count <= Math.max(0, this.maxItemsPerUser - reservedItems)
-      && bytes <= Math.max(0, this.maxBytesPerUser - reservedBytes);
-    if (fits()) return [];
-
-    const candidates = userItems
-      .filter((item) => item.state === 'pending'
-        && !item.deliveryReceipt
-        && PRIORITY_RANK[item.priority] > PRIORITY_RANK[incomingPriority])
-      .sort((a, b) => PRIORITY_RANK[b.priority] - PRIORITY_RANK[a.priority] || b.sequence - a.sequence);
-    const evictions: OutboxItem[] = [];
-    for (const candidate of candidates) {
-      if (fits()) return evictions;
-      evictions.push(candidate);
-      count -= 1;
-      bytes -= candidate.bytes;
-    }
-    if (!fits()) {
+  private ensureCapacity(userItems: OutboxItem[], incomingBytes: number): void {
+    const count = userItems.length + 1;
+    const bytes = userItems.reduce((sum, item) => sum + item.bytes, 0) + incomingBytes;
+    if (count > this.maxItemsPerUser || bytes > this.maxBytesPerUser) {
       throw new OutboxCapacityError();
     }
-    return evictions;
-  }
-
-  private removeSuperseded(target: Map<string, OutboxItem>, accountId: string, userId: string, generation: number): number {
-    let removed = 0;
-    for (const [itemId, item] of target) {
-      if (item.accountId !== accountId || item.userId !== userId || item.generation !== generation) continue;
-      if (item.priority !== 'activity' && item.priority !== 'intermediate') continue;
-      if (item.deliveryReceipt) continue;
-      target.delete(itemId);
-      target.delete(`delivery-notice:${itemId}`);
-      removed += 1;
-    }
-    return removed;
   }
 
   private pruneExpired(): void {
@@ -567,7 +510,6 @@ export class OutboxStore {
     const ordered = [...state.items.values()]
       .sort((a, b) => a.sequence - b.sequence || a.itemId.localeCompare(b.itemId));
     const normalized: OutboxItem[] = [];
-    const migratedFinalScopes: Array<Pick<OutboxItem, 'accountId' | 'userId' | 'generation'>> = [];
     let changed = false;
 
     for (let start = 0; start < ordered.length;) {
@@ -610,7 +552,6 @@ export class OutboxStore {
           bytes: Buffer.byteLength(chunk, 'utf8'),
         };
       }));
-      migratedFinalScopes.push(first);
       changed = true;
       start = end;
     }
@@ -632,9 +573,6 @@ export class OutboxStore {
       const resequenced = { ...item, sequence: firstSequence + index };
       items.set(resequenced.itemId, resequenced);
     });
-    for (const scope of migratedFinalScopes) {
-      this.removeSuperseded(items, scope.accountId, scope.userId, scope.generation);
-    }
     return {
       nextSequence: Math.max(state.nextSequence, nextSafeSequence(lastSequence)),
       items,
@@ -731,7 +669,7 @@ function decodeDeliveryState(
 }
 
 function isOutboxPriority(value: unknown): value is OutboxPriority {
-  return typeof value === 'string' && Object.hasOwn(PRIORITY_RANK, value);
+  return typeof value === 'string' && OUTBOX_PRIORITIES.has(value as OutboxPriority);
 }
 
 function isValidDeliveryReceipt(value: unknown): value is NonNullable<OutboxItem['deliveryReceipt']> {

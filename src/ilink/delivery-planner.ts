@@ -37,11 +37,22 @@ export function planDeliveryWindow<T extends DeliveryItem>(
   const maxItems = Math.max(0, Math.floor(options.maxItems));
   const selected: T[] = [];
   for (const item of ordered) {
-    if (sentItems + selected.length >= maxItems) break;
+    const priorityLimit = Math.min(
+      maxItems,
+      Math.max(0, Math.floor(options.maxItemsByPriority?.[item.priority] ?? maxItems)),
+    );
+    if (sentItems + selected.length >= priorityLimit) break;
     selected.push({ ...item });
   }
   const remainingItems = ordered.length - selected.length;
-  const needsContinuation = remainingItems > 0;
+  const last = selected.at(-1);
+  const closesPriorityWindow = Boolean(last)
+    && sentItems + selected.length >= Math.min(
+      maxItems,
+      Math.max(0, Math.floor(options.maxItemsByPriority?.[last!.priority] ?? maxItems)),
+    )
+    && sentItems + selected.length < maxItems;
+  const needsContinuation = remainingItems > 0 || closesPriorityWindow;
 
   if (needsContinuation && selected.length > 0) {
     const selectedLast = selected[selected.length - 1];

@@ -210,11 +210,24 @@ export class QuotaManager {
 
     const usedItems = state.sentItems + state.reservedItems;
     const usedBytes = state.sentBytes + state.reservedBytes;
-    if (usedItems + 1 > this.limits.maxItemsPerWindow) {
-      return { allowed: false, reason: 'token-budget-exhausted' };
+    const priorityLimit = this.maxItemsByPriority()[priority];
+    if (usedItems + 1 > priorityLimit) {
+      if (priority === 'intermediate' || priority === 'activity') {
+        const intermediateLimit = Math.min(
+          this.limits.maxItemsPerWindow,
+          Math.max(0, this.limits.maxIntermediateItemsPerToken ?? this.limits.maxItemsPerWindow),
+        );
+        return { allowed: false, reason: usedItems + 1 > intermediateLimit
+          ? 'intermediate-budget'
+          : 'final-reserved' };
+      }
+      return { allowed: false, reason: priority === 'final' || priority === 'control'
+        ? 'token-budget-exhausted'
+        : 'final-reserved' };
     }
-    if (usedBytes + amount > (this.limits.maxBytes ?? Number.MAX_SAFE_INTEGER)) {
-      return { allowed: false, reason: 'budget-exhausted' };
+    const reserveBytes = priority === 'final' ? 0 : Math.max(0, this.limits.finalReserveBytes ?? 0);
+    if (usedBytes + amount > (this.limits.maxBytes ?? Number.MAX_SAFE_INTEGER) - reserveBytes) {
+      return { allowed: false, reason: priority === 'final' ? 'budget-exhausted' : 'final-reserved' };
     }
 
     const reservation: QuotaReservation = {
@@ -301,12 +314,25 @@ export class QuotaManager {
 
   maxItemsByPriority(): Record<QuotaPriority, number> {
     const maxItems = this.limits.maxItemsPerWindow;
+    const finalReserveItems = Math.max(0, this.limits.finalReserveItems ?? 0);
+    const intermediateLimit = Math.min(
+      maxItems,
+      Math.max(0, maxItems - finalReserveItems),
+      Math.max(0, this.limits.maxIntermediateItemsPerToken ?? maxItems),
+    );
+    const mediaLimit = Math.min(
+      maxItems,
+      Math.max(0, maxItems - Math.max(
+        finalReserveItems,
+        this.limits.finalReserveItemsPerToken ?? 0,
+      )),
+    );
     return {
       final: maxItems,
       control: maxItems,
-      media: maxItems,
-      intermediate: maxItems,
-      activity: maxItems,
+      media: mediaLimit,
+      intermediate: intermediateLimit,
+      activity: intermediateLimit,
     };
   }
 

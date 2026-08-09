@@ -170,7 +170,7 @@ test('two users have independent windows and rate backoff state', () => {
   assert.equal(quota.snapshot('user-b').rateBackoffUntil, 0);
 });
 
-test('applies one total reservation budget regardless of priority', () => {
+test('holds one live-stream slot for a discoverable continuation boundary', () => {
   const quota = new QuotaManager(tempPath(), 'account-a', {
     maxItems: 3,
     maxBytes: 32,
@@ -183,23 +183,20 @@ test('applies one total reservation budget regardless of priority', () => {
   assert.equal(intermediate.allowed, true);
   const activity = quota.reserve('user-a', 8, 'activity');
   assert.equal(activity.allowed, true);
-  const third = quota.reserve('user-a', 1, 'activity');
-  assert.equal(third.allowed, true);
-  const blocked = quota.reserve('user-a', 1, 'final');
+  const blocked = quota.reserve('user-a', 1, 'activity');
   assert.equal(blocked.allowed, false);
-  assert.equal(blocked.reason, 'token-budget-exhausted');
+  assert.equal(blocked.reason, 'final-reserved');
 
-  assert.equal(quota.release(intermediate.reservation.reservationId), true);
-  assert.equal(quota.release(activity.reservation.reservationId), true);
   const final = quota.reserve('user-a', 16, 'final');
   assert.equal(final.allowed, true);
-  assert.equal(quota.commit(third.reservation.reservationId), true);
   assert.equal(quota.commit(final.reservation.reservationId), true);
+  assert.equal(quota.release(intermediate.reservation.reservationId), true);
+  assert.equal(quota.release(activity.reservation.reservationId), true);
   assert.equal(quota.snapshot('user-a').reservedItems, 0);
-  assert.equal(quota.snapshot('user-a').sentItems, 2);
+  assert.equal(quota.snapshot('user-a').sentItems, 1);
 });
 
-test('ignores legacy priority limits and preserves explicit reservation context', () => {
+test('enforces stream holdbacks and preserves explicit reservation context', () => {
   const quota = new QuotaManager(tempPath(), 'account-a', {
     maxItemsPerWindow: 5,
     finalReserveItems: 0,
@@ -214,15 +211,21 @@ test('ignores legacy priority limits and preserves explicit reservation context'
   assert.equal(first.reservation.tokenVersion, 9);
   const second = quota.reserve('user-a', 1, 'intermediate');
   assert.equal(second.allowed, true);
-  const third = quota.reserve('user-a', 1, 'activity');
-  assert.equal(third.allowed, true);
+  const blockedIntermediate = quota.reserve('user-a', 1, 'activity');
+  assert.equal(blockedIntermediate.allowed, false);
+  assert.equal(blockedIntermediate.reason, 'intermediate-budget');
+
+  quota.release(first.reservation.reservationId);
+  quota.release(second.reservation.reservationId);
   const mediaOne = quota.reserve('user-a', 1, 'media');
-  const final = quota.reserve('user-a', 1, 'final');
+  const mediaTwo = quota.reserve('user-a', 1, 'media');
+  const mediaThree = quota.reserve('user-a', 1, 'media');
   const blockedMedia = quota.reserve('user-a', 1, 'media');
   assert.equal(mediaOne.allowed, true);
-  assert.equal(final.allowed, true);
+  assert.equal(mediaTwo.allowed, true);
+  assert.equal(mediaThree.allowed, true);
   assert.equal(blockedMedia.allowed, false);
-  assert.equal(blockedMedia.reason, 'token-budget-exhausted');
+  assert.equal(blockedMedia.reason, 'final-reserved');
 });
 
 test('rate backoff aliases persist and clear only when the context token changes', () => {

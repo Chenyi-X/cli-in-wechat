@@ -96,7 +96,7 @@ test('delivers thirteen queued final chunks as ten then three on the next inboun
   });
 });
 
-test('migrates the incident-shaped schema-two queue before the first recovery window', async () => {
+test('preserves the incident-shaped mixed-priority queue in fifo order during migration', async () => {
   const options = paths();
   const snapshot = schemaTwoMixedFailureFixture();
   writeFileSync(options.outboxPath, JSON.stringify(snapshot), 'utf8');
@@ -105,24 +105,23 @@ test('migrates the incident-shaped schema-two queue before the first recovery wi
   await withFetchResponses(Array.from({ length: 10 }, () => ({ ret: 0 })), async (requests) => {
     await (client as any).processMessage(message(50, 'user-a', 'fresh-token', '继续'));
 
-    assert.equal(requests.length, 10);
+    assert.equal(requests.length, 9);
     const bodies = requests.map((request) => request.body.msg.item_list[0].text_item.text as string);
-    const expectedBodies = chunkUtf8Text(legacyFullChunkText, MIGRATED_BODY_BYTES).slice(0, 10);
-    expectedBodies[9] += '\n\n后续内容已排队，请回复“继续”续发。';
+    const expectedBodies = Array.from({ length: 9 }, (_, index) => `legacy-intermediate-${index + 1}`);
+    expectedBodies[8] += '\n\n后续内容已排队，请回复“继续”续发。';
     assert.deepEqual(bodies, expectedBodies);
     assert.ok(bodies.every((body) => Buffer.byteLength(body, 'utf8') <= 2_000));
-    assert.ok(bodies[9].endsWith('\n\n后续内容已排队，请回复“继续”续发。'));
+    assert.ok(bodies[8].endsWith('\n\n后续内容已排队，请回复“继续”续发。'));
     assert.ok(!bodies.includes('后续内容已排队，请回复“继续”续发。'));
 
     const pending = client.getDeliveryStatus('user-a').pending;
     assert.deepEqual(pending.map((item) => item.itemId), [
-      'legacy-11',
-      'legacy-12',
-      'legacy-13',
-      'new-confirmation',
+      ...Array.from({ length: 19 }, (_, index) => `legacy-activity-${index + 1}`),
+      ...Array.from({ length: 13 }, (_, index) => `legacy-${index + 1}`),
       'incident-control',
+      'new-confirmation',
     ]);
-    assert.ok(pending.every((item) => item.priority !== 'activity' && item.priority !== 'intermediate'));
+    assert.equal(pending.filter((item) => item.priority === 'activity').length, 19);
     const confirmation = pending.find((item) => item.itemId === 'new-confirmation');
     assert.deepEqual(
       confirmation && {
@@ -158,13 +157,10 @@ test('migrates the incident-shaped schema-two queue before the first recovery wi
       },
     );
     const persisted = JSON.parse(readFileSync(options.outboxPath, 'utf8'));
-    assert.deepEqual(persisted.items.map((item: { itemId: string }) => item.itemId), [
-      'legacy-11',
-      'legacy-12',
-      'legacy-13',
-      'incident-control',
-      'new-confirmation',
-    ]);
+    assert.deepEqual(
+      persisted.items.map((item: { itemId: string }) => item.itemId),
+      pending.map((item) => item.itemId),
+    );
   });
 });
 
@@ -206,6 +202,40 @@ test('drains twenty-five queued chunks as ten, ten, and five across inbound wind
     await (client as any).processMessage(message(3));
     assert.equal(requests.length, 25);
     assert.equal(outbox.listPending('user-a').length, 0);
+  });
+});
+
+test('keeps all streamed body chunks ahead of a final footer across windows', async () => {
+  const client = new ILinkClient(CREDS, paths());
+  await (client as any).processMessage(message(1));
+  const body = 'A'.repeat(MIGRATED_BODY_BYTES * 13 + 500);
+  const chunks = chunkUtf8Text(body, MIGRATED_BODY_BYTES);
+  assert.equal(chunks.length, 14);
+
+  await withFetchResponses(Array.from({ length: 15 }, () => ({ ret: 0 })), async (requests) => {
+    await client.sendText('user-a', body, { streamType: 'intermediate', priority: 'intermediate' });
+    assert.equal(requests.length, 9);
+    assert.deepEqual(
+      requests.slice(0, 8).map((request) => request.body.msg.item_list[0].text_item.text),
+      chunks.slice(0, 8),
+    );
+    assert.equal(
+      requests[8].body.msg.item_list[0].text_item.text,
+      `${chunks[8]}\n\n后续内容已排队，请回复“继续”续发。`,
+    );
+
+    await client.sendText('user-a', '— Codex | 30.0s', { priority: 'final' });
+    assert.deepEqual(
+      client.getDeliveryStatus('user-a').pending.map((item) => item.text),
+      [...chunks.slice(9), '— Codex | 30.0s'],
+    );
+
+    await (client as any).processMessage(message(2, 'user-a', 'next-token', '继续'));
+    assert.deepEqual(
+      requests.slice(9).map((request) => request.body.msg.item_list[0].text_item.text),
+      [...chunks.slice(9), '— Codex | 30.0s'],
+    );
+    assert.equal(client.getDeliveryStatus('user-a').pending.length, 0);
   });
 });
 
@@ -261,7 +291,7 @@ test('rate-limited ret=-2 stops the window without a second client retry', async
   });
 });
 
-test('activity delivery preserves one visible slot for the final result', async () => {
+test('activity holdback preserves fifo order when the final result arrives', async () => {
   const client = new ILinkClient(CREDS, paths());
   await (client as any).processMessage(message(1));
 
@@ -272,10 +302,18 @@ test('activity delivery preserves one visible slot for the final result', async 
     assert.equal(requests.length, 9);
     assert.match(requests[8].body.msg.item_list[0].text_item.text, /请回复“继续”续发。$/);
 
-    const final = await client.sendText('user-a', 'final-result', { priority: 'final' });
-    assert.equal(final[0].status, 'sent');
-    assert.equal(requests.length, 10);
-    assert.equal(requests[9].body.msg.item_list[0].text_item.text, 'final-result');
+    await client.sendText('user-a', 'final-result', { priority: 'final' });
+    assert.equal(requests.length, 9);
+    assert.deepEqual(client.getDeliveryStatus('user-a').pending.map((item) => item.text), [
+      'activity-10',
+      'final-result',
+    ]);
+
+    await (client as any).processMessage(message(2, 'user-a', 'next-token', '继续'));
+    assert.deepEqual(
+      requests.slice(9).map((request) => request.body.msg.item_list[0].text_item.text),
+      ['activity-10', 'final-result'],
+    );
     assert.equal(client.getDeliveryStatus('user-a').pending.length, 0);
   });
 });
