@@ -44,9 +44,11 @@ export interface BridgeConfig {
   tools: Record<string, ToolConfig>;
 }
 
+export const DEFAULT_MAX_RESPONSE_CHUNK_BYTES = 3_800;
+
 const DEFAULT_CONFIG: BridgeConfig = {
   defaultTool: 'claude',
-  maxResponseChunkSize: 2000,
+  maxResponseChunkSize: DEFAULT_MAX_RESPONSE_CHUNK_BYTES,
   cliTimeout: 300_000,      // 5 minutes
   typingInterval: 5_000,    // 5 seconds
   allowedUsers: [],          // empty = allow all

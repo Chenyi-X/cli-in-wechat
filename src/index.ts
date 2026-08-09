@@ -91,7 +91,9 @@ async function main() {
 
   // ─── 3. Start bridge ─────────────────────────────────
 
-  const ilink = new ILinkClient(credentials);
+  const ilink = new ILinkClient(credentials, {
+    maxTextBytes: config.maxResponseChunkSize,
+  });
   const sessions = new SessionManager();
   const router = new Router(ilink, registry, sessions, config);
 

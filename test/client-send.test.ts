@@ -170,7 +170,7 @@ test('preserves the incident-shaped mixed-priority queue in fifo order during mi
       'legacy-activity-1\n\n后续内容已排队，请回复“继续”续发。',
     ];
     assert.deepEqual(bodies, expectedBodies);
-    assert.ok(bodies.every((body) => Buffer.byteLength(body, 'utf8') <= 2_000));
+    assert.ok(bodies.every((body) => Buffer.byteLength(body, 'utf8') <= 3_800));
     assert.ok(bodies[9].endsWith('\n\n后续内容已排队，请回复“继续”续发。'));
     assert.ok(!bodies.includes('后续内容已排队，请回复“继续”续发。'));
 
@@ -238,7 +238,7 @@ test('uses an injected quota window when migrating the default outbox', async ()
 
     assert.equal(requests.length, 5);
     const bodies = requests.map((request) => request.body.msg.item_list[0].text_item.text as string);
-    assert.ok(bodies.every((body) => Buffer.byteLength(body, 'utf8') <= 2_000));
+    assert.ok(bodies.every((body) => Buffer.byteLength(body, 'utf8') <= 3_800));
     assert.ok(bodies[4].endsWith('\n\n后续内容已排队，请回复“继续”续发。'));
   });
 });
@@ -268,8 +268,13 @@ test('drains twenty-five queued chunks as ten, ten, and five across inbound wind
 test('keeps all streamed body chunks ahead of a final footer across windows', async () => {
   const client = new ILinkClient(CREDS, paths());
   await (client as any).processMessage(message(1));
-  const body = 'A'.repeat(MIGRATED_BODY_BYTES * 13 + 500);
-  const chunks = chunkUtf8Text(body, MIGRATED_BODY_BYTES);
+  const continuationSuffixBytes = Buffer.byteLength(
+    '\n\n后续内容已排队，请回复“继续”续发。',
+    'utf8',
+  );
+  const bodyChunkBytes = 3_800 - continuationSuffixBytes;
+  const body = 'A'.repeat(bodyChunkBytes * 13 + 500);
+  const chunks = chunkUtf8Text(body, bodyChunkBytes);
   assert.equal(chunks.length, 14);
 
   await withFetchResponses(Array.from({ length: 15 }, () => ({ ret: 0 })), async (requests) => {
@@ -337,6 +342,23 @@ test('HTTP success with an iLink message_id confirms delivery when ret is omitte
     assert.equal(result[0].status, 'sent');
     assert.equal(requests.length, 1);
     assert.equal((client as any).outbox.listPending('user-a').length, 0);
+  });
+});
+
+test('default client sends UTF-8 text bodies above 2000 and at most 3800 bytes', async () => {
+  const client = new ILinkClient(CREDS, paths());
+  await (client as any).processMessage(message(1));
+  const body = '中文🙂'.repeat(1_000);
+
+  await withFetchResponses(Array.from({ length: 10 }, () => ({ ret: 0 })), async (requests) => {
+    await client.sendText('user-a', body, { priority: 'final' });
+
+    const requestBodies = requests.map(
+      (request) => request.body.msg.item_list[0].text_item.text as string,
+    );
+    assert.ok(Buffer.byteLength(requestBodies[0], 'utf8') > 2_000);
+    assert.ok(requestBodies.every((text) => Buffer.byteLength(text, 'utf8') <= 3_800));
+    assert.equal(requestBodies.join(''), body);
   });
 });
 

@@ -4,7 +4,15 @@ import { basename, dirname, join } from 'node:path';
 import { generateWechatUin, encryptAesEcb, aesEcbPaddedSize, encodeMessageAesKey, md5 } from '../utils/crypto.js';
 import { log } from '../utils/logger.js';
 import { fetchWithRetry, describeNetworkError, isRetryableNetworkError } from '../utils/http.js';
-import { DATA_DIR, atomicWrite, savePollCursor, loadPollCursor, loadContextTokens, saveContextTokens } from '../config.js';
+import {
+  DATA_DIR,
+  DEFAULT_MAX_RESPONSE_CHUNK_BYTES,
+  atomicWrite,
+  savePollCursor,
+  loadPollCursor,
+  loadContextTokens,
+  saveContextTokens,
+} from '../config.js';
 import { downloadImage, downloadFile, downloadVideo, type DownloadedMedia } from '../utils/media.js';
 import type {
   Credentials,
@@ -45,6 +53,7 @@ export interface ILinkClientOptions {
   diagnosticsPath?: string;
   contextTokensPath?: string;
   maxItemsPerWindow?: number;
+  maxTextBytes?: number;
 }
 
 export interface DeliveryStatus {
@@ -76,10 +85,8 @@ export function isDeliveryFinalizationError(err: unknown): err is DeliveryFinali
   return Boolean(err && typeof err === 'object' && (err as { deliveryConfirmed?: unknown }).deliveryConfirmed === true);
 }
 
-const MAX_TEXT_BYTES = 2000;
 export const CONTINUATION_NOTICE = '后续内容已排队，请回复“继续”续发。';
 const CONTINUATION_SUFFIX = `\n\n${CONTINUATION_NOTICE}`;
-const BODY_CHUNK_BYTES = MAX_TEXT_BYTES - Buffer.byteLength(CONTINUATION_SUFFIX, 'utf8');
 
 interface UserRateLimitState {
   consecutiveRet2: number;
@@ -101,6 +108,8 @@ export class ILinkClient {
   private readonly quota: QuotaManager;
   private readonly diagnostics: DeliveryDiagnostics;
   private readonly contextTokensPath: string;
+  private readonly maxTextBytes: number;
+  private readonly bodyChunkBytes: number;
   private pollCursor: string;
   private running = false;
   private contextTokens = new Map<string, string>();
@@ -126,12 +135,18 @@ export class ILinkClient {
     this.pollCursor = loadPollCursor();
     this.contextTokensPath = options.contextTokensPath || join(DATA_DIR, 'context_tokens.json');
     this.contextTokens = loadContextTokensAt(this.contextTokensPath);
+    const minimumTextBytes = Buffer.byteLength(CONTINUATION_SUFFIX, 'utf8') + 1;
+    const configuredTextBytes = options.maxTextBytes ?? DEFAULT_MAX_RESPONSE_CHUNK_BYTES;
+    this.maxTextBytes = Number.isFinite(configuredTextBytes)
+      ? Math.max(minimumTextBytes, Math.floor(configuredTextBytes))
+      : DEFAULT_MAX_RESPONSE_CHUNK_BYTES;
+    this.bodyChunkBytes = this.maxTextBytes - Buffer.byteLength(CONTINUATION_SUFFIX, 'utf8');
     this.quota = options.quota || new QuotaManager(options.quotaPath || join(DATA_DIR, 'quota.json'), this.accountId, {
       maxItemsPerWindow: options.maxItemsPerWindow,
     });
     const maxItemsPerWindow = this.quota.getMaxItemsPerWindow();
     this.outbox = options.outbox || new OutboxStore(options.outboxPath || join(DATA_DIR, 'outbox.json'), {
-      bodyChunkBytes: BODY_CHUNK_BYTES,
+      bodyChunkBytes: this.bodyChunkBytes,
       inboundItemLimit: maxItemsPerWindow,
     });
     this.diagnostics = options.diagnostics || new DeliveryDiagnostics(options.diagnosticsPath || join(DATA_DIR, 'delivery-diagnostics.jsonl'));
@@ -460,7 +475,7 @@ export class ILinkClient {
     const streamType = options?.streamType || 'regular';
     return this.enqueueSend(userId, async () => {
       const snapshot = this.quota.snapshot(userId);
-      const chunks = chunkUtf8Text(text, BODY_CHUNK_BYTES);
+      const chunks = chunkUtf8Text(text, this.bodyChunkBytes);
       const priority = options?.priority || (streamType === 'intermediate' ? 'intermediate' as const : 'final' as const);
       const generation = options?.generation ?? snapshot.generation;
       const items = this.outbox.enqueueTextBatch(chunks.map((chunk) => ({
@@ -571,7 +586,7 @@ export class ILinkClient {
       sentItems: snapshot.sentItems,
       maxItems: snapshot.sentItems + snapshot.remainingItems,
       maxItemsByPriority: this.quota.maxItemsByPriority(),
-      maxBytes: MAX_TEXT_BYTES,
+      maxBytes: this.maxTextBytes,
       continuationNotice: CONTINUATION_NOTICE,
     });
     this.diagnostics.record({
