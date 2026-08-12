@@ -472,18 +472,68 @@ test('inbound diagnostics persist token and generation evidence without inbound 
         .trim()
         .split('\n')
         .map((line) => JSON.parse(line) as Record<string, unknown>);
-      assert.equal(records.length, 1);
-      assert.equal(records[0]?.event, 'inbound');
-      assert.equal(records[0]?.inboundMessageId, 'inbound-message-1');
-      assert.equal(records[0]?.generation, 1);
-      assert.equal(records[0]?.tokenVersion, 1);
-      assert.equal(records[0]?.tokenChanged, true);
-      assert.equal(records[0]?.itemCount, 1);
+      const inbound = records.find((record) => record.event === 'inbound');
+      assert.ok(inbound);
+      assert.equal(inbound.inboundMessageId, 'inbound-message-1');
+      assert.equal(inbound.generation, 1);
+      assert.equal(inbound.tokenVersion, 1);
+      assert.equal(inbound.tokenChanged, true);
+      assert.equal(inbound.itemCount, 1);
       assert.equal(JSON.stringify(records).includes('入站正文不应落盘'), false);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+});
+
+test('inbound recovery records a durable drain summary', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wxclient-drain-diagnostics-'));
+  const outbox = new OutboxStore(join(dir, 'outbox.json'));
+  const quota = new QuotaManager(join(dir, 'quota.json'), 'account-a');
+  const diagnostics = new DeliveryDiagnostics(join(dir, 'delivery.jsonl'));
+  const client = new ILinkClient(credentials, { outbox, quota, diagnostics });
+  quota.recordInbound('user-a', 'message-1', 'context-a');
+  outbox.enqueueText({
+    accountId: 'account-a',
+    userId: 'user-a',
+    generation: 1,
+    tokenVersion: 1,
+    priority: 'final',
+    text: '待恢复的最终结果',
+  });
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({ ret: 0 }), { status: 200 });
+  try {
+    await (client as any).processMessage({
+      message_id: 'message-2',
+      from_user_id: 'user-a',
+      to_user_id: 'bot-user',
+      client_id: 'inbound-client-2',
+      create_time_ms: Date.now(),
+      message_type: 1,
+      message_state: 0,
+      context_token: 'context-b',
+      item_list: [{ type: 1, text_item: { text: '0' } }],
+    });
+
+    const records = readFileSync(join(dir, 'delivery.jsonl'), 'utf8')
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line) as Record<string, any>);
+    const drain = records.find((record) => record.event === 'drain');
+    assert.ok(drain);
+    assert.equal(drain.inboundMessageId, 'message-2');
+    assert.equal(drain.pendingTextCountBeforeDrain, 1);
+    assert.equal(drain.pendingTextCountAfterDrain, 0);
+    assert.equal(drain.recoveryWindowOpened, false);
+    assert.equal(drain.drainResultCount, 1);
+    assert.equal(drain.drainSentCount, 1);
+    assert.deepEqual(drain.drainStatuses, ['sent']);
+  } finally {
+    globalThis.fetch = originalFetch;
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('sendText acknowledges an HTTP success response that omits ret when message_id is present', async () => {
@@ -681,7 +731,7 @@ test('rate backoff keeps new intermediate text durable for the next inbound toke
   });
 });
 
-test('a fresh inbound token drains the final result and drops stale intermediate text', async () => {
+test('a fresh inbound token drains the final result and then durable intermediate text', async () => {
   await withStores(async (outbox, quota) => {
     const client = new ILinkClient(credentials, { outbox, quota });
     quota.recordInbound('user-a', 'message-1', 'context-a');
@@ -720,10 +770,10 @@ test('a fresh inbound token drains the final result and drops stale intermediate
         item_list: [],
       });
 
-      assert.equal(requestCount, 2);
+      assert.equal(requestCount, 3);
       assert.deepEqual(
         payloads.slice(1).map((payload) => payload.msg.item_list[0].text_item.text),
-        ['最终结果'],
+        ['最终结果', '之前被保护的中间消息'],
       );
       assert.deepEqual(outbox.listPending('user-a'), []);
     } finally {
@@ -796,7 +846,7 @@ test('a final result does not delete durable intermediate messages from the same
   });
 });
 
-test('a confirmed final drops stale intermediate and activity items from the same generation', async () => {
+test('a confirmed final preserves and delivers durable intermediate and activity items from the same generation', async () => {
   await withStores(async (outbox, quota) => {
     const client = new ILinkClient(credentials, { outbox, quota });
     quota.recordInbound('user-a', 'message-1', 'context-a');
@@ -839,7 +889,7 @@ test('a confirmed final drops stale intermediate and activity items from the sam
       assert.ok(results.some((result) => result.status === 'sent'));
       assert.deepEqual(
         payloads.map((payload) => payload.msg.item_list[0].text_item.text),
-        ['最终结果'],
+        ['最终结果', '过时的恢复提示', '过时的中间文本', '过时的 Activity'],
       );
       assert.deepEqual(outbox.list('user-a'), []);
     } finally {
@@ -1297,6 +1347,60 @@ test('an inbound recovery requeues a failed item referenced by its durable notic
       assert.equal(payloads.at(-1)?.msg.item_list[0].text_item.text, '恢复提示关联的正文必须继续发送');
       assert.deepEqual(outbox.listPending('user-a'), []);
       assert.deepEqual(recoveries, [{ pendingTextCount: 1 }]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+test('an inbound recovery requeues a failed item when its recovery notice is also terminal', async () => {
+  await withStores(async (outbox, quota) => {
+    const client = new ILinkClient(credentials, { outbox, quota });
+    quota.recordInbound('user-a', 'message-1', 'context-a');
+    (client as any).contextTokens.set('user-a', 'context-a');
+
+    const item = outbox.enqueueText({
+      accountId: 'account-a',
+      userId: 'user-a',
+      generation: 1,
+      tokenVersion: 1,
+      priority: 'final',
+      text: '提示本身失败后也必须恢复的最终结果',
+    });
+    outbox.markPermanentFailure(item.itemId, { errmsg: 'Prepare failed' });
+    const notice = outbox.enqueueText({
+      itemId: `delivery-notice:${item.itemId}`,
+      accountId: 'account-a',
+      userId: 'user-a',
+      generation: 1,
+      tokenVersion: 1,
+      priority: 'control',
+      text: '消息发送暂时受限，收到新的消息后自动续发。',
+    });
+    outbox.markPermanentFailure(notice.itemId, { errmsg: 'Prepare failed' });
+
+    const originalFetch = globalThis.fetch;
+    const payloads: Array<Record<string, any>> = [];
+    globalThis.fetch = async (_input, init) => {
+      payloads.push(JSON.parse(String(init?.body)));
+      return new Response(JSON.stringify({ ret: 0, message_id: payloads.length }), { status: 200 });
+    };
+    try {
+      await (client as any).processMessage({
+        message_id: 2,
+        from_user_id: 'user-a',
+        to_user_id: 'bot-user',
+        client_id: 'inbound-client-2',
+        create_time_ms: Date.now(),
+        message_type: 1,
+        message_state: 0,
+        context_token: 'context-b',
+        item_list: [{ type: 1, text_item: { text: '0' } }],
+      });
+
+      assert.equal(payloads.at(-1)?.msg.item_list[0].text_item.text, '提示本身失败后也必须恢复的最终结果');
+      assert.deepEqual(outbox.listPending('user-a'), []);
+      assert.equal(outbox.get(notice.itemId), undefined);
     } finally {
       globalThis.fetch = originalFetch;
     }

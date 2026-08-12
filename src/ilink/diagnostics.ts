@@ -2,7 +2,16 @@ import { appendFileSync, mkdirSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { dirname } from 'node:path';
 
-export type DeliveryDiagnosticEvent = 'inbound' | 'request' | 'response' | 'error' | 'skipped' | 'queued';
+export type DeliveryDiagnosticEvent =
+  | 'inbound'
+  | 'inbound-skipped'
+  | 'poll'
+  | 'request'
+  | 'response'
+  | 'error'
+  | 'skipped'
+  | 'queued'
+  | 'drain';
 
 export interface DeliveryDiagnosticResponse {
   ret?: number;
@@ -15,9 +24,13 @@ export interface DeliveryDiagnosticResponse {
 export interface DeliveryDiagnosticInput {
   event: DeliveryDiagnosticEvent;
   accountId: string;
-  userId: string;
+  userId?: string;
   contextToken?: string;
   inboundMessageId?: string;
+  pollCursor?: string;
+  nextPollCursor?: string;
+  messageIds?: string[];
+  messageTypes?: number[];
   tokenChanged?: boolean;
   clientId?: string;
   itemId?: string;
@@ -30,6 +43,12 @@ export interface DeliveryDiagnosticInput {
   jsLength?: number;
   utf8Bytes?: number;
   itemListBytes?: number;
+  pendingTextCountBeforeDrain?: number;
+  pendingTextCountAfterDrain?: number;
+  recoveryWindowOpened?: boolean;
+  drainResultCount?: number;
+  drainSentCount?: number;
+  drainStatuses?: string[];
   response?: DeliveryDiagnosticResponse;
 }
 
@@ -58,6 +77,10 @@ export class DeliveryDiagnostics {
       userHash: hash(input.userId),
       tokenHash: hash(input.contextToken),
       inboundMessageId: input.inboundMessageId,
+      pollCursorHash: hash(input.pollCursor),
+      nextPollCursorHash: hash(input.nextPollCursor),
+      messageIdHashes: input.messageIds?.map((messageId) => hash(messageId)),
+      messageTypes: input.messageTypes,
       tokenChanged: input.tokenChanged,
       clientId: input.clientId,
       itemId: input.itemId,
@@ -70,6 +93,12 @@ export class DeliveryDiagnostics {
       jsLength: input.jsLength,
       utf8Bytes: input.utf8Bytes,
       itemListBytes: input.itemListBytes,
+      pendingTextCountBeforeDrain: input.pendingTextCountBeforeDrain,
+      pendingTextCountAfterDrain: input.pendingTextCountAfterDrain,
+      recoveryWindowOpened: input.recoveryWindowOpened,
+      drainResultCount: input.drainResultCount,
+      drainSentCount: input.drainSentCount,
+      drainStatuses: input.drainStatuses,
       response: input.response,
     };
 

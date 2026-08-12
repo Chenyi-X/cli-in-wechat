@@ -45,3 +45,34 @@ test('DeliveryDiagnostics persists redacted send evidence without message conten
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('DeliveryDiagnostics records redacted poll evidence for inbound recovery debugging', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wx-diagnostics-poll-'));
+  const filePath = join(dir, 'delivery.jsonl');
+
+  try {
+    const diagnostics = new DeliveryDiagnostics(filePath, () => 1_700_000_000_000);
+    diagnostics.record({
+      event: 'poll',
+      accountId: 'account-secret',
+      pollCursor: 'cursor-before',
+      nextPollCursor: 'cursor-after',
+      messageIds: ['message-0'],
+      messageTypes: [1],
+      itemCount: 1,
+      response: { ret: 0 },
+    });
+
+    const line = JSON.parse(readFileSync(filePath, 'utf8')) as Record<string, unknown>;
+    assert.equal(line.event, 'poll');
+    assert.equal(line.pollCursorHash, 'a6906b7c1d46');
+    assert.equal(line.nextPollCursorHash, '847529ac1070');
+    assert.deepEqual(line.messageIdHashes, ['ce78e7c740f4']);
+    assert.deepEqual(line.messageTypes, [1]);
+    assert.equal(line.userHash, undefined);
+    assert.equal(JSON.stringify(line).includes('cursor-before'), false);
+    assert.equal(JSON.stringify(line).includes('message-0'), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

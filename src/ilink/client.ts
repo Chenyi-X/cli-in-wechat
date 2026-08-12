@@ -81,7 +81,7 @@ export type MessageHandler = (
   refText: string,
   media?: DownloadedMedia[],
   recovery?: InboundRecoveryContext,
-) => void;
+) => void | Promise<void>;
 
 export class ILinkClient {
   private credentials: Credentials;
@@ -354,6 +354,22 @@ export class ILinkClient {
 
       const data = (await res.json()) as GetUpdatesResponse;
 
+      const messages = data.msgs || [];
+      this.recordDiagnostic({
+        event: 'poll',
+        accountId: this.accountId,
+        pollCursor: this.pollCursor,
+        nextPollCursor: data.get_updates_buf,
+        messageIds: messages.map((msg) => String(msg.message_id)),
+        messageTypes: messages.map((msg) => msg.message_type),
+        itemCount: messages.length,
+        response: {
+          ret: data.ret,
+          errcode: data.errcode,
+          errmsg: data.errmsg,
+        },
+      });
+
       // API omits ret/errcode on success; only check when explicitly present and non-zero
       if (data.ret !== undefined && data.ret !== 0) {
         const e: Error & { errcode?: number } = new Error(
@@ -377,7 +393,7 @@ export class ILinkClient {
         this.pendingPollCursor = data.get_updates_buf;
       }
 
-      return data.msgs || [];
+      return messages;
     } finally {
       clearTimeout(timer);
     }
@@ -394,11 +410,33 @@ export class ILinkClient {
 
   private async processMessage(msg: WeixinMessage): Promise<void> {
     // Only process user messages, skip bot echoes
-    if (msg.message_type !== 1) return;
+    if (msg.message_type !== 1) {
+      this.recordDiagnostic({
+        event: 'inbound-skipped',
+        accountId: this.accountId,
+        userId: msg.from_user_id,
+        contextToken: msg.context_token,
+        inboundMessageId: String(msg.message_id),
+        messageTypes: [msg.message_type],
+        itemCount: msg.item_list.length,
+        response: { errmsg: 'ignored message_type' },
+      });
+      return;
+    }
 
     // Drop long-poll re-deliveries so a command is never executed twice (at-most-once).
     if (!this.isFreshMessage(msg.from_user_id, msg.message_id)) {
       log.debug(`[msg] 跳过重复消息 message_id=${msg.message_id}`);
+      this.recordDiagnostic({
+        event: 'inbound-skipped',
+        accountId: this.accountId,
+        userId: msg.from_user_id,
+        contextToken: msg.context_token,
+        inboundMessageId: String(msg.message_id),
+        messageTypes: [msg.message_type],
+        itemCount: msg.item_list.length,
+        response: { errmsg: 'duplicate in-memory inbound' },
+      });
       return;
     }
 
@@ -411,6 +449,16 @@ export class ILinkClient {
     );
     if (inbound.duplicate) {
       log.debug(`[msg] 持久化判重命中，跳过重放 message_id=${msg.message_id}`);
+      this.recordDiagnostic({
+        event: 'inbound-skipped',
+        accountId: this.accountId,
+        userId: msg.from_user_id,
+        contextToken: msg.context_token,
+        inboundMessageId: String(msg.message_id),
+        messageTypes: [msg.message_type],
+        itemCount: msg.item_list.length,
+        response: { errmsg: 'duplicate durable inbound' },
+      });
       return;
     }
 
@@ -439,7 +487,7 @@ export class ILinkClient {
 
     const recoveryNoticeTargets = new Set(
       this.outbox
-        .listPending(msg.from_user_id, this.accountId)
+        .list(msg.from_user_id, this.accountId)
         .filter((item) => item.itemId.startsWith('delivery-notice:'))
         .map((item) => item.itemId.slice('delivery-notice:'.length)),
     );
@@ -488,15 +536,17 @@ export class ILinkClient {
     ).filter((item) => !this.isRecoveryNotice(item)).length;
     const tokenChanged = inbound.tokenVersion !== previousTokenVersion;
 
+    let recoveryWindowOpened = false;
     if (pendingTextCountBeforeDrain > 0
       && this.quota.openInboundRecoveryWindow(msg.from_user_id)) {
+      recoveryWindowOpened = true;
       log.info(`[msg] 新入站已打开恢复发送窗口: ${msg.from_user_id.substring(0, 12)}...`);
     }
     const tokenSentItemsBeforeDrain = this.quota.getTokenBudget(msg.from_user_id).sentItems;
 
     // A new, deduplicated inbound message is the safe trigger for draining text
     // that was waiting for a usable context token or an ambiguous ret=-2 response.
-    await this.drainOutbox(msg.from_user_id);
+    let drainResults = await this.drainOutbox(msg.from_user_id);
 
     // The inbound may have raced with an earlier send drain. In that case the
     // first snapshot was empty, but the serialized drain can expose durable
@@ -512,13 +562,34 @@ export class ILinkClient {
       && !tokenChanged
       && tokenSentItemsAfterDrain === tokenSentItemsBeforeDrain
       && this.quota.openInboundRecoveryWindow(msg.from_user_id)) {
+      recoveryWindowOpened = true;
       log.info(`[msg] drain 期间发现积压，已打开恢复发送窗口: ${msg.from_user_id.substring(0, 12)}...`);
-      await this.drainOutbox(msg.from_user_id);
+      drainResults = [
+        ...drainResults,
+        ...(await this.drainOutbox(msg.from_user_id)),
+      ];
       pendingTextCountAfterDrain = this.outbox.listPending(
         msg.from_user_id,
         this.accountId,
       ).filter((item) => !this.isRecoveryNotice(item)).length;
     }
+
+    this.recordDiagnostic({
+      event: 'drain',
+      accountId: this.accountId,
+      userId: msg.from_user_id,
+      contextToken: msg.context_token || this.contextTokens.get(msg.from_user_id),
+      inboundMessageId: String(msg.message_id),
+      tokenChanged,
+      generation: inbound.inboundGeneration,
+      tokenVersion: inbound.tokenVersion,
+      pendingTextCountBeforeDrain,
+      pendingTextCountAfterDrain,
+      recoveryWindowOpened,
+      drainResultCount: drainResults.length,
+      drainSentCount: drainResults.filter((result) => result.status === 'sent').length,
+      drainStatuses: drainResults.map((result) => result.status),
+    });
 
     const recoveryPendingTextCount = Math.max(
       pendingTextCountBeforeDrain,
@@ -534,7 +605,7 @@ export class ILinkClient {
 
     for (const handler of this.handlers) {
       try {
-        handler(
+        await handler(
           msg,
           text,
           refText,
@@ -543,6 +614,7 @@ export class ILinkClient {
         );
       } catch (err) {
         log.error('消息处理器异常:', err);
+        throw err;
       }
     }
     this.quota.completeInbound(msg.from_user_id, String(msg.message_id));
@@ -888,9 +960,11 @@ export class ILinkClient {
         this.outbox.ack(`delivery-notice:${item.itemId}`);
         if (item.priority === 'final') {
           finalDelivered = true;
-          // Once the final result is confirmed, stale streamed output from the
-          // same task must never be appended after it on a later recovery.
-          this.outbox.supersedeIntermediate(this.accountId, userId, item.generation);
+          // Keep any unconfirmed intermediate/activity items durable. They may
+          // contain the only copy of tool progress that was blocked by the
+          // token guard; dropping them here would make a later inbound unable
+          // to recover the promised backlog. Already-confirmed items are
+          // removed by ack(), so this does not create duplicates.
         }
         results.push(this.resultForItem(item, 'sent'));
       } catch (err) {
