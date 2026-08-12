@@ -242,7 +242,7 @@ $acceptanceRoot
 
 Expected: a new uniquely named evidence directory containing the complete pre-stop runtime snapshot, candidate SHA, and PID 2176 metadata.
 
-- [ ] **Step 3: Obtain explicit approval, then stop the single old poller**
+- [x] **Step 3: Obtain explicit approval, then stop the single old poller**
 
 Do not execute this step until the user explicitly authorizes stopping PID 2176.
 
@@ -273,7 +273,7 @@ cutover HEAD only in documentation, PID 2176 is absent, and the authoritative
 post-stop runtime snapshot exists. Never run the next step while PID 2176 remains
 alive.
 
-- [ ] **Step 4: Start exactly one V2 poller and capture its PID and logs**
+- [x] **Step 4: Start exactly one V2 poller and capture its PID and logs**
 
 ```powershell
 $acceptanceRoot = Get-Content -Raw -LiteralPath 'C:\tmp\cli-in-wechat-v2-active-acceptance.txt'
