@@ -22,6 +22,11 @@
 - [x] Apply the `.wx-media/` ignore rule to the rebuilt tree and commit it separately.
 - [x] Keep the old refs until at least two stable validation cycles have completed.
 
+Current evidence: the rebuilt baseline has no direct merge with unrelated upstream
+history; `main` tracks `origin/main`, `remote.pushDefault=origin`, `pull.ff=only`,
+and `upstream` has a disabled push URL. Four preserved stash entries and dated
+backup refs remain available in the repository.
+
 ### Task 2: Migrate local behavior that upstream has not absorbed
 
 **Files:**
@@ -102,6 +107,7 @@ The outbox is an atomically written, schema-versioned JSON store under the exist
 - [x] Track `READY`, `SENDING`, `WAITING_INBOUND`, `RATE_BACKOFF`, and `PERMANENT_FAILURE` per user/task.
 - [x] On a new deduplicated inbound message, update the generation, refresh the usable context token, and drain queued text in priority order without re-sending acknowledged items.
 - [x] Append a continuation notice only while the failed item remains queued; remove the associated notice once the item is confirmed so stale warnings are never sent.
+- [x] Await asynchronous route handlers before completing an inbound receipt; rethrow handler failures so the poll cursor and durable inbound receipt remain replayable.
 
 ### Task 7: Verify and prepare the dual-remote workflow
 
@@ -123,6 +129,9 @@ The outbox is an atomically written, schema-versioned JSON store under the exist
 - [ ] Test 1800/2000/2048/3000/3500/4000/4500 UTF-8 bytes with Chinese, English, emoji, Markdown, and code blocks.
 - [ ] Record timestamp, redacted user ID, token hash, inbound generation, token version, client ID, request/item/bubble sequence, JS length, UTF-8 bytes, full response, and actual WeChat visibility.
 - [ ] Accept only when at least 20 long tasks run, each mode has at least 5, final delivery is 100%, duplicates are 0, restart recovery works, and all media failures are visible.
+
+Current evidence: automated coverage is green at 188 tests, with 186 passing and
+2 platform-specific skips; the real-device run record remains `0 / 20`.
 
 ### Task 9: Prevent multiple bridge instances
 
