@@ -136,7 +136,11 @@ private resolveModelArg(model: string, workDir?: string): string {
                 log.debug(`[opencode] found reasoning, length: ${obj.part.text.length}`);
               }
               if (obj.sessionID && !sessionId) {
-                sessionId = obj.sessionID;
+                const observedSessionId = typeof obj.sessionID === 'string' ? obj.sessionID : undefined;
+                if (observedSessionId) {
+                  sessionId = observedSessionId;
+                  opts.onSessionId?.(observedSessionId);
+                }
               }
               if (obj.type === 'step_finish' && obj.part?.reason === 'error') {
                 hasError = true;

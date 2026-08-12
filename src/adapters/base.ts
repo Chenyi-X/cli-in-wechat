@@ -7,6 +7,17 @@ import { copyMediaToWorkDir, type DownloadedMedia } from '../utils/media.js';
 export type ToolMode = 'auto' | 'safe' | 'plan';
 export type MsgMode = 'verbose' | 'normal' | 'compact';
 
+export interface PendingTask {
+  taskId: string;
+  toolName: string;
+  prompt: string;
+  startedAt: number;
+  generation?: number;
+  tokenVersion?: number;
+  /** Whether the Agent is still running or its result only awaits delivery. */
+  phase?: 'running' | 'delivery-pending';
+}
+
 export interface UserSettings {
   // ── Universal ──
   defaultTool: string;
@@ -44,6 +55,8 @@ export interface UserSettings {
   // ── Output ──
   showThoughts: boolean;
   msgMode: MsgMode;
+  /** Durable marker for a task that may need resuming after process interruption. */
+  pendingTask?: PendingTask;
 }
 
 export const DEFAULT_SETTINGS: UserSettings = {
@@ -92,6 +105,8 @@ export interface ExecOptions {
   media?: DownloadedMedia[];
   /** Callback for streaming intermediate messages to WeChat */
   onIntermediate?: (msg: IntermediateMessage) => void;
+  /** Called as soon as an adapter observes a resumable session identifier. */
+  onSessionId?: (sessionId: string) => void;
 }
 
 export interface ExecResult {

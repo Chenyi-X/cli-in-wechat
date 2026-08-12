@@ -38,6 +38,7 @@ export class SessionManager {
       delete s.sessionIds[tool];
     } else {
       s.sessionIds = {};
+      delete s.pendingTask;
     }
     this.save();
   }

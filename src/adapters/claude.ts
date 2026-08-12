@@ -312,6 +312,16 @@ export class ClaudeAdapter implements CLIAdapter {
 
       const msg = message as Record<string, unknown>;
 
+      const observedSessionId = typeof msg.session_id === 'string'
+        ? msg.session_id
+        : typeof (msg.message as Record<string, unknown> | undefined)?.session_id === 'string'
+          ? (msg.message as Record<string, unknown>).session_id as string
+          : undefined;
+      if (observedSessionId) {
+        sessionId = observedSessionId;
+        opts.onSessionId?.(observedSessionId);
+      }
+
       if (msg.type === 'assistant') {
         // SDK 用 message.content 存储 content blocks
         const msgObj = msg as any;
@@ -369,6 +379,7 @@ export class ClaudeAdapter implements CLIAdapter {
         const result = msg as Record<string, unknown>;
         resultText = (result.result as string) || '(无输出)';
         sessionId = result.session_id as string;
+        if (sessionId) opts.onSessionId?.(sessionId);
         error = !!(result.is_error) || result.subtype !== 'success';
       }
     }
@@ -441,6 +452,11 @@ export class ClaudeAdapter implements CLIAdapter {
           if (!line.trim()) continue;
           try {
             const obj = JSON.parse(line);
+            const observedSessionId = typeof obj.session_id === 'string' ? obj.session_id : undefined;
+            if (observedSessionId) {
+              sessionId = observedSessionId;
+              opts.onSessionId?.(observedSessionId);
+            }
             if (obj.type === 'assistant' && obj.message?.content) {
               for (const block of obj.message.content) {
                 if (block.type === 'thinking' && block.thinking) {
@@ -454,6 +470,7 @@ export class ClaudeAdapter implements CLIAdapter {
             if (obj.type === 'result') {
               if (!text) text = obj.result || '(无输出)';
               sessionId = obj.session_id;
+              if (sessionId) opts.onSessionId?.(sessionId);
               duration = obj.duration_ms;
               isErr = obj.is_error || obj.subtype !== 'success';
             }

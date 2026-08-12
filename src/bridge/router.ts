@@ -2,6 +2,7 @@ import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { execSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { log } from '../utils/logger.js';
 import { ILinkClient, type DeliveryContext, type InboundRecoveryContext } from '../ilink/client.js';
 import { AdapterRegistry } from '../adapters/registry.js';
@@ -9,7 +10,7 @@ import { SessionManager } from './session.js';
 import { formatResponse } from './formatter.js';
 import type { WeixinMessage } from '../ilink/types.js';
 import type { BridgeConfig } from '../config.js';
-import { DEFAULT_SETTINGS, type AskUserRequest, type MsgMode } from '../adapters/base.js';
+import { DEFAULT_SETTINGS, type AskUserRequest, type MsgMode, type PendingTask } from '../adapters/base.js';
 import type { DownloadedMedia } from '../utils/media.js';
 
 interface ActiveTask { abort: AbortController; tool: string }
@@ -39,6 +40,8 @@ interface NormalActivityDelivery {
   hasUnconfirmed: boolean;
 }
 
+const INTERRUPTED_TASK_RECOVERY = '\n\n[系统恢复指令] 上一次任务在输出完成前被进程中断。请继续完成原任务并输出完整最终结果；不要把用户本次恢复消息当作新的任务内容。';
+
 export class Router {
   private ilink: ILinkClient;
   private registry: AdapterRegistry;
@@ -57,8 +60,8 @@ export class Router {
   }
 
   start(): void {
-    this.ilink.onMessage((msg, text, refText, media, recovery) => {
-      this.handle(msg, text, refText, media, recovery).catch((e) => log.error('路由异常:', e));
+    this.ilink.onMessage(async (msg, text, refText, media, recovery) => {
+      await this.handle(msg, text, refText, media, recovery);
     });
   }
 
@@ -248,11 +251,39 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
       }
     }
 
+    let pendingTask = this.sessions.get(uid).pendingTask;
+    // A completed Agent task can still have a final result waiting in the outbox.
+    // Consume this inbound as the delivery trigger; never reinterpret it as a
+    // new prompt after the final body was already generated.
+    if (pendingTask?.phase === 'delivery-pending') {
+      const delivery = this.ilink.getDeliveryState(uid);
+      if ((recovery?.pendingTextCount ?? 0) > 0 || delivery.pendingTextCount > 0) {
+        await this.ilink.resumePendingText(uid);
+        if (this.ilink.getDeliveryState(uid).pendingTextCount > 0) return;
+        this.sessions.update(uid, { pendingTask: undefined });
+        return;
+      }
+      // The marker can outlive a terminal/acknowledged delivery result. With
+      // no durable backlog left, this inbound is a normal new prompt.
+      this.sessions.update(uid, { pendingTask: undefined });
+      pendingTask = undefined;
+    }
+
     // The client already drained durable text before invoking the router. If
     // this inbound arrived while text was waiting, consume it as the recovery
     // trigger instead of accidentally starting a second Agent task (for
     // example, a user replying "如何" to a recovery prompt).
     if (recovery && recovery.pendingTextCount > 0) return;
+
+    if (pendingTask) {
+      const taskKey = `${uid}:${pendingTask.toolName}`;
+      if (this.active.has(taskKey)) {
+        await this.ilink.sendText(uid, `${pendingTask.toolName} 仍在执行，当前消息已作为恢复确认，请稍候等待完整结果。`);
+        return;
+      }
+      await this.resumeInterruptedTask(uid, pendingTask);
+      return;
+    }
 
     // ── Parse: @tool1>tool2 chain, @tool single, >> relay, plain text ──
 
@@ -435,12 +466,17 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
         return true;
 
       case 'cancel': case 'c': {
+        const hadPendingTask = !!this.sessions.get(uid).pendingTask;
         const tasks = [...this.active.entries()].filter(([k]) => k.startsWith(`${uid}:`));
         if (tasks.length > 0) {
           const seen = new Set<AbortController>();
           tasks.forEach(([k, t]) => { if (!seen.has(t.abort)) { seen.add(t.abort); t.abort.abort(); } this.active.delete(k); });
+          this.sessions.update(uid, { pendingTask: undefined });
           await reply(`已取消 ${[...new Set(tasks.map(([, t]) => t.tool))].join(', ')}`);
-        } else { await reply('无任务'); }
+        } else {
+          if (hadPendingTask) this.sessions.update(uid, { pendingTask: undefined });
+          await reply('无任务');
+        }
         return true;
       }
 
@@ -724,7 +760,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
           allowedTools: '', disallowedTools: '', verbose: false, sandbox: '',
           search: false, systemPrompt: '', workDir: '', bare: false, addDir: '',
           sessionName: '', ephemeral: false, profile: '', approvalMode: '',
-          includeDirs: '', extensions: '', showThoughts: false, msgMode: this.getDefaultMsgMode(),
+          includeDirs: '', extensions: '', showThoughts: false, msgMode: this.getDefaultMsgMode(), pendingTask: undefined,
         } as any);
         await reply('所有设置已重置');
         return true;
@@ -800,6 +836,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
         // Fork = clear session ID so next call doesn't --resume
         const tool = settings.defaultTool || this.config.defaultTool;
         this.sessions.clearSession(uid, tool);
+        this.sessions.update(uid, { pendingTask: undefined });
         await reply(`已 fork ${tool} 会话 (下次消息开始新分支)`);
         return true;
       }
@@ -1203,6 +1240,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
       askUser: (req) => this.askUserViaWeChat(uid, toolName, req),
       media,
       onIntermediate,
+      onSessionId: (sessionId) => this.sessions.setSession(uid, toolName, sessionId),
     });
 
     if (result.sessionExpired && hadSession && !signal.aborted) {
@@ -1277,10 +1315,45 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
     const settings = this.sessions.get(uid);
     const msgMode = this.normalizeMsgMode(settings.msgMode);
     const deliveryContext = this.ilink.getDeliveryContext?.(uid);
-    const stopTyping = await this.ilink.startTyping(uid);
     const start = Date.now();
     const workDir = this.sessions.get(uid).workDir || this.config.workDir;
     const artifactSnapshot = this.snapshotAutoDeliverables(workDir);
+    const taskId = randomUUID();
+    this.sessions.update(uid, {
+      pendingTask: {
+        taskId,
+        toolName,
+        prompt,
+        startedAt: start,
+        generation: deliveryContext?.generation,
+        tokenVersion: deliveryContext?.tokenVersion,
+      },
+    });
+    let taskCompleted = false;
+
+    const stopTyping = await this.ilink.startTyping(uid);
+
+    const clearCompletedTask = (): void => {
+      const current = this.sessions.get(uid).pendingTask;
+      if (current?.taskId !== taskId) return;
+      this.sessions.update(uid, { pendingTask: undefined });
+      taskCompleted = true;
+    };
+
+    const recordDeliveryOutcome = (results: Array<{ status: string }> | undefined): void => {
+      const current = this.sessions.get(uid).pendingTask;
+      if (current?.taskId !== taskId) return;
+      const confirmed = Array.isArray(results)
+        && results.length > 0
+        && results.every((result) => result.status === 'sent');
+      if (confirmed) {
+        clearCompletedTask();
+        return;
+      }
+      this.sessions.update(uid, {
+        pendingTask: { ...current, phase: 'delivery-pending' },
+      });
+    };
 
     // Track if we've streamed text (to avoid duplicate with final result)
     let hasStreamedText = false;
@@ -1445,34 +1518,53 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
       // If text was already streamed, only send footer (avoid duplicate large-body resend).
       if (hasStreamedText && !requiresCompleteFinal) {
         const tailNotice = `${notice}${sentNotice}${failedNotice}`;
-        await this.ilink.sendText(uid, formatResponse(`${finalActivityBlock}${tailNotice}`.trim(), {
+        const finalResults = await this.ilink.sendText(uid, formatResponse(`${finalActivityBlock}${tailNotice}`.trim(), {
           tool: adapter.displayName,
           duration: result.duration || (Date.now() - start),
           error: result.error,
         }), { priority: 'final', ...deliveryContext });
+        recordDeliveryOutcome(finalResults);
       } else {
         // compact mode or no streamed text: send full result
         const recoveryNotice = hasStreamedText && intermediateSendFailed ? '[部分中间消息发送失败]\n' : '';
-        await this.ilink.sendText(uid, formatResponse(`${finalActivityBlock}${notice}${recoveryNotice}${activityRecoveryNotice}${cleanText}${sentNotice}${failedNotice}`, {
+        const finalResults = await this.ilink.sendText(uid, formatResponse(`${finalActivityBlock}${notice}${recoveryNotice}${activityRecoveryNotice}${cleanText}${sentNotice}${failedNotice}`, {
           tool: adapter.displayName,
           duration: result.duration || (Date.now() - start),
           error: result.error,
         }), { priority: 'final', ...deliveryContext });
+        recordDeliveryOutcome(finalResults);
       }
     } catch (err: unknown) {
       if (!abort.signal.aborted) {
         log.error(`[${toolName}] 失败:`, err);
-        await this.ilink.sendText(uid, `失败: ${(err as Error).message}`, {
-          priority: 'final',
-          ...deliveryContext,
-        });
+        try {
+          const failureResults = await this.ilink.sendText(uid, `失败: ${(err as Error).message}`, {
+            priority: 'final',
+            ...deliveryContext,
+          });
+          recordDeliveryOutcome(failureResults);
+        } catch (sendError) {
+          log.error(`[${toolName}] 失败提示也未能进入发送层:`, sendError);
+          const current = this.sessions.get(uid).pendingTask;
+          if (current?.taskId === taskId) {
+            this.sessions.update(uid, {
+              pendingTask: { ...current, phase: 'delivery-pending' },
+            });
+          }
+        }
       }
     } finally {
       // Defensive cleanup for pending timer when task exits early.
       if (textFlushTimer) clearTimeout(textFlushTimer);
       stopTyping();
       this.active.delete(`${uid}:${toolName}`);
+      if (taskCompleted) log.debug(`[${toolName}] task=${taskId} completed and cleared`);
     }
+  }
+
+  private async resumeInterruptedTask(uid: string, task: PendingTask): Promise<void> {
+    log.warn(`[${task.toolName}] 检测到未完成任务，消费本次入站并恢复 task=${task.taskId}`);
+    await this.exec(uid, task.toolName, `${task.prompt}${INTERRUPTED_TASK_RECOVERY}`);
   }
 
   private async parseAndSendFiles(

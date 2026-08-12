@@ -220,6 +220,51 @@ test('an arbitrary recovery inbound is consumed instead of starting a second Age
   assert.equal(execCalled, false);
 });
 
+test('an arbitrary inbound resumes a persisted interrupted task after restart', async () => {
+  const { router, sessions } = createRouter();
+  const calls: Array<{ tool: string; prompt: string }> = [];
+  (sessions.get('u1') as any).defaultTool = 'claude';
+  (sessions.get('u1') as any).pendingTask = {
+    taskId: 'interrupted-task-1',
+    toolName: 'claude',
+    prompt: '调研这位老师并给出完整结论',
+    startedAt: Date.now() - 10_000,
+    generation: 7,
+    tokenVersion: 7,
+  };
+  router.exec = async (_uid: string, tool: string, prompt: string) => {
+    calls.push({ tool, prompt });
+  };
+
+  await router.handle(makeMessage('u1'), '0', '');
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].tool, 'claude');
+  assert.match(calls[0].prompt, /调研这位老师并给出完整结论/);
+  assert.match(calls[0].prompt, /恢复|继续完成/);
+  assert.equal(calls[0].prompt.includes('\n0\n'), false);
+});
+
+test('exec retains the pending task marker when shutdown interrupts the adapter', async () => {
+  const { router, sessions } = createRouter();
+  (router as any).registry = {
+    get: () => ({
+      displayName: 'Claude',
+      capabilities: { sessionResume: false },
+      execute: async (_prompt: string, options: any) => new Promise((resolve) => {
+        options.signal?.addEventListener('abort', () => resolve({ text: '已取消', error: true }), { once: true });
+      }),
+    }),
+  };
+
+  const running = router.exec('u1', 'claude', '一个很长的调研任务');
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  router.stop();
+  await running;
+
+  assert.equal((sessions.get('u1') as any).pendingTask.prompt, '一个很长的调研任务');
+});
+
 test('exec sends the complete final body when intermediate delivery was not confirmed', async () => {
   const { router } = createRouter();
   const sent: Array<{ text: string; options?: Record<string, unknown> }> = [];
@@ -338,6 +383,72 @@ test('normal mode sends the complete final body when Activity is queued', async 
   const final = sent.find((message) => message.options?.priority === 'final');
   assert.ok(final?.text.includes('complete final body'), JSON.stringify(sent));
   assert.match(final?.text || '', /Activity 已排队/);
+});
+
+test('exec keeps a delivery-pending marker when the final result is queued', async () => {
+  const { router, sessions } = createRouter();
+  (router as any).ilink.sendText = async () => [{ status: 'queued' }];
+  (router as any).registry = {
+    get: () => ({
+      displayName: 'Claude',
+      capabilities: { sessionResume: false },
+      execute: async () => ({ text: '完整结果待续发', duration: 1_000, error: false }),
+    }),
+  };
+
+  await (router as any).exec('u1', 'claude', '调研这位老师');
+
+  assert.equal((sessions.get('u1') as any).pendingTask.phase, 'delivery-pending');
+  assert.equal((sessions.get('u1') as any).pendingTask.prompt, '调研这位老师');
+});
+
+test('a recovery inbound drains a delivery-pending task without rerunning the Agent', async () => {
+  const { router, sessions, delivery, resumed } = createRouter();
+  delivery.waitingForInbound = true;
+  delivery.pendingTextCount = 1;
+  (sessions.get('u1') as any).pendingTask = {
+    taskId: 'delivery-task-1',
+    toolName: 'claude',
+    prompt: '调研这位老师',
+    startedAt: Date.now() - 1_000,
+    phase: 'delivery-pending',
+  };
+  (router as any).ilink.resumePendingText = async () => {
+    resumed.push('u1');
+    delivery.pendingTextCount = 0;
+    delivery.waitingForInbound = false;
+    return [{ status: 'sent' }];
+  };
+  let execCalled = false;
+  router.exec = async () => {
+    execCalled = true;
+  };
+
+  await router.handle(makeMessage('u1'), '0', '', undefined, { pendingTextCount: 1 });
+
+  assert.deepEqual(resumed, ['u1']);
+  assert.equal(execCalled, false);
+  assert.equal((sessions.get('u1') as any).pendingTask, undefined);
+});
+
+test('a delivery-pending marker without durable backlog does not swallow a new prompt', async () => {
+  const { router, sessions } = createRouter();
+  (sessions.get('u1') as any).pendingTask = {
+    taskId: 'delivery-task-without-backlog',
+    toolName: 'claude',
+    prompt: '旧任务',
+    startedAt: Date.now() - 1_000,
+    phase: 'delivery-pending',
+  };
+  let capturedPrompt = '';
+  router.exec = async (_uid: string, _tool: string, prompt: string) => {
+    capturedPrompt = prompt;
+  };
+
+  await router.handle(makeMessage('u1'), '新的问题', '');
+
+  assert.equal(capturedPrompt, '新的问题');
+  assert.equal((sessions.get('u1') as any).pendingTask, undefined);
 });
 
 test('chain final output keeps the delivery context captured at task start', async () => {
