@@ -6,6 +6,7 @@ import { GeminiAdapter } from './gemini.js';
 import { KimiAdapter } from './kimi.js';
 import { OpenCodeAdapter } from './opencode-sdk.js';
 import { OpenCodeAdapter as OpenCodeCliAdapter } from './opencode.js';
+import { PiAdapter } from './pi-sdk.js';
 
 export class AdapterRegistry {
   private adapters = new Map<string, CLIAdapter>();
@@ -23,6 +24,7 @@ export class AdapterRegistry {
     this.register(new OpenCodeAdapter());
     this.register(new OpenCodeCliAdapter(), 'opencode-cli');
     this.fallbackChains.set('opencode', ['opencode-cli']);
+    this.register(new PiAdapter());
   }
 
   private register(adapter: CLIAdapter, fallbackName?: string): void {

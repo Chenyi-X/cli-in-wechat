@@ -464,6 +464,19 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
       }
 
       case 'models': {
+        // Adapters that can enumerate models (e.g. pi via ModelRuntime) serve the
+        // list themselves; otherwise keep the existing `opencode models` behavior.
+        const modelsTool = settings.defaultTool || this.config.defaultTool;
+        const modelsAdapter = this.registry.get(modelsTool);
+        if (modelsAdapter?.listModels) {
+          try {
+            const models = await modelsAdapter.listModels();
+            await reply(models.length > 0 ? `可用模型 (${models.length}个):\n${models.join('\n')}` : '没有可用的模型');
+          } catch (err) {
+            await reply(`获取模型列表失败: ${(err as Error).message}`);
+          }
+          return true;
+        }
         try {
           const stdout = execSync('opencode models', {
             encoding: 'utf-8',
@@ -510,9 +523,9 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
         if (!v) { await reply('/mode <auto|safe|plan>\nauto=最高权限 safe=需确认 plan=只读'); return true; }
         this.sessions.update(uid, { mode: v as any });
         const desc: Record<string, string> = {
-          auto: 'AUTO\nClaude: --dangerously-skip-permissions\nCodex: --yolo\nGemini: --approval-mode yolo\nKimi: -p (自带auto)',
-          safe: 'SAFE\nClaude: 默认权限\nCodex: --sandbox workspace-write\nGemini: --approval-mode default\nKimi: -p 恒auto (/mode 对Kimi无效)',
-          plan: 'PLAN\nClaude: --permission-mode plan\nCodex: --sandbox read-only\nGemini: --approval-mode plan\nKimi: -p 不支持plan (恒auto)',
+          auto: 'AUTO\nClaude: --dangerously-skip-permissions\nCodex: --yolo\nGemini: --approval-mode yolo\nKimi: -p (自带auto)\nPi: 全部内置工具(read/bash/edit/write)',
+          safe: 'SAFE\nClaude: 默认权限\nCodex: --sandbox workspace-write\nGemini: --approval-mode default\nKimi: -p 恒auto (/mode 对Kimi无效)\nPi: 只读工具(read/grep/find/ls)',
+          plan: 'PLAN\nClaude: --permission-mode plan\nCodex: --sandbox read-only\nGemini: --approval-mode plan\nKimi: -p 不支持plan (恒auto)\nPi: 不支持plan (按safe处理)',
         };
         await reply(desc[v]);
         return true;
@@ -971,7 +984,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
           return true;
         }
         // List all sessions for current tool
-        const list = this.listSessions(tool, settings.workDir || this.config.workDir);
+        const list = await this.listSessions(tool, settings.workDir || this.config.workDir);
         if (list.length === 0) {
           await reply(`${tool} 没有历史会话`);
           return true;
@@ -1017,6 +1030,8 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
         this.sessions.update(uid, { defaultTool: 'kimi' }); await reply('→ kimi'); return true;
       case 'opencode': case 'oc':
         this.sessions.update(uid, { defaultTool: 'opencode' }); await reply('→ opencode'); return true;
+      case 'pi':
+        this.sessions.update(uid, { defaultTool: 'pi' }); await reply('→ pi'); return true;
 
       // ═══════════════════════════════════════════
       // 未识别
@@ -1030,11 +1045,12 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
 
   // ─── List historical sessions ───────────────────────────
 
-  private listSessions(tool: string, workDir: string): Array<{ id: string; date: string; summary: string }> {
+  private async listSessions(tool: string, workDir: string): Promise<Array<{ id: string; date: string; summary: string }>> {
     try {
       // Claude: ~/.claude/projects/<encoded-cwd>/<session-id>.jsonl
       // Codex: ~/.codex/sessions/YYYY/MM/DD/*.jsonl
       // OpenCode: uses 'opencode session list --format json'
+      // Pi: SessionManager.list (async)
       let dir = '';
       if (tool === 'claude') {
         const encoded = workDir.replace(/[^a-zA-Z0-9]/g, '-');
@@ -1044,6 +1060,8 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
         return this.listCodexSessions(dir);
       } else if (tool === 'opencode') {
         return this.listOpenCodeSessions(workDir);
+      } else if (tool === 'pi') {
+        return await this.listPiSessions(workDir);
       } else {
         return [];
       }
@@ -1087,6 +1105,28 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
 
       return files.map(({ id, date, summary }) => ({ id, date, summary }));
     } catch {
+      return [];
+    }
+  }
+
+  private async listPiSessions(workDir: string): Promise<Array<{ id: string; date: string; summary: string }>> {
+    try {
+      // Dynamic import: pi is an optional dependency; machines without it get []
+      // instead of a crash (isAvailable gates the /pi switch, but /resume is still
+      // reachable after a config change).
+      const { SessionManager } = await import('@earendil-works/pi-coding-agent');
+      const sessions = await SessionManager.list(workDir);
+      return sessions
+        .slice()
+        .sort((a, b) => new Date(b.modified).getTime() - new Date(a.modified).getTime())
+        .slice(0, 15)
+        .map((s) => ({
+          id: s.id,
+          date: new Date(s.modified).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false }).replace(/\//g, '-'),
+          summary: (s.firstMessage || '(无摘要)').substring(0, 60),
+        }));
+    } catch (err) {
+      log.debug(`[pi] session list failed: ${(err as Error).message}`);
       return [];
     }
   }
