@@ -94,6 +94,14 @@ export interface ExecOptions {
   onIntermediate?: (msg: IntermediateMessage) => void;
 }
 
+export interface ExecResultUsage {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  totalCost: number; // USD
+}
+
 export interface ExecResult {
   text: string;
   thinking?: string;
@@ -103,6 +111,8 @@ export interface ExecResult {
   error?: boolean;
   /** Set by the adapter when the error is positively identified as a session/resume failure. */
   sessionExpired?: boolean;
+  /** Token/cost usage for the run. Only filled by adapters that can report it (M8). */
+  usage?: ExecResultUsage;
 }
 
 export interface IntermediateMessage {
@@ -129,6 +139,8 @@ export interface CLIAdapter {
   readonly capabilities: AdapterCapabilities;
   isAvailable(): Promise<boolean>;
   execute(prompt: string, opts: ExecOptions): Promise<ExecResult>;
+  /** List available models as `provider/id` strings, when the adapter can enumerate them. */
+  listModels?(): Promise<string[]>;
   /** Release any long-lived resources (e.g. spawned background servers) on shutdown. */
   close?(): void;
 }
@@ -361,6 +373,13 @@ export function summarizeToolUse(toolName: string, input: unknown): string {
     return skill
       ? `- Skill: \`${basenameFromPath(skill)}\``
       : '- Skill';
+  }
+
+  if (/^find$/i.test(t)) {
+    const pattern = pickStringField(obj, ['pattern', 'query']);
+    return pattern
+      ? `- Find: \`${truncate(pattern, 80)}\``
+      : '- Find';
   }
 
   if (/^glob$/i.test(t)) {
