@@ -120,6 +120,18 @@ test('summarizeToolUse preserves the historical Claude/OpenCode activity labels'
   assert.equal(summarizeToolUse('unknown-tool', {}), '- unknown-tool');
 });
 
+test('summarizeToolUse summarizes find with both pattern and query arg shapes', () => {
+  assert.equal(
+    summarizeToolUse('find', { pattern: 'TODO.*refactor' }),
+    '- Find: `TODO.*refactor`',
+  );
+  assert.equal(
+    summarizeToolUse('find', { query: 'sessionIds' }),
+    '- Find: `sessionIds`',
+  );
+  assert.equal(summarizeToolUse('find', {}), '- Find');
+});
+
 test('summarizeToolResult emits only the historical curated result summaries', () => {
   assert.equal(summarizeToolResult('bash', 'Exit code 0\nhello'), '  ↳ Exit: 0');
   assert.equal(summarizeToolResult('webfetch', 'HTTP: 404'), '  ↳ HTTP: 404');

@@ -67,6 +67,32 @@ test('mapPiEvent maps tool_execution_end errors', () => {
   ]);
 });
 
+test('mapPiEvent falls back to the raw result for errors without content[] blocks', () => {
+  // Error results may not carry the standard content[] shape; the raw result
+  // must be stringified so "  ↳ Error: " never ends up empty.
+  const stringResult: PiEventLike = {
+    type: 'tool_execution_end',
+    toolCallId: 'call_e1',
+    toolName: 'bash',
+    result: 'command not found',
+    isError: true,
+  };
+  assert.deepEqual(mapPiEvent(stringResult), [
+    { type: 'tool_result', content: '  ↳ Error: command not found', toolName: 'bash' },
+  ]);
+
+  const objectResult: PiEventLike = {
+    type: 'tool_execution_end',
+    toolCallId: 'call_e2',
+    toolName: 'bash',
+    result: { error: 'ENOENT: no such file' },
+    isError: true,
+  };
+  assert.deepEqual(mapPiEvent(objectResult), [
+    { type: 'tool_result', content: '  ↳ Error: {"error":"ENOENT: no such file"}', toolName: 'bash' },
+  ]);
+});
+
 test('mapPiEvent maps assistant message_end text and thinking blocks', () => {
   const ev: PiEventLike = {
     type: 'message_end',
@@ -137,6 +163,9 @@ function createFakeSession(overrides: {
   sessionId?: string;
   events?: PiEventLike[];
   messages?: PiMessageLike[];
+  /** Assistant messages appended to state.messages when prompt() runs —
+   *  simulates the messages pi adds for the current turn. */
+  appendOnPrompt?: PiMessageLike[];
   hangUntilAbort?: boolean;
   abortOnPrompt?: AbortController;
 }): { session: PiSessionLike; state: FakeSessionState } {
@@ -152,10 +181,17 @@ function createFakeSession(overrides: {
   };
   const session: PiSessionLike = {
     sessionId: overrides.sessionId ?? 'pi-ses-1',
-    subscribe: (l) => { listeners.push(l); return () => { /* noop */ }; },
+    subscribe: (l) => {
+      listeners.push(l);
+      return () => {
+        const i = listeners.indexOf(l);
+        if (i >= 0) listeners.splice(i, 1);
+      };
+    },
     prompt: async (text) => {
       state.promptTexts.push(text);
       for (const ev of overrides.events ?? []) state.emit(ev);
+      for (const m of overrides.appendOnPrompt ?? []) state.messages.push(m);
       overrides.abortOnPrompt?.abort();
       if (overrides.hangUntilAbort) await abortPromise;
     },
@@ -177,7 +213,7 @@ function piSettings(overrides: Record<string, unknown> = {}) {
 }
 
 test('PiAdapter execute streams blocks and assembles result with usage', async () => {
-  const messages: PiMessageLike[] = [
+  const turnMessages: PiMessageLike[] = [
     {
       role: 'assistant',
       content: [{ type: 'toolCall', toolCallId: 'call_b92', toolName: 'bash', arguments: { command: 'echo hi' } }],
@@ -193,7 +229,9 @@ test('PiAdapter execute streams blocks and assembles result with usage', async (
     },
   ];
   const { session, state } = createFakeSession({
-    messages,
+    // The assistant messages of this turn are appended while prompt() runs,
+    // mirroring how pi extends state.messages during a run.
+    appendOnPrompt: turnMessages,
     events: [
       { type: 'message_update', message: { role: 'assistant', content: [] } },
       { type: 'tool_execution_start', toolCallId: 'call_b92', toolName: 'bash', args: { command: 'echo hi' } },
@@ -245,6 +283,86 @@ test('PiAdapter execute streams blocks and assembles result with usage', async (
   // close() disposes the cached session.
   adapter.close();
   assert.equal(state.disposed, true);
+});
+
+test('PiAdapter execute counts usage only for the current turn on a resumed session', async () => {
+  // Resumed session: state.messages already carries the previous turn's
+  // assistant message (with its usage) before this run's prompt.
+  const messages: PiMessageLike[] = [
+    { role: 'user', content: [{ type: 'text', text: 'previous question' }] },
+    {
+      role: 'assistant',
+      content: [{ type: 'text', text: 'previous answer' }],
+      usage: { input: 1000, output: 100, cacheRead: 500, cacheWrite: 0, totalTokens: 1600, cost: { total: 0.01 } },
+    },
+  ];
+  const { session } = createFakeSession({
+    sessionId: 'pi-ses-resumed',
+    messages,
+    appendOnPrompt: [
+      {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'new answer' }],
+        usage: { input: 4690, output: 22, cacheRead: 7488, cacheWrite: 0, totalTokens: 12200, cost: { total: 0.00860968 } },
+      },
+    ],
+  });
+  const adapter = new PiAdapter({ sessionFactory: async () => session });
+
+  const result = await adapter.execute('new question', { settings: piSettings() });
+
+  // Text comes from the last assistant message (this turn), usage from this
+  // turn only — the pre-existing history usage must NOT be re-counted.
+  assert.equal(result.text, 'new answer');
+  assert.ok(result.usage);
+  assert.equal(result.usage.inputTokens, 4690);
+  assert.equal(result.usage.outputTokens, 22);
+  assert.equal(result.usage.cacheReadTokens, 7488);
+  assert.equal(result.usage.cacheWriteTokens, 0);
+  assert.ok(Math.abs(result.usage.totalCost - 0.00860968) < 1e-9);
+});
+
+test('PiAdapter execute disposes the previous session before replacing it', async () => {
+  const first = createFakeSession({ sessionId: 'pi-ses-1' });
+  const second = createFakeSession({ sessionId: 'pi-ses-2' });
+  const sessions = [first.session, second.session];
+  const adapter = new PiAdapter({ sessionFactory: async () => sessions.shift()! });
+
+  await adapter.execute('first prompt', { settings: piSettings() });
+  await adapter.execute('second prompt', { settings: piSettings() });
+
+  // The first session was disposed when the second one replaced it; the
+  // current (second) session is only disposed by close().
+  assert.equal(first.state.disposed, true);
+  assert.equal(second.state.disposed, false);
+  adapter.close();
+  assert.equal(second.state.disposed, true);
+});
+
+test('PiAdapter execute unsubscribes after prompt resolves so late events are dropped', async () => {
+  const messages: PiMessageLike[] = [];
+  const events: PiEventLike[] = [
+    { type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text: 'final answer' }] } },
+  ];
+  const { session, state } = createFakeSession({
+    messages,
+    events,
+    appendOnPrompt: [{ role: 'assistant', content: [{ type: 'text', text: 'final answer' }] }],
+  });
+  const adapter = new PiAdapter({ sessionFactory: async () => session });
+
+  const activity: IntermediateMessage[] = [];
+  const result = await adapter.execute('hello', {
+    settings: piSettings(),
+    onIntermediate: (msg) => activity.push(msg),
+  });
+  assert.equal(result.text, 'final answer');
+  assert.equal(activity.length, 1);
+
+  // An event arriving after prompt() resolved must not reach the bridge
+  // (the subscription was torn down in finally).
+  state.emit({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text: 'late' }] } });
+  assert.equal(activity.length, 1);
 });
 
 test('PiAdapter execute passes read-only tools in safe mode', async () => {

@@ -8,7 +8,7 @@ import type {
   ExecResultUsage,
   IntermediateMessage,
 } from './base.js';
-import { buildMediaPrompt, summarizeToolResult, summarizeToolUse } from './base.js';
+import { asString, buildMediaPrompt, summarizeToolResult, summarizeToolUse } from './base.js';
 
 // ─── Structural SDK types (no SDK import — keeps this module unit-testable) ──
 // The pi package is an optional dependency and MUST NOT be statically imported
@@ -111,6 +111,13 @@ function extractToolResultText(result: unknown): string {
   return parts.join('');
 }
 
+/** Error results may not carry the standard `content: [{type:'text'}]` shape
+ *  (the SDK error path differs), so fall back to stringifying the raw result —
+ *  otherwise "  ↳ Error: " would trail off with nothing after it. */
+function extractToolErrorText(result: unknown): string {
+  return extractToolResultText(result) || asString(result).trim();
+}
+
 /** Map one pi SDK event to 0..n intermediate messages. Pure: no SDK import,
  *  no side effects. Delta-class events (message_update etc.) yield nothing —
  *  WeChat only renders block-level output. */
@@ -129,15 +136,15 @@ export function mapPiEvent(ev: PiEventLike): IntermediateMessage[] {
 
   if (ev.type === 'tool_execution_end') {
     const toolName = typeof ev.toolName === 'string' && ev.toolName ? ev.toolName : 'Tool';
-    const text = extractToolResultText(ev.result);
     if (ev.isError) {
+      const text = extractToolErrorText(ev.result);
       messages.push({
         type: 'tool_result',
         content: `  ↳ Error: ${text.substring(0, 100)}`,
         toolName,
       });
     } else {
-      const summary = summarizeToolResult(toolName, text);
+      const summary = summarizeToolResult(toolName, extractToolResultText(ev.result));
       if (summary) {
         messages.push({ type: 'tool_result', content: summary, toolName });
       }
@@ -257,7 +264,18 @@ export class PiAdapter implements CLIAdapter {
         duration: Date.now() - start,
       };
     }
+    // Replace the cached session, disposing the previous one so repeated
+    // execute() calls (e.g. session resume miss → new session) never leak it.
+    if (this.session && this.session !== session) {
+      try { this.session.dispose(); } catch { /* already gone */ }
+    }
     this.session = session;
+
+    // Usage baseline: messages already present before this run's prompt belong
+    // to earlier turns of a resumed session and must not be re-counted.
+    const usageBaseline = Array.isArray(session.agent.state.messages)
+      ? session.agent.state.messages.length
+      : 0;
 
     // Idle-timeout anti-wedge (mirrors claude.ts): the timer is re-armed on every
     // event, so a long-but-healthy run is never cut off, while a run that stops
@@ -278,16 +296,22 @@ export class PiAdapter implements CLIAdapter {
     signal?.addEventListener('abort', onAbort, { once: true });
 
     try {
-      // Subscribe before prompt so no block-level event is missed.
-      session.subscribe((ev) => {
+      // Subscribe before prompt so no block-level event is missed. Unsubscribe
+      // in finally so events arriving after prompt resolves cannot re-arm the
+      // idle timer or inject intermediate messages into the next run.
+      const unsubscribe = session.subscribe((ev) => {
         armIdleTimeout();
         if (signal?.aborted) return;
         for (const msg of mapPiEvent(ev)) onIntermediate?.(msg);
       });
-      armIdleTimeout();
+      try {
+        armIdleTimeout();
 
-      log.debug(`[pi] prompt (model=${settings.model || 'default'} thinking=${thinkingLevel || 'default'} mode=${settings.mode} timeout=${timeout}ms)`);
-      await session.prompt(fullPrompt);
+        log.debug(`[pi] prompt (model=${settings.model || 'default'} thinking=${thinkingLevel || 'default'} mode=${settings.mode} timeout=${timeout}ms)`);
+        await session.prompt(fullPrompt);
+      } finally {
+        unsubscribe();
+      }
     } catch (err) {
       if (signal?.aborted) return { text: '已取消', error: true, duration: Date.now() - start };
       if (timedOut) return this.timeoutResult(timeout, start);
@@ -304,7 +328,7 @@ export class PiAdapter implements CLIAdapter {
     if (signal?.aborted) return { text: '已取消', error: true, duration: Date.now() - start };
     if (timedOut) return this.timeoutResult(timeout, start);
 
-    return this.assembleResult(session, start);
+    return this.assembleResult(session, start, usageBaseline);
   }
 
   private timeoutResult(timeout: number, start: number): ExecResult {
@@ -318,8 +342,9 @@ export class PiAdapter implements CLIAdapter {
   }
 
   /** Build the ExecResult from the final agent state: last assistant message
-   *  for text/thinking/error, all assistant messages for usage accumulation. */
-  private assembleResult(session: PiSessionLike, start: number): ExecResult {
+   *  for text/thinking/error, usage accumulated over the assistant messages
+   *  added during THIS run only (baseline = messages present before prompt). */
+  private assembleResult(session: PiSessionLike, start: number, usageBaseline: number): ExecResult {
     const messages = Array.isArray(session.agent.state.messages) ? session.agent.state.messages : [];
     const assistantMessages = messages.filter((m) => m && m.role === 'assistant');
     const last = assistantMessages[assistantMessages.length - 1];
@@ -340,21 +365,24 @@ export class PiAdapter implements CLIAdapter {
       }
     }
 
-    // Usage: sum across all assistant messages of this run (M8 hook, pi only).
+    // Usage: sum across the assistant messages appended during this run (M8 hook,
+    // pi only). state.messages carries full resumed history, so entries below
+    // the pre-prompt baseline (earlier turns) are skipped.
     const usage: ExecResultUsage = {
       inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, totalCost: 0,
     };
     let hasUsage = false;
-    for (const m of assistantMessages) {
+    messages.forEach((m, i) => {
+      if (i < usageBaseline || !m || m.role !== 'assistant') return;
       const u = m.usage;
-      if (!u || typeof u !== 'object') continue;
+      if (!u || typeof u !== 'object') return;
       hasUsage = true;
       usage.inputTokens += u.input ?? 0;
       usage.outputTokens += u.output ?? 0;
       usage.cacheReadTokens += u.cacheRead ?? 0;
       usage.cacheWriteTokens += u.cacheWrite ?? 0;
       usage.totalCost += u.cost?.total ?? 0;
-    }
+    });
 
     return {
       text: text || '(无输出)',

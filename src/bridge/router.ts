@@ -59,6 +59,7 @@ const TOOL_ALIASES: Record<string, string> = {
   gemini: 'gemini', gm: 'gemini',
   kimi: 'kimi', km: 'kimi',
   opencode: 'opencode', oc: 'opencode',
+  pi: 'pi',
 };
 
 const NORMAL_ACTIVITY_MAX_LINES_PER_MESSAGE = 12;
@@ -416,10 +417,10 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
           '/yolo  auto+effort max',
           '/fast  effort low',
           '/reset  重置所有设置',
-          '/cc /cx /gm /km /oc  切工具',
+          '/cc /cx /gm /km /oc /pi  切工具',
           '',
           '— 发消息 —',
-          '@claude/@codex/@gemini/@kimi/@opencode  指定工具',
+          '@claude/@codex/@gemini/@kimi/@opencode/@pi  指定工具',
           '>>  接力(传上条结果)',
           '@tool1>tool2  链式调用',
         ].join('\n'));

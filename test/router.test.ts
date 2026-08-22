@@ -258,6 +258,33 @@ test('handleSlash /model strips accidental /. suffix from model name', async () 
   assert.equal(messages[messages.length - 1]?.text, 'model → glm-5');
 });
 
+test('handleSlash /pi switches the default tool to pi', async () => {
+  const { router, sessions, messages } = createRouter();
+
+  await router.handleSlash('u1', '/pi');
+
+  assert.equal((sessions.get('u1') as any).defaultTool, 'pi');
+  assert.equal(messages[messages.length - 1]?.text, '→ pi');
+});
+
+test('/models is served by the current tool when its adapter implements listModels (pi wiring)', async () => {
+  const { router, sessions, messages } = createRouter();
+  sessions.update('u1', { defaultTool: 'pi' });
+  (router as any).registry.get = () => ({
+    name: 'pi',
+    displayName: 'Pi',
+    capabilities: { sessionResume: true },
+    listModels: async () => ['zai/glm-5.3', 'anthropic/claude-opus-4-5'],
+  });
+
+  await router.handleSlash('u1', '/models');
+
+  assert.equal(
+    messages[messages.length - 1]?.text,
+    '可用模型 (2个):\nzai/glm-5.3\nanthropic/claude-opus-4-5',
+  );
+});
+
 test('handleSlash /model 默认 resets model only', async () => {
   const { router, sessions, messages } = createRouter();
   sessions.update('u1', { model: 'glm-5', effort: 'low', mode: 'safe' } as any);
