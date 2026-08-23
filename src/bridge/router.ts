@@ -1124,7 +1124,14 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
         .map((s) => ({
           id: s.id,
           date: new Date(s.modified).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false }).replace(/\//g, '-'),
-          summary: (s.firstMessage || '(无摘要)').substring(0, 60),
+          // Strip the system-injected SEND_FILE hint (appended to every prompt by
+          // runOnce) before building the summary — same as the Claude branch above.
+          // Non-anchored + multiline: the hint body contains ']' itself, so match
+          // lazily to the end of the marker line, then truncate.
+          summary: ((s.firstMessage || '(无摘要)') as string)
+            .replace(/\n?\n\[提示:[^\]]*\]\]?\s*$/m, '')
+            .replace(/\s*\[提示:[^\]]*\]\]?\s*$/m, '')
+            .substring(0, 60),
         }));
     } catch (err) {
       log.debug(`[pi] session list failed: ${(err as Error).message}`);
