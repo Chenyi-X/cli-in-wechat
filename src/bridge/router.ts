@@ -6,7 +6,7 @@ import { log } from '../utils/logger.js';
 import { ILinkClient, isDeliveryFinalizationError } from '../ilink/client.js';
 import { AdapterRegistry } from '../adapters/registry.js';
 import { SessionManager } from './session.js';
-import { formatResponse } from './formatter.js';
+import { formatResponse, formatTokens } from './formatter.js';
 import type { WeixinMessage } from '../ilink/types.js';
 import type { BridgeConfig } from '../config.js';
 import { DEFAULT_SETTINGS, type AskUserRequest, type MsgMode } from '../adapters/base.js';
@@ -404,6 +404,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
           '/files  列出目录结构',
           '/compact  压缩上下文(清session)',
           '/stats  使用统计',
+          '/context  会话token统计(pi)',
           '/send <文件路径>  发送文件到微信',
           '',
           '— 会话 —',
@@ -459,6 +460,42 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
           const delivery = getDeliveryStatus.call(this.ilink, uid);
           const backoff = delivery.quota.rateBackoffUntil > Date.now() ? 'backoff' : 'ready';
           lines.push(`delivery: pending=${delivery.pending.length} failed=${delivery.failed.length} sent=${delivery.quota.sentItems}/${delivery.quota.maxItemsPerWindow} remaining=${delivery.quota.remainingItems} ${backoff}`);
+        }
+        await reply(lines.join('\n'));
+        return true;
+      }
+
+      case 'context': case 'ctx': {
+        // Session-level runtime stats (window occupancy, cumulative tokens/cost,
+        // cache hit rate) — pi only. Footer already shows per-run usage.
+        const tool = settings.defaultTool || this.config.defaultTool;
+        const adapter = this.registry.get(tool);
+        const hook = adapter?.getContext;
+        if (!adapter || !hook) {
+          await reply(`${adapter?.displayName || tool} 不支持会话统计（目前仅 pi 提供）`);
+          return true;
+        }
+        const ctx = hook.call(adapter);
+        if (!ctx || !ctx.totals) {
+          await reply(`当前没有活跃的 pi 会话——重启后先跑一轮对话，/context 才有数据。`);
+          return true;
+        }
+        const lines: string[] = [`会话统计 (${adapter.displayName})`];
+        lines.push(`session: ${ctx.sessionId ? ctx.sessionId.substring(0, 8) : '-'}`);
+        if (ctx.window) {
+          const w = ctx.window;
+          const occ = w.tokens !== null && w.tokens !== undefined ? formatTokens(w.tokens) : '未知';
+          const pct = w.percent !== null && w.percent !== undefined ? `${w.percent.toFixed(1)}%` : '未知';
+          lines.push(`窗口: ${occ} / ${formatTokens(w.contextWindow)} (${pct})`);
+        }
+        const t = ctx.totals;
+        lines.push(`累计 token: in ${formatTokens(t.input)} · out ${formatTokens(t.output)} · cacheR ${formatTokens(t.cacheRead)} · cacheW ${formatTokens(t.cacheWrite)}`);
+        lines.push(`累计成本: $${t.cost.toFixed(4)}`);
+        const sent = t.cacheRead + t.cacheWrite + t.input;
+        if (sent > 0) lines.push(`缓存命中率(累计): ${Math.round((t.cacheRead / sent) * 100)}%`);
+        if (ctx.messages) {
+          const m = ctx.messages;
+          lines.push(`消息: user ${m.user} / asst ${m.assistant} / toolCall ${m.toolCalls} / toolResult ${m.toolResults}`);
         }
         await reply(lines.join('\n'));
         return true;
@@ -1550,6 +1587,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
           tool: adapter.displayName,
           duration: result.duration || (Date.now() - start),
           error: result.error,
+          usage: result.usage,
         }), { priority: 'final', generation: taskGeneration }, `${toolName}:final`);
       } else {
         // compact mode or no streamed text: send full result
@@ -1557,6 +1595,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
           tool: adapter.displayName,
           duration: result.duration || (Date.now() - start),
           error: result.error,
+          usage: result.usage,
         }), { priority: 'final', generation: taskGeneration }, `${toolName}:final`);
       }
     } catch (err: unknown) {

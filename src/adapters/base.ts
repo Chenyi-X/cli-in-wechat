@@ -115,6 +115,35 @@ export interface ExecResult {
   usage?: ExecResultUsage;
 }
 
+/** Session-level runtime statistics exposed by adapters that can report them
+ *  (pi). Returned by the optional CLIAdapter.getContext() hook, consumed by the
+ *  /context command. `null` from the hook means the adapter has no live session
+ *  yet (no data to read); the hook itself being absent means unsupported. */
+export interface AdapterContextStats {
+  sessionId?: string;
+  /** Context-window occupancy as of the last model response (pi's estimate). */
+  window?: {
+    tokens: number | null;
+    contextWindow: number;
+    percent: number | null;
+  };
+  /** Session-cumulative billed tokens (whole session, incl. compaction/summaries). */
+  totals?: {
+    input: number;
+    output: number;
+    cacheRead: number;
+    cacheWrite: number;
+    cost: number;
+  };
+  /** Session activity counters. */
+  messages?: {
+    user: number;
+    assistant: number;
+    toolCalls: number;
+    toolResults: number;
+  };
+}
+
 export interface IntermediateMessage {
   type: 'thinking' | 'text' | 'tool_use' | 'tool_result';
   content: string;
@@ -141,6 +170,9 @@ export interface CLIAdapter {
   execute(prompt: string, opts: ExecOptions): Promise<ExecResult>;
   /** List available models as `provider/id` strings, when the adapter can enumerate them. */
   listModels?(): Promise<string[]>;
+  /** Session-level runtime statistics for the /context command. Absent = the
+   *  adapter cannot report context stats. Returning null = no live session yet. */
+  getContext?(): AdapterContextStats | null;
   /** Release any long-lived resources (e.g. spawned background servers) on shutdown. */
   close?(): void;
 }

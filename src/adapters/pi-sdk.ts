@@ -1,6 +1,7 @@
 import { log } from '../utils/logger.js';
 import { DEFAULT_CLI_TIMEOUT } from '../config.js';
 import type {
+  AdapterContextStats,
   CLIAdapter,
   AdapterCapabilities,
   ExecOptions,
@@ -35,6 +36,35 @@ export interface PiMessageLike {
   errorMessage?: string;
 }
 
+/** Session-level cumulative stats as reported by AgentSession.getSessionStats(). */
+export interface PiSessionStatsLike {
+  sessionId?: string;
+  userMessages?: number;
+  assistantMessages?: number;
+  toolCalls?: number;
+  toolResults?: number;
+  totalMessages?: number;
+  tokens?: {
+    input?: number;
+    output?: number;
+    cacheRead?: number;
+    cacheWrite?: number;
+    total?: number;
+  };
+  cost?: number;
+  contextUsage?: PiContextUsageLike | undefined;
+  [k: string]: unknown;
+}
+
+/** Context-window occupancy as reported by AgentSession.getContextUsage().
+ *  tokens/percent may be null when the size is unknown (e.g. right after a
+ *  compaction with no subsequent model response). */
+export interface PiContextUsageLike {
+  tokens: number | null;
+  contextWindow: number;
+  percent: number | null;
+}
+
 /** The subset of AgentSession this adapter consumes (fakes implement just this). */
 export interface PiSessionLike {
   readonly sessionId: string;
@@ -43,6 +73,11 @@ export interface PiSessionLike {
   abort(): Promise<void> | void;
   dispose(): void;
   readonly agent: { readonly state: { readonly messages: readonly PiMessageLike[] } };
+  /** Whole-session cumulative billed usage (pi counts every billed call, incl.
+   *  compaction summaries). Used by the diff method for per-run usage. */
+  getSessionStats(): PiSessionStatsLike;
+  /** Context-window occupancy as of the last model response, if known. */
+  getContextUsage(): PiContextUsageLike | undefined;
 }
 
 export interface PiSessionOptions {
@@ -281,11 +316,11 @@ export class PiAdapter implements CLIAdapter {
     }
     this.session = session;
 
-    // Usage baseline: messages already present before this run's prompt belong
-    // to earlier turns of a resumed session and must not be re-counted.
-    const usageBaseline = Array.isArray(session.agent.state.messages)
-      ? session.agent.state.messages.length
-      : 0;
+    // Snapshot the session-wide totals BEFORE this run's prompt. Per-run usage
+    // is then the diff to the totals after the run — this covers every billed
+    // call this run actually made (incl. any compaction summaries) exactly once,
+    // unlike summing per-message usage which re-counts shared history per call.
+    const beforeStats = PiAdapter.readStats(session);
 
     // Idle-timeout anti-wedge (mirrors claude.ts): the timer is re-armed on every
     // event, so a long-but-healthy run is never cut off, while a run that stops
@@ -338,7 +373,7 @@ export class PiAdapter implements CLIAdapter {
     if (signal?.aborted) return { text: '已取消', error: true, duration: Date.now() - start };
     if (timedOut) return this.timeoutResult(timeout, start);
 
-    return this.assembleResult(session, start, usageBaseline);
+    return this.assembleResult(session, start, beforeStats);
   }
 
   private timeoutResult(timeout: number, start: number): ExecResult {
@@ -352,9 +387,13 @@ export class PiAdapter implements CLIAdapter {
   }
 
   /** Build the ExecResult from the final agent state: last assistant message
-   *  for text/thinking/error, usage accumulated over the assistant messages
-   *  added during THIS run only (baseline = messages present before prompt). */
-  private assembleResult(session: PiSessionLike, start: number, usageBaseline: number): ExecResult {
+   *  for text/thinking/error; usage diffed against the pre-run session totals,
+   *  so it reflects THIS run's billed calls only (M8). */
+  private assembleResult(
+    session: PiSessionLike,
+    start: number,
+    beforeStats: PiSessionStatsLike | undefined,
+  ): ExecResult {
     const messages = Array.isArray(session.agent.state.messages) ? session.agent.state.messages : [];
     const assistantMessages = messages.filter((m) => m && m.role === 'assistant');
     const last = assistantMessages[assistantMessages.length - 1];
@@ -375,24 +414,10 @@ export class PiAdapter implements CLIAdapter {
       }
     }
 
-    // Usage: sum across the assistant messages appended during this run (M8 hook,
-    // pi only). state.messages carries full resumed history, so entries below
-    // the pre-prompt baseline (earlier turns) are skipped.
-    const usage: ExecResultUsage = {
-      inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, totalCost: 0,
-    };
-    let hasUsage = false;
-    messages.forEach((m, i) => {
-      if (i < usageBaseline || !m || m.role !== 'assistant') return;
-      const u = m.usage;
-      if (!u || typeof u !== 'object') return;
-      hasUsage = true;
-      usage.inputTokens += u.input ?? 0;
-      usage.outputTokens += u.output ?? 0;
-      usage.cacheReadTokens += u.cacheRead ?? 0;
-      usage.cacheWriteTokens += u.cacheWrite ?? 0;
-      usage.totalCost += u.cost?.total ?? 0;
-    });
+    const afterStats = PiAdapter.readStats(session);
+    const usage = beforeStats && afterStats
+      ? PiAdapter.diffUsage(beforeStats, afterStats)
+      : undefined;
 
     return {
       text: text || '(无输出)',
@@ -400,7 +425,77 @@ export class PiAdapter implements CLIAdapter {
       sessionId: session.sessionId,
       duration: Date.now() - start,
       error,
-      usage: hasUsage ? usage : undefined,
+      usage,
+    };
+  }
+
+  /** Session-level runtime stats for the /context command. null = no live
+   *  session yet (nothing has run since bridge start). */
+  getContext(): AdapterContextStats | null {
+    const session = this.session;
+    if (!session) return null;
+    const stats = PiAdapter.readStats(session);
+    if (!stats) return { sessionId: session.sessionId };
+    const t = stats.tokens ?? {};
+    return {
+      sessionId: session.sessionId,
+      window: stats.contextUsage
+        ? {
+            tokens: stats.contextUsage.tokens ?? null,
+            contextWindow: stats.contextUsage.contextWindow,
+            percent: stats.contextUsage.percent ?? null,
+          }
+        : undefined,
+      totals: {
+        input: t.input ?? 0,
+        output: t.output ?? 0,
+        cacheRead: t.cacheRead ?? 0,
+        cacheWrite: t.cacheWrite ?? 0,
+        cost: stats.cost ?? 0,
+      },
+      messages: {
+        user: stats.userMessages ?? 0,
+        assistant: stats.assistantMessages ?? 0,
+        toolCalls: stats.toolCalls ?? 0,
+        toolResults: stats.toolResults ?? 0,
+      },
+    };
+  }
+
+  /** Read session-wide totals defensively (never crash the run on a session
+   *  shape we did not expect). */
+  private static readStats(session: PiSessionLike): PiSessionStatsLike | undefined {
+    try {
+      return session.getSessionStats?.();
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Per-run usage = session totals after − before. Every billed call of this
+   *  run is counted once; history from earlier turns cancels out in the diff. */
+  private static diffUsage(
+    before: PiSessionStatsLike,
+    after: PiSessionStatsLike,
+  ): ExecResultUsage | undefined {
+    const sub = (a: number | undefined, b: number | undefined): number =>
+      Math.max(0, (a ?? 0) - (b ?? 0));
+    const bt = before.tokens ?? {};
+    const at = after.tokens ?? {};
+    const inputTokens = sub(at.input, bt.input);
+    const outputTokens = sub(at.output, bt.output);
+    const cacheReadTokens = sub(at.cacheRead, bt.cacheRead);
+    const cacheWriteTokens = sub(at.cacheWrite, bt.cacheWrite);
+    const totalCost = sub(after.cost, before.cost);
+    if (!inputTokens && !outputTokens && !cacheReadTokens && !cacheWriteTokens && totalCost === 0) {
+      return undefined;
+    }
+    return {
+      inputTokens,
+      outputTokens,
+      cacheReadTokens,
+      cacheWriteTokens,
+      totalCost,
     };
   }
 

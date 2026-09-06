@@ -197,6 +197,48 @@ function createFakeSession(overrides: {
     },
     abort: async () => { state.abortCount++; resolveAbort(); },
     dispose: () => { state.disposed = true; },
+    // Mimic AgentSession.getSessionStats(): cumulative totals over all messages
+    // currently in state (assistant + any toolResult usage). The adapter diffs
+    // this before/after a run, so simple runs yield exactly the summed usage of
+    // the messages appended during that run.
+    getSessionStats: () => {
+      const tokens = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
+      let cost = 0;
+      let user = 0;
+      let assistant = 0;
+      let toolCalls = 0;
+      let toolResults = 0;
+      for (const m of state.messages) {
+        if (m.role === 'user') { user++; continue; }
+        if (m.role === 'toolResult') { toolResults++; }
+        else if (m.role === 'assistant') {
+          assistant++;
+          if (Array.isArray(m.content)) {
+            toolCalls += m.content.filter((c) => c && (c as { type?: string }).type === 'toolCall').length;
+          }
+        }
+        const u = m.usage;
+        if (u) {
+          tokens.input += u.input ?? 0;
+          tokens.output += u.output ?? 0;
+          tokens.cacheRead += u.cacheRead ?? 0;
+          tokens.cacheWrite += u.cacheWrite ?? 0;
+          cost += u.cost?.total ?? 0;
+        }
+      }
+      tokens.total = tokens.input + tokens.output + tokens.cacheRead + tokens.cacheWrite;
+      return {
+        sessionId: overrides.sessionId ?? 'pi-ses-1',
+        userMessages: user,
+        assistantMessages: assistant,
+        toolCalls,
+        toolResults,
+        totalMessages: state.messages.length,
+        tokens,
+        cost,
+      };
+    },
+    getContextUsage: () => undefined,
     agent: { state: { messages: state.messages } },
   };
   return { session, state };

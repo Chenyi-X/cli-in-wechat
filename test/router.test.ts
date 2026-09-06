@@ -628,3 +628,44 @@ test('stripper stops buffering an unterminated head past the carry cap', () => {
   // being swallowed into an ever-growing buffer.
   assert.equal(strip('正常文本'), '正常文本');
 });
+
+test('/context reports unsupported when the adapter has no getContext hook', async () => {
+  const { router, sessions, messages } = createRouter();
+  sessions.update('u1', { defaultTool: 'gemini' } as any);
+  // default registry fake has no getContext
+  await router.handleSlash('u1', '/context');
+  assert.match(messages[messages.length - 1]?.text ?? '', /不支持会话统计/);
+});
+
+test('/context says no active session when pi has not run yet', async () => {
+  const { router, sessions, messages } = createRouter();
+  sessions.update('u1', { defaultTool: 'pi' } as any);
+  (router as any).registry.get = () => ({
+    name: 'pi', displayName: 'Pi', capabilities: { sessionResume: true },
+    getContext: () => null,
+  });
+  await router.handleSlash('u1', '/context');
+  assert.match(messages[messages.length - 1]?.text ?? '', /没有活跃的 pi 会话/);
+});
+
+test('/context renders session window, cumulative tokens/cost and cache hit rate', async () => {
+  const { router, sessions, messages } = createRouter();
+  sessions.update('u1', { defaultTool: 'pi' } as any);
+  (router as any).registry.get = () => ({
+    name: 'pi', displayName: 'Pi', capabilities: { sessionResume: true },
+    getContext: () => ({
+      sessionId: 'abc12345def',
+      window: { tokens: 12340, contextWindow: 200000, percent: 6.17 },
+      totals: { input: 1_200_000, output: 340_000, cacheRead: 880_000, cacheWrite: 45_000, cost: 1.234 },
+      messages: { user: 3, assistant: 7, toolCalls: 12, toolResults: 9 },
+    }),
+  });
+  await router.handleSlash('u1', '/context');
+  const text = messages[messages.length - 1]?.text ?? '';
+  assert.match(text, /会话统计 \(Pi\)/);
+  assert.match(text, /session: abc12345/);
+  assert.match(text, /窗口: 12\.3k \/ 200\.0k \(6\.2%\)/);
+  assert.match(text, /累计 token: in 1\.2M · out 340\.0k · cacheR 880\.0k · cacheW 45\.0k/);
+  assert.match(text, /缓存命中率\(累计\): 41%/);
+  assert.match(text, /消息: user 3 \/ asst 7 \/ toolCall 12 \/ toolResult 9/);
+});
