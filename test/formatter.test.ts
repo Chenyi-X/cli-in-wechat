@@ -30,14 +30,17 @@ test('formatResponse without usage keeps the legacy footer untouched', () => {
   assert.equal(formatResponse('plain'), 'plain');
 });
 
-test('formatResponse appends usage on its own footer line, split from tool/duration', () => {
+test('formatResponse splits per-run usage into labelled Chinese footer lines', () => {
   const out = formatResponse('done', {
     tool: 'Pi',
     duration: 3200,
     usage: { inputTokens: 4744, outputTokens: 73, cacheReadTokens: 19648, cacheWriteTokens: 0 },
   });
   // 19648 / (19648 + 0 + 4744) = 81%
-  assert.equal(out, 'done\n\n— Pi | 3.2s\nin 4.7k · out 73 · cache 81%');
+  assert.equal(
+    out,
+    'done\n\n— Pi | 3.2s\n本轮 token：输入 4.7k · 输出 73\n本轮缓存命中：81%',
+  );
 });
 
 test('formatResponse omits the usage line for all-zero usage', () => {

@@ -48,12 +48,15 @@ export function formatResponse(text: string, meta?: ResponseMeta): string {
   if (head.length > 0) out.push(`— ${head.join(' | ')}`);
   // Per-run token usage gets its own footer line(s) instead of being jammed
   // onto the `— tool | duration` line, so the bubble reads cleanly in WeChat.
+  // Chinese labels carry the unit in the heading (数字 = token 数), and the
+  // cache line is explicitly THIS run, distinct from /context's cumulative rate.
   if (hasUsage) {
-    const hit = cacheHitRate(usage);
+    const u = usage!;
     out.push(
-      `in ${formatTokens(usage!.inputTokens ?? 0)} · out ${formatTokens(usage!.outputTokens ?? 0)}` +
-        (hit !== null ? ` · cache ${hit}%` : ''),
+      `本轮 token：输入 ${formatTokens(u.inputTokens ?? 0)} · 输出 ${formatTokens(u.outputTokens ?? 0)}`,
     );
+    const hit = cacheHitRate(u);
+    if (hit !== null) out.push(`本轮缓存命中：${hit}%`);
   }
 
   return out.join('\n');
