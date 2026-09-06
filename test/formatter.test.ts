@@ -30,14 +30,14 @@ test('formatResponse without usage keeps the legacy footer untouched', () => {
   assert.equal(formatResponse('plain'), 'plain');
 });
 
-test('formatResponse appends an in/out/cache line when usage is present', () => {
+test('formatResponse appends usage on its own footer line, split from tool/duration', () => {
   const out = formatResponse('done', {
     tool: 'Pi',
     duration: 3200,
     usage: { inputTokens: 4744, outputTokens: 73, cacheReadTokens: 19648, cacheWriteTokens: 0 },
   });
   // 19648 / (19648 + 0 + 4744) = 81%
-  assert.equal(out, 'done\n\n— Pi | 3.2s | in 4.7k · out 73 · cache 81%');
+  assert.equal(out, 'done\n\n— Pi | 3.2s\nin 4.7k · out 73 · cache 81%');
 });
 
 test('formatResponse omits the usage line for all-zero usage', () => {

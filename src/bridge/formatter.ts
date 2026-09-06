@@ -30,25 +30,31 @@ export function cacheHitRate(usage: NonNullable<ResponseMeta['usage']>): number 
 }
 
 export function formatResponse(text: string, meta?: ResponseMeta): string {
-  const parts: string[] = [];
-  if (meta?.error) parts.push('[错误]');
-  parts.push(text);
+  const out: string[] = [];
+  if (meta?.error) out.push('[错误]');
+  out.push(text);
 
-  const footer: string[] = [];
-  if (meta?.tool) footer.push(meta.tool);
+  const head: string[] = [];
+  if (meta?.tool) head.push(meta.tool);
   if (meta?.duration) {
     const sec = meta.duration / 1000;
-    footer.push(sec >= 60 ? `${(sec / 60).toFixed(1)}min` : `${sec.toFixed(1)}s`);
+    head.push(sec >= 60 ? `${(sec / 60).toFixed(1)}min` : `${sec.toFixed(1)}s`);
   }
   const usage = meta?.usage;
-  if (usage && (usage.inputTokens || usage.outputTokens || usage.cacheReadTokens || usage.cacheWriteTokens)) {
+  const hasUsage =
+    !!usage && (usage.inputTokens || usage.outputTokens || usage.cacheReadTokens || usage.cacheWriteTokens);
+
+  if (head.length || hasUsage) out.push('');
+  if (head.length > 0) out.push(`— ${head.join(' | ')}`);
+  // Per-run token usage gets its own footer line(s) instead of being jammed
+  // onto the `— tool | duration` line, so the bubble reads cleanly in WeChat.
+  if (hasUsage) {
     const hit = cacheHitRate(usage);
-    footer.push(
-      `in ${formatTokens(usage.inputTokens ?? 0)} · out ${formatTokens(usage.outputTokens ?? 0)}` +
+    out.push(
+      `in ${formatTokens(usage!.inputTokens ?? 0)} · out ${formatTokens(usage!.outputTokens ?? 0)}` +
         (hit !== null ? ` · cache ${hit}%` : ''),
     );
   }
-  if (footer.length > 0) parts.push(`\n— ${footer.join(' | ')}`);
 
-  return parts.join('\n');
+  return out.join('\n');
 }
