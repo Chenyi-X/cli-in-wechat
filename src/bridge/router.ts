@@ -372,7 +372,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
           '/status  查看所有配置',
           '/models  查看可用模型',
           '/model <名>  切模型',
-          '/mode <auto|safe|plan>  权限',
+          '/mode <auto|safe|plan|full>  权限',
           '/effort <low|med|high|xhigh|max>  深度',
           '/turns <数>  最大轮次',
           '/budget <$>  预算(off=无限)',
@@ -519,16 +519,21 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
         return true;
 
       case 'mode': {
-        const modes: Record<string, string> = { auto: 'auto', safe: 'safe', plan: 'plan' };
+        const modes: Record<string, string> = { auto: 'auto', safe: 'safe', plan: 'plan', full: 'full' };
         const v = modes[arg.toLowerCase()];
-        if (!v) { await reply('/mode <auto|safe|plan>\nauto=最高权限 safe=需确认 plan=只读'); return true; }
-        this.sessions.update(uid, { mode: v as any });
+        if (!v) { await reply('/mode <auto|safe|plan|full>\nauto=最高权限 safe=需确认 plan=只读 full=pi专属(工具交给pi设置)'); return true; }
+        // full 是 pi 专属档：其他工具收到 full 时静默按 auto 存储，避免 claude/codex
+        // 对未知 mode 走默认权限而出现比 auto 更弱的隐性降级。
+        const tool = settings.defaultTool || this.config.defaultTool;
+        const effective = (v === 'full' && tool !== 'pi') ? 'auto' : v;
+        this.sessions.update(uid, { mode: effective as any });
         const desc: Record<string, string> = {
           auto: 'AUTO\nClaude: --dangerously-skip-permissions\nCodex: --yolo\nGemini: --approval-mode yolo\nKimi: -p (自带auto)\nPi: 全部内置工具(read/bash/edit/write)',
           safe: 'SAFE\nClaude: 默认权限\nCodex: --sandbox workspace-write\nGemini: --approval-mode default\nKimi: -p 恒auto (/mode 对Kimi无效)\nPi: 只读工具(read/grep/find/ls)',
           plan: 'PLAN\nClaude: --permission-mode plan\nCodex: --sandbox read-only\nGemini: --approval-mode plan\nKimi: -p 不支持plan (恒auto)\nPi: 不支持plan (按safe处理)',
+          full: 'FULL\nPi: 工具集交给 pi settings(defaultTools + 全部扩展/自定义工具)\n其他工具: full 等同 auto',
         };
-        await reply(desc[v]);
+        await reply(desc[effective]);
         return true;
       }
 

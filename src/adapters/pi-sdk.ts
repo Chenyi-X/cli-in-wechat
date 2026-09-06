@@ -55,6 +55,8 @@ export interface PiSessionOptions {
   thinkingLevel?: string;
   /** Allowlist of tool names. */
   tools?: string[];
+  /** Tool names to exclude after any allowlist (e.g. interactive question tools). */
+  excludeTools?: string[];
 }
 
 export type PiSessionFactory = (opts: PiSessionOptions) => Promise<PiSessionLike>;
@@ -189,7 +191,7 @@ export class PiAdapter implements CLIAdapter {
   readonly command = 'pi';
   readonly capabilities: AdapterCapabilities = {
     streaming: true, jsonOutput: true, sessionResume: true,
-    modes: ['auto', 'safe'], hasEffort: true, hasModel: true, hasSearch: false, hasBudget: false,
+    modes: ['full', 'auto', 'safe'], hasEffort: true, hasModel: true, hasSearch: false, hasBudget: false,
   };
 
   private readonly sdkLoader: PiSdkLoader;
@@ -240,10 +242,17 @@ export class PiAdapter implements CLIAdapter {
     }
 
     // mode: auto → default toolset; safe/plan → read-only tools (plan is not
-    // declared in capabilities.modes, router treats it as safe).
-    const tools = settings.mode === 'auto'
-      ? ['read', 'bash', 'edit', 'write']
-      : ['read', 'grep', 'find', 'ls'];
+    // declared in capabilities.modes, router treats it as safe). full → no
+    // allowlist and no exclusions at all: the toolset comes entirely from pi's
+    // own settings (defaultTools + all extension/SDK custom tools).
+    const fullMode = settings.mode === 'full';
+    const tools = fullMode ? undefined
+      : settings.mode === 'auto'
+        ? ['read', 'bash', 'edit', 'write']
+        : ['read', 'grep', 'find', 'ls'];
+    // ask_question needs interactive replies the bridge cannot answer in phase
+    // 1, so it is excluded on the controlled modes; full leaves it to pi.
+    const excludeTools = fullMode ? undefined : ['ask_question'];
     const thinkingLevel = settings.effort && PI_THINKING_LEVELS.has(settings.effort)
       ? settings.effort
       : undefined;
@@ -256,6 +265,7 @@ export class PiAdapter implements CLIAdapter {
         model: settings.model || undefined,
         thinkingLevel,
         tools,
+        excludeTools,
       });
     } catch (err) {
       return {
@@ -455,12 +465,13 @@ export class PiAdapter implements CLIAdapter {
     const sessionOpts: Record<string, unknown> = {
       cwd: opts.workDir,
       sessionManager,
-      // pi's built-in question tool needs interactive replies; phase 1 has none.
-      excludeTools: ['ask_question'],
     };
     if (model) sessionOpts.model = model;
     if (opts.thinkingLevel) sessionOpts.thinkingLevel = opts.thinkingLevel;
     if (opts.tools) sessionOpts.tools = opts.tools;
+    // Exclusions (e.g. ask_question on the controlled modes) are decided per
+    // mode by execute(); full mode passes none so pi settings rule entirely.
+    if (opts.excludeTools) sessionOpts.excludeTools = opts.excludeTools;
 
     const { session } = await pi.createAgentSession(sessionOpts);
     return session as unknown as PiSessionLike;

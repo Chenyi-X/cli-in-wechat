@@ -285,6 +285,22 @@ test('/models is served by the current tool when its adapter implements listMode
   );
 });
 
+test('/mode full is pi-only: stored as full for pi, normalized to auto otherwise', async () => {
+  const { router, messages, sessions } = createRouter();
+
+  // Non-pi session (config default gemini): full is silently stored as auto,
+  // so other adapters never see a mode they would implicitly downgrade.
+  await router.handleSlash('u1', '/mode full');
+  assert.equal((sessions.get('u1') as any).mode, 'auto');
+  assert.match(messages[messages.length - 1]?.text ?? '', /^AUTO/);
+
+  // Pi session: full is stored as-is and described as delegating to pi settings.
+  sessions.update('u2', { defaultTool: 'pi' } as any);
+  await router.handleSlash('u2', '/mode full');
+  assert.equal((sessions.get('u2') as any).mode, 'full');
+  assert.match(messages[messages.length - 1]?.text ?? '', /^FULL/);
+});
+
 test('handleSlash /model 默认 resets model only', async () => {
   const { router, sessions, messages } = createRouter();
   sessions.update('u1', { model: 'glm-5', effort: 'low', mode: 'safe' } as any);

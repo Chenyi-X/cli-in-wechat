@@ -124,7 +124,7 @@ Claude Code 需要你做选择时，问题自动转发到微信：
 |---|---|---|
 | `/status` | 查看所有配置 | 通用 |
 | `/model <名>` | 切模型 | 所有 |
-| `/mode <auto\|safe\|plan>` | 权限模式 | 所有 |
+| `/mode <auto\|safe\|plan\|full>` | 权限模式（full=pi 专属：工具交给 pi 设置） | 所有 |
 | `/effort <low\|med\|high\|xhigh\|max>` | 思考深度 | Claude |
 | `/turns <数>` | 最大轮次 | Claude |
 | `/budget <$>` | API 预算 | Claude |
@@ -190,8 +190,10 @@ Claude Code 需要你做选择时，问题自动转发到微信：
 | `auto` | `--dangerously-skip-permissions` | `--yolo` | `--approval-mode yolo` | `-p`（自带 auto） | `--auto` |
 | `safe` | 默认权限 | `--sandbox workspace-write` | `--approval-mode default` | `-p` 恒 auto | — |
 | `plan` | `--permission-mode plan` | `--sandbox read-only` | `--approval-mode plan` | — | — |
+| `full` | 等同 `auto` | 等同 `auto` | 等同 `auto` | `-p` 恒 auto | 等同 `auto` |
 
-> 注：Kimi 非交互模式（`-p`）永远是 auto 权限，`--prompt` 不能与 `--yolo/--auto/--plan` 同用，故 `/mode` 对 Kimi 无效。
+> `full`：pi 专属档——不传工具白名单/排除项，工具集完全由 pi 自身 settings 决定（`defaultTools` + 全部扩展/自定义工具）。其他工具收到 `full` 时静默按 `auto` 处理。
+> Kimi 非交互模式（`-p`）永远是 auto 权限，`--prompt` 不能与 `--yolo/--auto/--plan` 同用，故 `/mode` 对 Kimi 无效。
 
 ## 配置
 

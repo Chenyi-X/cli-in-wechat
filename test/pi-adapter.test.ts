@@ -377,6 +377,21 @@ test('PiAdapter execute passes read-only tools in safe mode', async () => {
   assert.deepEqual(capturedOpts[0].tools, ['read', 'grep', 'find', 'ls']);
 });
 
+test('PiAdapter execute in full mode delegates tools/excludeTools to pi settings', async () => {
+  const { session } = createFakeSession({});
+  const capturedOpts: PiSessionOptions[] = [];
+  const adapter = new PiAdapter({
+    sessionFactory: async (opts) => { capturedOpts.push(opts); return session; },
+  });
+
+  await adapter.execute('full prompt', { settings: piSettings({ mode: 'full' }) });
+
+  // full passes no allowlist and no exclusions: the toolset comes entirely
+  // from pi's own settings (defaultTools + extension/SDK custom tools).
+  assert.equal(capturedOpts[0].tools, undefined);
+  assert.equal(capturedOpts[0].excludeTools, undefined);
+});
+
 test('PiAdapter execute maps errorMessage to an error result', async () => {
   const { session } = createFakeSession({
     messages: [

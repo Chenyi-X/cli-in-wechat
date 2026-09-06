@@ -4,7 +4,7 @@ import { dirname } from 'node:path';
 import { log } from '../utils/logger.js';
 import { copyMediaToWorkDir, type DownloadedMedia } from '../utils/media.js';
 
-export type ToolMode = 'auto' | 'safe' | 'plan';
+export type ToolMode = 'full' | 'auto' | 'safe' | 'plan';
 export type MsgMode = 'verbose' | 'normal' | 'compact';
 
 export interface UserSettings {
