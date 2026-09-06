@@ -39,7 +39,7 @@ test('formatResponse splits per-run usage into labelled Chinese footer lines', (
   // 19648 / (19648 + 0 + 4744) = 81%
   assert.equal(
     out,
-    'done\n\n— Pi | 3.2s\n本轮 token：输入 4.7k · 输出 73\n本轮缓存命中：81%',
+    'done\n\n本轮 token：输入 4.7k · 输出 73\n本轮缓存命中：81%\n— Pi | 3.2s',
   );
 });
 
