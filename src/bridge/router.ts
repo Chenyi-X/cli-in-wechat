@@ -1457,6 +1457,17 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
     const activityLines: string[] = [];
     const finalActivityLines: string[] = [];
     let textFlushTimer: ReturnType<typeof setTimeout> | null = null;
+    let activityFlushTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const clearActivityFlushTimer = (): void => {
+      if (activityFlushTimer !== null) clearTimeout(activityFlushTimer);
+      activityFlushTimer = null;
+    };
+    const discardActivityBatch = (): void => {
+      clearActivityFlushTimer();
+      activityLines.length = 0;
+    };
+    abort.signal.addEventListener('abort', discardActivityBatch, { once: true });
 
     const flushTextBatch = (): void => {
       if (textFlushTimer) {
@@ -1470,7 +1481,8 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
     };
 
     const flushActivityBatch = (): void => {
-      if (msgMode !== 'verbose') {
+      clearActivityFlushTimer();
+      if (msgMode !== 'verbose' || abort.signal.aborted) {
         activityLines.length = 0;
         return;
       }
@@ -1478,6 +1490,12 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
       const payload = ['Activity', ...activityLines].join('\n');
       activityLines.length = 0;
       enqueueIntermediateSend(payload, 'activity');
+    };
+
+    const scheduleActivityFlush = (): void => {
+      // Bound the batch age from its first event, even under continuous tool activity.
+      if (activityFlushTimer !== null) return;
+      activityFlushTimer = setTimeout(flushActivityBatch, 5000);
     };
 
     const scheduleTextFlush = (): void => {
@@ -1490,6 +1508,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
 
     // Streaming intermediate messages (for verbose/normal mode)
     const onIntermediate = msgMode !== 'compact' ? (msg: import('../adapters/base.js').IntermediateMessage) => {
+      if (abort.signal.aborted) return;
       const content = typeof msg.content === 'string' ? msg.content.trim() : '';
       switch (msg.type) {
         case 'tool_use':
@@ -1503,6 +1522,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
             } else {
               activityLines.push(`- ${msg.toolName || 'Tool'}`);
             }
+            scheduleActivityFlush();
           }
           break;
         case 'thinking':
@@ -1531,6 +1551,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
           if (msgMode === 'verbose' && content) {
             flushTextBatch();
             activityLines.push(content);
+            scheduleActivityFlush();
           }
           break;
       }
@@ -1599,6 +1620,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
         }), { priority: 'final', generation: taskGeneration }, `${toolName}:final`);
       }
     } catch (err: unknown) {
+      discardActivityBatch();
       if (!abort.signal.aborted) {
         log.error(`[${toolName}] 失败:`, err);
         await this.sendTextAfterConfirmation(uid, `失败: ${(err as Error).message}`, {
@@ -1607,8 +1629,10 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
         }, `${toolName}:failure`);
       }
     } finally {
-      // Defensive cleanup for pending timer when task exits early.
+      // Defensive cleanup for pending timers when task exits early.
       if (textFlushTimer) clearTimeout(textFlushTimer);
+      discardActivityBatch();
+      abort.signal.removeEventListener('abort', discardActivityBatch);
       stopTyping();
       this.active.delete(`${uid}:${toolName}`);
     }

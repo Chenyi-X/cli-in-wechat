@@ -424,6 +424,229 @@ test('compact normal and verbose preserve delivery content order and priorities'
   }
 });
 
+test('verbose activity flushes within five seconds under continuous tool events for pi and claude', async (t) => {
+  for (const tool of ['pi', 'claude']) {
+    await t.test(tool, async (t) => {
+      t.mock.timers.enable({ apis: ['setTimeout'] });
+      const { router, sessions, messages } = createRouter();
+      sessions.update('u1', { msgMode: 'verbose' } as any);
+      router.registry.get = () => ({
+        displayName: tool,
+        capabilities: { sessionResume: false },
+        execute: async (_prompt: string, { onIntermediate }: any) => {
+          onIntermediate({ type: 'tool_use', content: '- read A' });
+          t.mock.timers.tick(3000);
+          onIntermediate({ type: 'tool_result', content: '  ↳ A result' });
+          onIntermediate({ type: 'tool_use', content: '- read B' });
+          t.mock.timers.tick(1999);
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          assert.equal(messages.length, 0);
+          t.mock.timers.tick(1);
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          assert.deepEqual(messages.map((m) => m.text), ['Activity\n- read A\n↳ A result\n- read B']);
+          assert.equal(messages[0].options?.priority, 'activity');
+          assert.equal(messages[0].options?.generation, 7);
+
+          t.mock.timers.tick(20_000);
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          assert.equal(messages.length, 1);
+          // A result arriving after its call was sent starts a fresh batch.
+          onIntermediate({ type: 'tool_result', content: '  ↳ B result' });
+          t.mock.timers.tick(4999);
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          assert.equal(messages.length, 1);
+          t.mock.timers.tick(1);
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          assert.equal(messages[1].text, 'Activity\n↳ B result');
+          onIntermediate({ type: 'tool_use', content: '- final tool' });
+          return { text: 'done', error: false };
+        },
+      });
+
+      await router.exec('u1', tool, 'hello', undefined, 7);
+      assert.equal(messages[2].text, 'Activity\n- final tool');
+      assert.equal(messages[3].options?.priority, 'final');
+      t.mock.timers.tick(10_000);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(messages.length, 4);
+    });
+  }
+});
+
+test('visible text and thinking flush activity early and give the next batch a new deadline', async (t) => {
+  for (const type of ['text', 'thinking']) {
+    await t.test(type, async (t) => {
+      t.mock.timers.enable({ apis: ['setTimeout'] });
+      const { router, sessions, messages } = createRouter();
+      sessions.update('u1', { msgMode: 'verbose', showThoughts: true } as any);
+      router.registry.get = () => ({
+        displayName: 'Pi',
+        capabilities: { sessionResume: false },
+        execute: async (_prompt: string, { onIntermediate }: any) => {
+          onIntermediate({ type: 'tool_use', content: '- first' });
+          t.mock.timers.tick(2000);
+          onIntermediate({ type, content: 'progress' });
+          onIntermediate({ type: 'tool_use', content: '- second' });
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          assert.deepEqual(messages.map((m) => m.text), [
+            'Activity\n- first', type === 'thinking' ? '💭 progress' : 'progress',
+          ]);
+          t.mock.timers.tick(3000);
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          assert.equal(messages.length, 2);
+          t.mock.timers.tick(2000);
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          assert.equal(messages[2].text, 'Activity\n- second');
+          return { text: 'done', error: false };
+        },
+      });
+      await router.exec('u1', 'pi', 'hello');
+      assert.equal(messages.length, 4);
+    });
+  }
+});
+
+test('hidden thinking does not interrupt the activity deadline', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const { router, sessions, messages } = createRouter();
+  sessions.update('u1', { msgMode: 'verbose', showThoughts: false } as any);
+  router.registry.get = () => ({
+    displayName: 'Pi',
+    capabilities: { sessionResume: false },
+    execute: async (_prompt: string, { onIntermediate }: any) => {
+      onIntermediate({ type: 'tool_use', content: '- first' });
+      t.mock.timers.tick(3000);
+      onIntermediate({ type: 'thinking', content: 'hidden' });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(messages.length, 0);
+      t.mock.timers.tick(2000);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(messages[0].text, 'Activity\n- first');
+      return { text: 'done', error: false };
+    },
+  });
+  await router.exec('u1', 'pi', 'hello');
+  assert.equal(messages.length, 2);
+});
+
+test('cancel drops pending activity even while the adapter is still stopping', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const { router, sessions, messages } = createRouter();
+  sessions.update('u1', { msgMode: 'verbose' } as any);
+  router.registry.get = () => ({
+    displayName: 'Pi',
+    capabilities: { sessionResume: false },
+    execute: async (_prompt: string, { onIntermediate }: any) => {
+      onIntermediate({ type: 'tool_use', content: '- pending' });
+      router.active.get('u1:pi').abort.abort();
+      onIntermediate({ type: 'tool_result', content: 'late result' });
+      t.mock.timers.tick(10_000);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(messages.length, 0);
+      return { text: 'cancelled', error: true };
+    },
+  });
+  await router.exec('u1', 'pi', 'hello');
+  t.mock.timers.tick(10_000);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(messages.length, 0);
+});
+
+test('failed execution clears activity before waiting for failure delivery', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const { router, ilink, sessions, messages } = createRouter();
+  sessions.update('u1', { msgMode: 'verbose' } as any);
+  const sendText = ilink.sendText;
+  ilink.sendText = async (...args: any[]) => {
+    await sendText(...args);
+    if (args[1].startsWith('失败:')) {
+      t.mock.timers.tick(10_000);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+  };
+  router.registry.get = () => ({
+    displayName: 'Pi',
+    capabilities: { sessionResume: false },
+    execute: async (_prompt: string, { onIntermediate }: any) => {
+      onIntermediate({ type: 'tool_use', content: '- pending' });
+      throw new Error('adapter failed');
+    },
+  });
+  await router.exec('u1', 'pi', 'hello');
+  t.mock.timers.tick(10_000);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(messages.map((m) => m.text), ['失败: adapter failed']);
+});
+
+test('timed activity batches stay ordered behind a slow send and before the final response', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const { router, ilink, sessions, messages } = createRouter();
+  sessions.update('u1', { msgMode: 'verbose' } as any);
+  let releaseFirst!: () => void;
+  const firstSend = new Promise<void>((resolve) => { releaseFirst = resolve; });
+  let finishAdapter!: () => void;
+  const adapterFinished = new Promise<void>((resolve) => { finishAdapter = resolve; });
+  const sendText = ilink.sendText;
+  ilink.sendText = async (...args: any[]) => {
+    await sendText(...args);
+    if (args[1] === 'Activity\n- first') await firstSend;
+  };
+  router.registry.get = () => ({
+    displayName: 'Pi',
+    capabilities: { sessionResume: false },
+    execute: async (_prompt: string, { onIntermediate }: any) => {
+      try {
+        onIntermediate({ type: 'tool_use', content: '- first' });
+        t.mock.timers.tick(5000);
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        onIntermediate({ type: 'tool_use', content: '- second' });
+        t.mock.timers.tick(5000);
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        assert.deepEqual(messages.map((m) => m.text), ['Activity\n- first']);
+        return { text: 'done', error: false };
+      } finally {
+        finishAdapter();
+      }
+    },
+  });
+  const execution = router.exec('u1', 'pi', 'hello');
+  try {
+    await adapterFinished;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(messages.length, 1);
+  } finally {
+    releaseFirst();
+  }
+  await execution;
+  assert.deepEqual(messages.slice(0, 2).map((m) => m.text), ['Activity\n- first', 'Activity\n- second']);
+  assert.equal(messages.length, 3);
+  assert.equal(messages[2].options?.priority, 'final');
+});
+
+test('normal and compact keep activity buffered through five-second intervals', async (t) => {
+  for (const msgMode of ['normal', 'compact']) {
+    await t.test(msgMode, async (t) => {
+      t.mock.timers.enable({ apis: ['setTimeout'] });
+      const { router, sessions, messages } = createRouter();
+      sessions.update('u1', { msgMode } as any);
+      router.registry.get = () => ({
+        displayName: 'Pi',
+        capabilities: { sessionResume: false },
+        execute: async (_prompt: string, { onIntermediate }: any) => {
+          onIntermediate?.({ type: 'tool_use', content: '- pending' });
+          t.mock.timers.tick(10_000);
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          assert.equal(messages.length, 0);
+          return { text: 'done', error: false };
+        },
+      });
+      await router.exec('u1', 'pi', 'hello');
+      assert.equal(messages.length, 1);
+      assert.equal(messages[0].text.includes('Activity'), msgMode === 'normal');
+    });
+  }
+});
+
 test('exec does not send a failure bubble after confirmed delivery bookkeeping fails', async () => {
   const { router, ilink } = createRouter();
   const attempts: string[] = [];
