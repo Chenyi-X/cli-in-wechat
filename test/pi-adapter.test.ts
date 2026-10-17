@@ -434,6 +434,80 @@ test('PiAdapter execute in full mode delegates tools/excludeTools to pi settings
   assert.equal(capturedOpts[0].excludeTools, undefined);
 });
 
+test('PiAdapter execute in full mode registers codemode via the SDK resource loader', async () => {
+  const { session } = createFakeSession({});
+  const binds: unknown[] = [];
+  const sessionWithBind = {
+    ...session,
+    bindExtensions: async (bindings: Record<string, unknown>) => { binds.push(bindings); },
+  };
+  const seen: {
+    loader?: { cwd?: string; agentDir?: string; extensionFactories?: unknown[] };
+    overrides?: Record<string, unknown>;
+    sessionOpts?: Record<string, unknown>;
+  } = {};
+  const adapter = new PiAdapter({
+    sdkLoader: async () => ({
+      createAgentSession: async (options: Record<string, unknown>) => {
+        seen.sessionOpts = options;
+        return { session: sessionWithBind };
+      },
+      SessionManager: { create: () => ({}), open: () => ({}), list: async () => [] },
+      ModelRuntime: { create: async () => ({ getModel: () => undefined, getAvailable: async () => [] }) },
+      DefaultResourceLoader: class {
+        constructor(options: { cwd?: string; agentDir?: string; extensionFactories?: unknown[] }) {
+          seen.loader = options;
+        }
+        async reload() { /* no-op */ }
+      },
+      getAgentDir: () => 'C:\\agent',
+      SettingsManager: {
+        create: () => ({ applyOverrides: (o: Record<string, unknown>) => { seen.overrides = o; } }),
+      },
+      createCodemodeExtension: () => ({ name: 'codemode' }),
+    }),
+  });
+
+  await adapter.execute('full prompt', { settings: piSettings({ mode: 'full' }) });
+
+  // SDK sessions do not load the CLI's built-in extensions; full mode adds
+  // codemode to the resource loader and switches it on without dropping the
+  // defaultTools selection from the user's settings.
+  assert.equal(seen.loader?.cwd, 'C:\\fixture-work');
+  assert.equal(seen.loader?.agentDir, 'C:\\agent');
+  assert.equal(seen.loader?.extensionFactories?.length, 1);
+  assert.deepEqual(seen.overrides, { defaultTools: ['+codemode'] });
+  assert.ok(seen.sessionOpts?.resourceLoader);
+  assert.ok(seen.sessionOpts?.settingsManager);
+  assert.equal(seen.sessionOpts?.tools, undefined);
+  // Extensions only start once bound (session_start), like the CLI does.
+  assert.deepEqual(binds, [{}]);
+});
+
+test('PiAdapter controlled modes do not wire the full-mode extensions', async () => {
+  const { session } = createFakeSession({});
+  const seen: { loader?: unknown; codemode: boolean } = { codemode: false };
+  const adapter = new PiAdapter({
+    sdkLoader: async () => ({
+      createAgentSession: async () => ({ session }),
+      SessionManager: { create: () => ({}), open: () => ({}), list: async () => [] },
+      ModelRuntime: { create: async () => ({ getModel: () => undefined, getAvailable: async () => [] }) },
+      DefaultResourceLoader: class {
+        constructor(options: { cwd?: string }) { seen.loader = options; }
+        async reload() { /* no-op */ }
+      },
+      getAgentDir: () => 'C:\\agent',
+      SettingsManager: { create: () => ({ applyOverrides: () => {} }) },
+      createCodemodeExtension: () => { seen.codemode = true; return {}; },
+    }),
+  });
+
+  await adapter.execute('auto prompt', { settings: piSettings({ mode: 'auto' }) });
+
+  assert.equal(seen.loader, undefined);
+  assert.equal(seen.codemode, false);
+});
+
 test('PiAdapter execute maps errorMessage to an error result', async () => {
   const { session } = createFakeSession({
     messages: [

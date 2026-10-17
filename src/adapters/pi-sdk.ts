@@ -78,6 +78,8 @@ export interface PiSessionLike {
   getSessionStats(): PiSessionStatsLike;
   /** Context-window occupancy as of the last model response, if known. */
   getContextUsage(): PiContextUsageLike | undefined;
+  /** Binds extensions and emits session_start (pi ≥1.0; absent on older SDKs). */
+  bindExtensions?(bindings: Record<string, unknown>): Promise<void>;
 }
 
 export interface PiSessionOptions {
@@ -106,6 +108,15 @@ export interface PiModelRuntimeLike {
   getAvailable(): Promise<readonly PiModelLike[]>;
 }
 
+/** Resource loader subset needed to add SDK-side built-in extensions. */
+export interface PiResourceLoaderLike {
+  reload(): Promise<void>;
+}
+
+export interface PiSettingsManagerLike {
+  applyOverrides(overrides: Record<string, unknown>): void;
+}
+
 export interface PiSdkModule {
   createAgentSession(options: Record<string, unknown>): Promise<{ session: unknown }>;
   SessionManager: {
@@ -116,6 +127,14 @@ export interface PiSdkModule {
   ModelRuntime: {
     create(...args: unknown[]): Promise<PiModelRuntimeLike>;
   };
+  DefaultResourceLoader?: new (options: {
+    cwd: string;
+    agentDir: string;
+    extensionFactories?: unknown[];
+  }) => PiResourceLoaderLike;
+  getAgentDir?: () => string;
+  SettingsManager?: { create(cwd: string, agentDir?: string): PiSettingsManagerLike };
+  createCodemodeExtension?: (options?: Record<string, unknown>) => unknown;
 }
 
 export type PiSdkLoader = () => Promise<PiSdkModule>;
@@ -533,6 +552,30 @@ export class PiAdapter implements CLIAdapter {
     return undefined;
   }
 
+  /** SDK sessions do not load the CLI's built-in extensions (pi docs/sdk.md).
+   *  Full mode adds codemode and enables it through defaultTools; `+name` adds
+   *  to the selection from the user's settings instead of replacing it. The
+   *  controlled modes pass an explicit allowlist, so they are unaffected. */
+  private async buildFullModeResources(
+    pi: PiSdkModule,
+    workDir: string,
+  ): Promise<Record<string, unknown>> {
+    if (!pi.DefaultResourceLoader || !pi.getAgentDir || !pi.createCodemodeExtension) return {};
+    const resourceLoader = new pi.DefaultResourceLoader({
+      cwd: workDir,
+      agentDir: pi.getAgentDir(),
+      extensionFactories: [pi.createCodemodeExtension()],
+    });
+    await resourceLoader.reload();
+    const resources: Record<string, unknown> = { resourceLoader };
+    const settingsManager = pi.SettingsManager?.create(workDir);
+    if (settingsManager) {
+      settingsManager.applyOverrides({ defaultTools: ['+codemode'] });
+      resources.settingsManager = settingsManager;
+    }
+    return resources;
+  }
+
   /** Production session factory: createAgentSession via dynamic import, with
    *  resume-by-id (SessionManager.list → open) falling back to a silent new session. */
   private async createDefaultSession(opts: PiSessionOptions): Promise<PiSessionLike> {
@@ -567,8 +610,25 @@ export class PiAdapter implements CLIAdapter {
     // Exclusions (e.g. ask_question on the controlled modes) are decided per
     // mode by execute(); full mode passes none so pi settings rule entirely.
     if (opts.excludeTools) sessionOpts.excludeTools = opts.excludeTools;
+    if (!opts.tools) {
+      try {
+        Object.assign(sessionOpts, await this.buildFullModeResources(pi, opts.workDir));
+      } catch (err) {
+        log.warn(`[pi] full mode 扩展加载失败: ${(err as Error).message}`);
+      }
+    }
 
     const { session } = await pi.createAgentSession(sessionOpts);
+    // Extensions start on session_start; the CLI binds them implicitly. Without
+    // this, codemode stays unregistered even when defaultTools names it.
+    const bind = (session as { bindExtensions?: PiSessionLike['bindExtensions'] }).bindExtensions;
+    if (!opts.tools && typeof bind === 'function') {
+      try {
+        await bind.call(session, {});
+      } catch (err) {
+        log.warn(`[pi] 扩展绑定失败: ${(err as Error).message}`);
+      }
+    }
     return session as unknown as PiSessionLike;
   }
 }

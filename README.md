@@ -194,7 +194,7 @@ Claude Code 需要你做选择时，问题自动转发到微信：
 | `plan` | `--permission-mode plan` | `--sandbox read-only` | `--approval-mode plan` | — | — |
 | `full` | 等同 `auto` | 等同 `auto` | 等同 `auto` | `-p` 恒 auto | 等同 `auto` |
 
-> `full`：pi 专属档——不传工具白名单/排除项，工具集完全由 pi 自身 settings 决定（`defaultTools` + 全部扩展/自定义工具）。其他工具收到 `full` 时静默按 `auto` 处理。
+> `full`：pi 专属档——不传工具白名单/排除项，工具集由 pi 自身 settings 决定（`defaultTools` + 全部扩展/自定义工具）。bridge 建会话时注册 pi 的 codemode 扩展并用 `defaultTools: ["+codemode"]` 激活。其他工具收到 `full` 时静默按 `auto` 处理。
 > Kimi 非交互模式（`-p`）永远是 auto 权限，`--prompt` 不能与 `--yolo/--auto/--plan` 同用，故 `/mode` 对 Kimi 无效。
 
 ## 配置
