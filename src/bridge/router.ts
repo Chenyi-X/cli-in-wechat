@@ -75,6 +75,8 @@ export class Router {
   private lastResponse = new Map<string, { tool: string; text: string }>();
   private pendingQuestions = new Map<string, PendingQuestion>();
   private _lastSessionList: Array<{ id: string; date: string; summary: string }> | null = null;
+  /** Numbered model list from the last /models, for /model <number>. */
+  private _lastModelList: { tool: string; models: string[] } | null = null;
 
   constructor(ilink: ILinkClient, registry: AdapterRegistry, sessions: SessionManager, config: BridgeConfig) {
     this.ilink = ilink;
@@ -370,8 +372,8 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
           '',
           '— 设置 —',
           '/status  查看所有配置',
-          '/models  查看可用模型',
-          '/model <名>  切模型',
+          '/models  查看可用模型（带编号）',
+          '/model [编号|名]  选模型；/model 查看当前；/model default 回默认',
           '/mode <auto|safe|plan|full>  权限',
           '/effort <low|med|high|xhigh|max>  深度',
           '/turns <数>  最大轮次',
@@ -509,7 +511,14 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
         if (modelsAdapter?.listModels) {
           try {
             const models = await modelsAdapter.listModels();
-            await reply(models.length > 0 ? `可用模型 (${models.length}个):\n${models.join('\n')}` : '没有可用的模型');
+            if (models.length === 0) {
+              await reply('没有可用的模型');
+              return true;
+            }
+            this._lastModelList = { tool: modelsTool, models };
+            const current = (settings.model || '').trim();
+            const lines = models.map((m, i) => `${m === current ? '✨' : ' '} ${i + 1}. ${m}`);
+            await reply(`可用模型 (${models.length}个):\n${lines.join('\n')}\n\n回复 /model <编号> 选择`);
           } catch (err) {
             await reply(`获取模型列表失败: ${(err as Error).message}`);
           }
@@ -545,6 +554,26 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
       }
 
       case 'model': case 'm':
+        // No argument: show the current model (reset moved to /model default).
+        if (!arg.trim()) {
+          await reply(settings.model ? `model → ${settings.model}` : 'model → 默认（未设置）');
+          return true;
+        }
+        // Pure number selects from the last /models list; a model name is set as is.
+        if (/^\d+$/.test(arg.trim())) {
+          if (!this._lastModelList) {
+            await reply('先 /models 查看列表，再用 /model <编号>');
+            return true;
+          }
+          const pick = this._lastModelList.models[parseInt(arg.trim(), 10) - 1];
+          if (!pick) {
+            await reply(`无效编号，范围 1-${this._lastModelList.models.length}`);
+            return true;
+          }
+          this.sessions.update(uid, { model: pick });
+          await reply(`model → ${pick}`);
+          return true;
+        }
         const model = this.normalizeModelArg(arg);
         if (!model) {
           this.sessions.update(uid, { model: '' });

@@ -123,7 +123,7 @@ Claude Code 需要你做选择时，问题自动转发到微信：
 | 命令 | 作用 | 工具 |
 |---|---|---|
 | `/status` | 查看所有配置 | 通用 |
-| `/model <名>` | 切模型 | 所有 |
+| `/model [编号\|名]` | 选模型；不带参数显示当前，`default` 回默认 | 所有 |
 | `/mode <auto\|safe\|plan\|full>` | 权限模式（full=pi 专属：工具交给 pi 设置） | 所有 |
 | `/effort <low\|med\|high\|xhigh\|max>` | 思考深度 | Claude |
 | `/turns <数>` | 最大轮次 | Claude |

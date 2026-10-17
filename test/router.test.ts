@@ -281,7 +281,7 @@ test('/models is served by the current tool when its adapter implements listMode
 
   assert.equal(
     messages[messages.length - 1]?.text,
-    '可用模型 (2个):\nzai/glm-5.3\nanthropic/claude-opus-4-5',
+    '可用模型 (2个):\n  1. zai/glm-5.3\n  2. anthropic/claude-opus-4-5\n\n回复 /model <编号> 选择',
   );
 });
 
@@ -891,4 +891,97 @@ test('/context renders session window, cumulative tokens/cost and cache hit rate
   assert.match(text, /累计 token: in 1\.2M · out 340\.0k · cacheR 880\.0k · cacheW 45\.0k/);
   assert.match(text, /缓存命中率\(累计\): 41%/);
   assert.match(text, /消息: user 3 \/ asst 7 \/ toolCall 12 \/ toolResult 9/);
+});
+
+// ─── /models 编号与 /model 选择 ────────────────────────────────────────────
+
+function createRouterWithModels(models: string[]) {
+  const ctx = createRouter();
+  (ctx.router as any).registry.get = (name: string) => name === 'pi'
+    ? {
+        name: 'pi',
+        displayName: 'Pi',
+        capabilities: { sessionResume: true },
+        listModels: async () => models,
+      }
+    : { name, displayName: name, capabilities: { sessionResume: false } };
+  return ctx;
+}
+
+test('/models numbers the list and marks the current model', async () => {
+  const { router, sessions, messages } = createRouterWithModels(['anthropic/opus-4-5', 'zai/glm-5.3']);
+  sessions.update('u1', { defaultTool: 'pi', model: 'zai/glm-5.3' } as any);
+
+  await router.handleSlash('u1', '/models');
+
+  const text = messages[messages.length - 1]?.text ?? '';
+  assert.match(text, /可用模型 \(2个\)/);
+  assert.match(text, / {2}1\. anthropic\/opus-4-5/);
+  assert.match(text, /✨ 2. zai\/glm-5\.3/);
+  assert.match(text, /\/model <编号>/);
+});
+
+test('/model <number> picks from the last /models list', async () => {
+  const { router, sessions, messages } = createRouterWithModels(['a/one', 'b/two']);
+  sessions.update('u1', { defaultTool: 'pi' } as any);
+
+  await router.handleSlash('u1', '/models');
+  await router.handleSlash('u1', '/model 2');
+
+  assert.equal((sessions.get('u1') as any).model, 'b/two');
+  assert.match(messages[messages.length - 1]?.text ?? '', /model → b\/two/);
+});
+
+test('/model without an argument shows the current model and keeps it', async () => {
+  const { router, sessions, messages } = createRouterWithModels(['a/one']);
+  sessions.update('u1', { defaultTool: 'pi', model: 'a/one' } as any);
+
+  await router.handleSlash('u1', '/model');
+  assert.match(messages[messages.length - 1]?.text ?? '', /model → a\/one/);
+  assert.equal((sessions.get('u1') as any).model, 'a/one');
+
+  sessions.update('u1', { model: '' } as any);
+  await router.handleSlash('u1', '/model');
+  assert.match(messages[messages.length - 1]?.text ?? '', /model → 默认（未设置）/);
+});
+
+test('/model default resets the model', async () => {
+  const { router, sessions, messages } = createRouterWithModels(['a/one']);
+  sessions.update('u1', { defaultTool: 'pi', model: 'a/one' } as any);
+
+  await router.handleSlash('u1', '/model default');
+
+  assert.equal((sessions.get('u1') as any).model, '');
+  assert.match(messages[messages.length - 1]?.text ?? '', /model → 默认/);
+});
+
+test('/model <number> reports the valid range and never sets an unknown index', async () => {
+  const { router, sessions, messages } = createRouterWithModels(['a/one', 'b/two']);
+  sessions.update('u1', { defaultTool: 'pi', model: 'b/two' } as any);
+
+  await router.handleSlash('u1', '/models');
+  await router.handleSlash('u1', '/model 9');
+
+  assert.match(messages[messages.length - 1]?.text ?? '', /无效编号，范围 1-2/);
+  assert.equal((sessions.get('u1') as any).model, 'b/two');
+});
+
+test('/model <number> before any /models points at /models', async () => {
+  const { router, sessions, messages } = createRouterWithModels(['a/one']);
+  sessions.update('u1', { defaultTool: 'pi' } as any);
+
+  await router.handleSlash('u1', '/model 1');
+
+  assert.match(messages[messages.length - 1]?.text ?? '', /先 \/models/);
+  assert.equal((sessions.get('u1') as any).model, undefined);
+});
+
+test('/model <name> still sets the model directly', async () => {
+  const { router, sessions, messages } = createRouterWithModels(['a/one']);
+  sessions.update('u1', { defaultTool: 'pi' } as any);
+
+  await router.handleSlash('u1', '/model opencode-go/mimo-v2.6-flash');
+
+  assert.equal((sessions.get('u1') as any).model, 'opencode-go/mimo-v2.6-flash');
+  assert.match(messages[messages.length - 1]?.text ?? '', /model → opencode-go\/mimo-v2\.6-flash/);
 });
